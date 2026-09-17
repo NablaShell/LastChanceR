@@ -1,0 +1,187 @@
+// ui/app_window.slint
+import { Theme } from "theme.slint";
+import { CustomHeader } from "components/header.slint";
+import { Sidebar, ContactItem } from "components/sidebar.slint";
+import { ChatArea, MessageItem } from "components/chat_area.slint";
+import { ProfileModal } from "components/profile_modal.slint";
+import { ShareModal } from "components/share_modal.slint";
+import { AddContactModal } from "components/add_contact_modal.slint";
+
+export { ContactItem, MessageItem }
+
+export component AppWindow inherits Window {
+    title: "Not LastChance";
+    width: 1024px;
+    height: 768px;
+    background: #0a0a0f;
+
+    in-out property <string> profile-nickname: "";
+    in-out property <string> profile-hash: "";
+    in-out property <string> profile-public-key: "";
+    in-out property <string> profile-ed25519-public-key: "";
+    in-out property <string> profile-seed-phrase: "";
+
+    in-out property <[ContactItem]> contacts: [];
+    in-out property <[MessageItem]> messages: [];
+    in-out property <string> selected-id: "";
+    in-out property <string> selected-name: "";
+    in-out property <int> selected-index: -1;
+
+    in-out property <string> input-value: "";
+    in-out property <string> upload-status: "";
+    in-out property <bool> is-uploading: false;
+    in-out property <bool> sidebar-expanded: true;
+
+    in-out property <bool> show-add-contact: false;
+    in-out property <bool> show-profile-modal: false;
+    in-out property <bool> show-share-modal: false;
+
+    in-out property <string> add-contact-input: "";
+    in-out property <string> add-contact-error: "";
+    in-out property <bool> add-contact-loading: false;
+
+    in-out property <int> renaming-index: -1;
+    in-out property <string> rename-value: "";
+
+    // ----- Callbacks (UI -> Rust) -----
+    callback send-message(string);
+    callback attach-file();
+    callback contact-selected(int);
+    callback switch-room(string);
+    callback download-file(string, string);
+    callback copy-text(string);
+    callback close-app();
+    callback minimize-app();
+    callback drag-window();
+    callback update-nickname(string);
+    callback update-contact-nickname(int, string);
+    callback add-contact-submit(string, string, string);
+    callback open-add-contact();
+    callback open-profile();
+    callback open-share();
+    callback close-modals();
+    callback paste-from-clipboard();
+
+    // ----- Root layout -----
+    VerticalLayout {
+        spacing: 0px;
+
+        CustomHeader {
+            title: "Not LastChance";
+            minimize-clicked => { root.minimize-app(); }
+            close-clicked => { root.close-app(); }
+            drag-started => { root.drag-window(); }
+        }
+
+        // Upload status bar (fixed overlay)
+        if upload-status != "" : Rectangle {
+            height: 36px;
+            background: Theme.upload-bar-gradient;
+
+            HorizontalLayout {
+                alignment: center;
+                spacing: 10px;
+                Text {
+                    text: upload-status;
+                    color: white;
+                    font-size: 13px;
+                    vertical-alignment: center;
+                }
+                if is-uploading : Rectangle {
+                    width: 16px; height: 16px;
+                    border-radius: 8px;
+                    background: #ffffff4d;
+                }
+            }
+        }
+
+        // Main content
+        HorizontalLayout {
+            vertical-stretch: 1;
+
+            Sidebar {
+                width: sidebar-expanded ? 280px : 75px;
+                expanded: root.sidebar-expanded;
+                contacts: root.contacts;
+                selected-id: root.selected-id;
+                renaming-index: root.renaming-index;
+                rename-value: root.rename-value;
+
+                toggle-expanded => {
+                    root.sidebar-expanded = !root.sidebar-expanded;
+                }
+                profile-clicked => { root.open-profile(); }
+                share-clicked => { root.open-share(); }
+                add-contact-clicked => { root.open-add-contact(); }
+                contact-clicked(idx) => {
+                    root.selected-index = idx;
+                    root.contact-selected(idx);
+                }
+                rename-start(idx, name) => {
+                    root.renaming-index = idx;
+                    root.rename-value = name;
+                }
+                rename-commit(idx, name) => {
+                    root.update-contact-nickname(idx, name);
+                    root.renaming-index = -1;
+                }
+                rename-cancel => { root.renaming-index = -1; }
+            }
+
+            ChatArea {
+                horizontal-stretch: 1;
+                messages: root.messages;
+                selected-id: root.selected-id;
+                selected-name: root.selected-name;
+                input-value: root.input-value;
+                is-uploading: root.is-uploading;
+
+                input-changed(v) => { root.input-value = v; }
+                send() => {
+                    if (root.input-value != "") {
+                        root.send-message(root.input-value);
+                        root.input-value = "";
+                    }
+                }
+                attach() => { root.attach-file(); }
+                download-file(hash, name) => {
+                    root.download-file(hash, name);
+                }
+                copy-text(t) => { root.copy-text(t); }
+            }
+        }
+    }
+
+    // ----- Modals -----
+    if show-profile-modal : ProfileModal {
+        nickname: profile-nickname;
+        hash: profile-hash;
+        public-key: profile-public-key;
+        ed25519-public-key: profile-ed25519-public-key;
+        seed-phrase: profile-seed-phrase;
+
+        close => { root.close-modals(); }
+        update-nickname(v) => { root.update-nickname(v); }
+        copy-text(v) => { root.copy-text(v); }
+    }
+
+    if show-share-modal : ShareModal {
+        close => { root.close-modals(); }
+        copy-link => { root.copy-text("__share_link__"); }
+        copy-json => { root.copy-text("__share_json__"); }
+    }
+
+    if show-add-contact : AddContactModal {
+        input <=> root.add-contact-input;
+        error: root.add-contact-error;
+        loading: root.add-contact-loading;
+
+        close => { root.close-modals(); }
+        input-changed(v) => { root.add-contact-input = v; }
+        paste-from-clipboard => { root.paste-from-clipboard(); }
+        submit => {
+            // парсинг делается в Rust
+            root.add-contact-submit("", "", "");
+        }
+    }
+}

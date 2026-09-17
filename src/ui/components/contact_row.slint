@@ -1,0 +1,131 @@
+// ui/components/contact_row.slint
+import { Theme } from "../theme.slint";
+
+export component ContactRow inherits Rectangle {
+    in property <bool> expanded: true;
+    in property <string> nickname: "";
+    in property <string> truncated-hash: "";
+    in property <string> avatar-url: "";
+    in property <int> unread: 0;
+    in property <bool> selected: false;
+    in property <bool> renaming: false;
+    in-out property <string> rename-value: "";
+
+    callback clicked();
+    callback rename-start();
+    callback rename-commit(string);
+    callback rename-cancel();
+
+    height: expanded ? 52px : 48px;
+    border-radius: 14px;
+    background: selected
+        ? #8b5cf633
+        : (touch.pressed ? #8b5cf61a : transparent);
+    border-width: selected ? 1px : 0px;
+    border-color: #8b5cf64d;
+
+    touch := TouchArea {
+        clicked => { clicked(); }
+    }
+
+    HorizontalLayout {
+        padding: 6px;
+        spacing: 10px;
+        alignment: expanded ? start : center;
+
+        Rectangle {
+            width: 40px;
+            height: 40px;
+            border-radius: 20px;
+            background: #8b5cf626;
+        
+            Text {
+                text: "👤";
+                font-size: 18px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+        // --- Name + hash / rename input ---
+        if expanded : VerticalLayout {
+            alignment: center;
+            spacing: 2px;
+            horizontal-stretch: 1;
+
+            if !renaming : Text {
+                text: nickname;
+                color: Theme.text-primary;
+                font-size: 14px;
+                font-weight: 500;
+                overflow: elide;
+            }
+
+            if renaming : Rectangle {
+                height: 24px;
+                background: #0000004d;
+                border-radius: 6px;
+                border-width: 1px;
+                border-color: #8b5cf64d;
+
+                rename-edit := TextInput {
+                    text: root.rename-value;
+                    color: Theme.text-primary;
+                    font-size: 13px;
+                    single-line: true;
+                    edited => { root.rename-value = self.text; }
+                    accepted => { root.rename-commit(self.text); }
+                }
+            }
+
+            if !renaming : Text {
+                text: truncated-hash;
+                color: Theme.text-muted;
+                font-size: 10px;
+                font-family: "monospace";
+            }
+        }
+
+        // --- Rename button ---
+        if expanded : Rectangle {
+            width: 20px;
+            height: 20px;
+            border-radius: 10px;
+            background: rename-touch.pressed ? #ffffff1a : transparent;
+
+            rename-touch := TouchArea {
+                clicked => {
+                    if root.renaming {
+                        rename-cancel();
+                    } else {
+                        rename-start();
+                    }
+                }
+            }
+
+            Text {
+                text: "✎";
+                color: Theme.text-secondary;
+                font-size: 10px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+
+        // --- Unread badge ---
+        if unread > 0 : Rectangle {
+            width: 20px;
+            height: 20px;
+            border-radius: 10px;
+            background: Theme.danger;
+
+            Text {
+                text: unread > 99 ? "99+" : unread;
+                color: white;
+                font-size: 10px;
+                font-weight: 700;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+    }
+}

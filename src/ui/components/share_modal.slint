@@ -1,0 +1,129 @@
+// ui/components/share_modal.slint
+import { Theme } from "../theme.slint";
+
+// --- Вспомогательный компонент объявлен ДО ShareModal ---
+component ShareCard inherits Rectangle {
+    in property <string> icon;
+    in property <string> title;
+    in property <string> desc;
+    callback clicked();
+
+    height: 68px;
+    border-radius: 16px;
+    background: card-t.pressed ? #8b5cf61f : #ffffff0d;
+    border-width: 1px;
+    border-color: Theme.glass-border;
+
+    card-t := TouchArea {
+        clicked => { root.clicked(); }
+    }
+
+    HorizontalLayout {
+        padding: 14px;
+        spacing: 14px;
+
+        Rectangle {
+            width: 44px;
+            height: 44px;
+            border-radius: 12px;
+            background: #8b5cf626;
+
+            Text {
+                text: icon;
+                font-size: 20px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            spacing: 2px;
+            horizontal-stretch: 1;
+
+            Text {
+                text: title;
+                color: Theme.text-primary;
+                font-size: 15px;
+                font-weight: 500;
+            }
+
+            Text {
+                text: desc;
+                color: Theme.text-secondary;
+                font-size: 12px;
+            }
+        }
+    }
+}
+
+export component ShareModal inherits Rectangle {
+    callback close();
+    callback copy-link();
+    callback copy-json();
+
+    width: 100%;
+    height: 100%;
+    background: #00000099;
+
+    overlay-touch := TouchArea { clicked => { close(); } }
+
+    card := Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: 520px;
+        height: 340px;
+        border-radius: 18px;
+        background: #0f0a1af2;
+        border-width: 1px;
+        border-color: #8b5cf64d;
+
+        card-touch := TouchArea { }
+
+        VerticalLayout {
+            padding: 24px;
+            spacing: 16px;
+
+            HorizontalLayout {
+                Text {
+                    text: "Share Your Contact";
+                    color: white;
+                    font-size: 20px;
+                    font-weight: 600;
+                    horizontal-stretch: 1;
+                    vertical-alignment: center;
+                }
+
+                close-btn := Rectangle {
+                    width: 28px;
+                    height: 28px;
+                    border-radius: 14px;
+                    background: close-t.pressed ? #ffffff1a : transparent;
+
+                    close-t := TouchArea { clicked => { close(); } }
+
+                    Text {
+                        text: "✕";
+                        color: Theme.text-secondary;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
+            ShareCard {
+                icon: "🔗";
+                title: "Copy Invite Link";
+                desc: "lastchance://contact?...";
+                clicked => { root.copy-link(); }
+            }
+
+            ShareCard {
+                icon: "{}";
+                title: "Copy JSON Identity";
+                desc: "Full public keys & nickname";
+                clicked => { root.copy-json(); }
+            }
+        }
+    }
+}

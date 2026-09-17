@@ -1,0 +1,244 @@
+// ui/components/sidebar.slint
+import { Theme } from "../theme.slint";
+import { ContactRow } from "contact_row.slint";
+import { ScrollView } from "std-widgets.slint";
+
+export struct ContactItem {
+    hash: string,
+    nickname: string,
+    truncated-hash: string,
+    avatar-url: string,
+    unread: int,
+}
+
+// --- Вспомогательный компонент объявлен ДО Sidebar ---
+component ActionBtn inherits Rectangle {
+    in property <string> icon;
+    in property <string> label;
+    callback clicked();
+
+    height: 44px;
+    width: label == "" ? 44px : 76px;
+    border-radius: 12px;
+    background: touch.pressed ? #8b5cf633 : #ffffff0d;
+    border-width: 1px;
+    border-color: Theme.glass-border;
+
+    touch := TouchArea {
+        clicked => { clicked(); }
+    }
+
+    HorizontalLayout {
+        padding: 8px;
+        spacing: 6px;
+        alignment: center;
+
+        Text {
+            text: root.icon;
+            font-size: 14px;
+            vertical-alignment: center;
+        }
+
+        if label != "" : Text {
+            text: root.label;
+            color: Theme.accent-light;
+            font-size: 13px;
+            vertical-alignment: center;
+        }
+    }
+}
+
+export component Sidebar inherits Rectangle {
+    in property <bool> expanded: true;
+    in property <[ContactItem]> contacts: [];
+    in property <string> selected-id: "";
+    in property <int> renaming-index: -1;
+    in property <string> rename-value: "";
+
+    callback toggle-expanded();
+    callback profile-clicked();
+    callback share-clicked();
+    callback add-contact-clicked();
+    callback contact-clicked(int);
+    callback rename-start(int, string);
+    callback rename-commit(int, string);
+    callback rename-cancel();
+
+    background: transparent;
+
+    VerticalLayout {
+        padding-top: 12px;
+        padding-bottom: 12px;
+        padding-left: 8px;
+        padding-right: 8px;
+        spacing: 12px;
+
+        // ----- Control bubble -----
+        Rectangle {
+            height: expanded ? 56px : 130px;
+            border-radius: 16px;
+            background: #ffffff08;
+            border-width: 1px;
+            border-color: Theme.glass-border;
+
+            if expanded : HorizontalLayout {
+                padding: 6px;
+                spacing: 8px;
+                alignment: start;
+
+                burger := Rectangle {
+                    width: 44px;
+                    height: 44px;
+                    border-radius: 12px;
+                    background: burger-touch.pressed ? #8b5cf626 : #ffffff0d;
+                    border-width: 1px;
+                    border-color: Theme.glass-border;
+
+                    burger-touch := TouchArea {
+                        clicked => { toggle-expanded(); }
+                    }
+
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 4px;
+                        Rectangle { width: 24px; height: 2px; background: Theme.text-secondary; }
+                        Rectangle { width: 18px; height: 2px; background: Theme.text-secondary; }
+                        Rectangle { width: 12px; height: 2px; background: Theme.text-secondary; }
+                    }
+                }
+
+                Rectangle { horizontal-stretch: 1; }
+
+                ActionBtn {
+                    icon: "👤";
+                    label: "Profile";
+                    clicked => { profile-clicked(); }
+                }
+
+                ActionBtn {
+                    icon: "🔗";
+                    label: "Share";
+                    clicked => { share-clicked(); }
+                }
+            }
+
+            if !expanded : VerticalLayout {
+                alignment: center;
+                padding: 8px;
+                spacing: 10px;
+
+                burger2 := Rectangle {
+                    width: 44px;
+                    height: 44px;
+                    border-radius: 22px;
+                    background: burger2-touch.pressed ? #8b5cf626 : #ffffff0d;
+                    border-width: 1px;
+                    border-color: Theme.glass-border;
+
+                    burger2-touch := TouchArea {
+                        clicked => { toggle-expanded(); }
+                    }
+
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 4px;
+                        Rectangle { width: 24px; height: 2px; background: Theme.text-secondary; }
+                        Rectangle { width: 18px; height: 2px; background: Theme.text-secondary; }
+                        Rectangle { width: 12px; height: 2px; background: Theme.text-secondary; }
+                    }
+                }
+
+                ActionBtn {
+                    icon: "👤";
+                    label: "";
+                    clicked => { profile-clicked(); }
+                }
+
+                ActionBtn {
+                    icon: "🔗";
+                    label: "";
+                    clicked => { share-clicked(); }
+                }
+            }
+        }
+
+        // ----- Contacts bubble -----
+        Rectangle {
+            vertical-stretch: 1;
+            border-radius: 16px;
+            background: #ffffff08;
+            border-width: 1px;
+            border-color: Theme.glass-border;
+
+            VerticalLayout {
+                padding: 8px;
+                spacing: 6px;
+
+                if expanded : HorizontalLayout {
+                    alignment: start;
+
+                    Text {
+                        text: "CONTACTS";
+                        color: Theme.text-secondary;
+                        font-size: 11px;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+
+                    add-btn := Rectangle {
+                        width: 28px;
+                        height: 28px;
+                        border-radius: 14px;
+                        background: add-touch.pressed ? #8b5cf626 : #ffffff0d;
+
+                        add-touch := TouchArea {
+                            clicked => { add-contact-clicked(); }
+                        }
+
+                        Text {
+                            text: "➕";
+                            color: Theme.text-secondary;
+                            font-size: 12px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+
+                ScrollView {
+                    VerticalLayout {
+                        spacing: 4px;
+
+                        if contacts.length == 0 : Text {
+                            text: expanded ? "No contacts" : "";
+                            color: Theme.text-muted;
+                            font-size: 12px;
+                            horizontal-alignment: center;
+                        }
+
+                        for contact[index] in contacts : ContactRow {
+                            expanded: root.expanded;
+                            nickname: contact.nickname;
+                            truncated-hash: contact.truncated-hash;
+                            avatar-url: contact.avatar-url;
+                            unread: contact.unread;
+                            selected: contact.hash == root.selected-id;
+                            renaming: index == root.renaming-index;
+                            rename-value: root.rename-value;
+
+                            clicked => { root.contact-clicked(index); }
+                            rename-start => {
+                                root.rename-start(index, contact.nickname);
+                            }
+                            rename-commit(name) => {
+                                root.rename-commit(index, name);
+                            }
+                            rename-cancel => { root.rename-cancel(); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

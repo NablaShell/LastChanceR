@@ -1,0 +1,184 @@
+// ui/components/profile_modal.slint
+import { Theme } from "../theme.slint";
+
+// --- Вспомогательный компонент объявлен ДО ProfileModal ---
+component ProfileField inherits Rectangle {
+    in property <string> label;
+    in property <string> value;
+    in property <bool> editable: false;
+
+    callback edited(string);
+    callback copy-text(string);
+
+    background: transparent;
+
+    VerticalLayout {
+        spacing: 4px;
+
+        Text {
+            text: label;
+            color: Theme.accent-light;
+            font-size: 12px;
+            font-weight: 600;
+        }
+
+        if !editable : Rectangle {
+            background: #00000033;
+            border-radius: 8px;
+            min-height: 32px;
+
+            HorizontalLayout {
+                padding: 8px;
+                spacing: 6px;
+
+                Text {
+                    text: value;
+                    color: Theme.text-primary;
+                    font-size: 12px;
+                    font-family: "monospace";
+                    wrap: word-wrap;
+                    horizontal-stretch: 1;
+                    vertical-alignment: center;
+                }
+
+                cp := Rectangle {
+                    width: 20px;
+                    height: 20px;
+                    border-radius: 10px;
+                    background: cp-t.pressed ? #ffffff1a : transparent;
+
+                    cp-t := TouchArea {
+                        clicked => { root.copy-text(root.value); }
+                    }
+
+                    Text {
+                        text: "📋";
+                        font-size: 12px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+
+        if editable : Rectangle {
+            background: #ffffff0d;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: #8b5cf64d;
+            height: 34px;
+
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 10px;
+                padding-top: 0px;
+                padding-bottom: 0px;
+                alignment: center;
+
+                edit := TextInput {
+                    text: root.value;
+                    color: Theme.text-primary;
+                    font-size: 14px;
+                    single-line: true;
+                    horizontal-stretch: 1;
+                    vertical-alignment: center;
+                    edited => { root.edited(self.text); }
+                    accepted => { root.edited(self.text); }
+                }
+            }
+        }
+    }
+}
+
+export component ProfileModal inherits Rectangle {
+    in property <string> nickname: "";
+    in property <string> hash: "";
+    in property <string> public-key: "";
+    in property <string> ed25519-public-key: "";
+    in property <string> seed-phrase: "";
+
+    callback close();
+    callback update-nickname(string);
+    callback copy-text(string);
+
+    width: 100%;
+    height: 100%;
+    background: #00000099;
+
+    overlay-touch := TouchArea {
+        clicked => { close(); }
+    }
+
+    card := Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: 520px;
+        height: min(content.preferred-height + 48px, parent.height * 0.85);
+        border-radius: 18px;
+        background: #0f0a1af2;
+        border-width: 1px;
+        border-color: #8b5cf64d;
+
+        card-touch := TouchArea { }
+
+        content := VerticalLayout {
+            padding: 24px;
+            spacing: 16px;
+
+            HorizontalLayout {
+                Text {
+                    text: "Your Cryptographic Profile";
+                    color: white;
+                    font-size: 20px;
+                    font-weight: 600;
+                    horizontal-stretch: 1;
+                    vertical-alignment: center;
+                }
+
+                close-btn := Rectangle {
+                    width: 28px;
+                    height: 28px;
+                    border-radius: 14px;
+                    background: close-t.pressed ? #ffffff1a : transparent;
+
+                    close-t := TouchArea {
+                        clicked => { close(); }
+                    }
+
+                    Text {
+                        text: "✕";
+                        color: Theme.text-secondary;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
+            ProfileField {
+                label: "Nickname";
+                value: nickname;
+                editable: true;
+                edited(v) => { root.update-nickname(v); }
+                copy-text(v) => { root.copy-text(v); }
+            }
+
+            ProfileField {
+                label: "Hash";
+                value: hash;
+                copy-text(v) => { root.copy-text(v); }
+            }
+
+            ProfileField {
+                label: "X25519 Public Key";
+                value: public-key;
+                copy-text(v) => { root.copy-text(v); }
+            }
+
+            if ed25519-public-key != "" : ProfileField {
+                label: "Ed25519 Public Key";
+                value: ed25519-public-key;
+                copy-text(v) => { root.copy-text(v); }
+            }
+        }
+    }
+}

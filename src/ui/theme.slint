@@ -1,0 +1,33 @@
+// ui/theme.slint
+export global Theme {
+    // Colors from CSS variables
+    out property <color> primary: #6366f1;
+    out property <color> primary-light: #818cf8;
+    out property <color> primary-dark: #4f46e5;
+    out property <color> accent: #a855f7;
+    out property <color> accent-light: #a78bfa;
+    out property <color> accent-dark: #7c3aed;
+    out property <color> danger: #ef4444;
+    out property <color> danger-light: #fca5a5;
+    out property <color> success: #48bb78;
+    out property <color> success-light: #6ee7b7;
+
+    out property <color> bg-dark: #0a0a0f;
+    out property <color> bg-card: #0f0a1a; // ~rgba(15,10,26,0.7) over black
+
+    out property <color> glass-border: #8b5cf633;      // rgba(139,92,246,0.20)
+    out property <color> glass-border-light: #ffffff0d; // rgba(255,255,255,0.05)
+
+    out property <color> text-primary: #e0e0e0;
+    out property <color> text-secondary: #808080;
+    out property <color> text-muted: #606060;
+
+    out property <brush> message-gradient:
+        @linear-gradient(135deg, #6366f1 0%, #a855f7 50%, #7c3aed 100%);
+
+    out property <brush> upload-bar-gradient:
+        @linear-gradient(90deg, #6366f1 0%, #7c3aed 100%);
+
+    out property <length> radius-card: 18px;
+    out property <length> radius-bubble: 20px;
+}
