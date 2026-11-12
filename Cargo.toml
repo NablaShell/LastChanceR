@@ -1,10 +1,9 @@
 [package]
 name = "lastchance"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-# Crypto
 chacha20poly1305 = "0.10"
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 ed25519-dalek = { version = "2.0", features = ["rand_core"] }
@@ -13,43 +12,20 @@ sha2 = "0.10"
 rand = "0.8"
 hex = "0.4"
 bip39 = "2.0"
-
-# Network
 reqwest = { version = "0.12", features = ["json", "multipart"] }
-tokio = { version = "1.0", features = ["full"] }
-mime = "0.3"
+tokio = { version = "1", features = ["full"] }
 url = "2.5"
-
-# Storage
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-
-# Utils
 anyhow = "1.0"
 thiserror = "1.0"
 log = "0.4"
-env_logger = "0.11"
 chrono = "0.4"
 dirs = "5.0"
-notify-rust = "4.11"
-
-# Async
 async-trait = "0.1"
 futures = "0.3"
-
-# GUI - Slint
-slint = { version = "1.9", features = ["backend-winit", "renderer-femtovg", "compat-1-2"] }
-arboard = "3.2"
-
-[build-dependencies]
-slint-build = "1.9"
+bytes = "1"
 
 [dev-dependencies]
-tempfile = "3.8"
-
-[profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
-strip = true
+tempfile = "3"

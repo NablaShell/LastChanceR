@@ -78,7 +78,6 @@ pub struct App {
     signing_key: SigningKey,
     ed25519_pub_key_hex: String,
 
-    window_active: Arc<Mutex<bool>>,
     current_room_hash: Arc<Mutex<String>>,
 
     safe_fs: Arc<SafeFSOps>,
@@ -174,7 +173,6 @@ impl App {
             listener,
             signing_key,
             ed25519_pub_key_hex,
-            window_active: Arc::new(Mutex::new(false)),
             current_room_hash,
             safe_fs,
             event_sender,
@@ -196,9 +194,6 @@ impl App {
         let signing_key = self.signing_key.clone();
         let shared_secrets = self.shared_secrets.clone();
         let storage = self.storage.clone();
-        let window_active = self.window_active.clone();
-        let current_room_hash = self.current_room_hash.clone();
-        let _config = self.config.clone();
         let event_sender = self.event_sender.clone();
 
         tokio::spawn(async move {
@@ -228,8 +223,6 @@ impl App {
                                 packet,
                                 &shared_secrets,
                                 &storage,
-                                &window_active,
-                                &current_room_hash,
                                 &identity_hash,
                                 &identity_pub_key,
                                 &identity_priv_key,
@@ -263,8 +256,6 @@ impl App {
         packet: Vec<u8>,
         shared_secrets: &Arc<Mutex<HashMap<String, [u8; 32]>>>,
         storage: &Arc<Storage>,
-        window_active: &Arc<Mutex<bool>>,
-        current_room_hash: &Arc<Mutex<String>>,
         identity_hash: &str,
         identity_pub_key: &str,
         identity_priv_key: &[u8],
@@ -331,43 +322,10 @@ impl App {
             timestamp: chrono::Utc::now().timestamp(),
             sender: from_name.clone(),
         });
-
-        // System notification
-        if from_hash != identity_hash {
-            let room_hash = current_room_hash.lock().unwrap().clone();
-            let is_window_active = *window_active.lock().unwrap();
-
-            if from_hash != room_hash || !is_window_active {
-                let title = format!("📨 {}", from_name);
-                let body: String = message_text.chars().take(100).collect();
-
-                // Check if it's a file message
-                let final_body = if body.starts_with("📎 Файл:") {
-                    body.lines().next().unwrap_or(&body).to_string()
-                } else {
-                    body
-                };
-
-                Self::notify_user(&title, &final_body);
-            }
-        }
     }
 
-	fn notify_user(title: &str, message: &str) {
-        let title = title.to_string();
-        let message = message.to_string();
-        std::thread::spawn(move || {
-            if let Err(e) = notify_rust::Notification::new()
-                .summary(&title)
-                .body(&message)
-                .show()
-            {
-                log::warn!("Failed to show notification: {}", e);
-            }
-        });
-    }
     // ============================================================
-    // API METHODS FOR UI
+    // API METHODS FOR CLI
     // ============================================================
 
     pub fn get_profile(&self) -> serde_json::Value {
@@ -653,11 +611,6 @@ impl App {
 
     pub fn get_current_room(&self) -> String {
         self.current_room_hash.lock().unwrap().clone()
-    }
-
-    pub fn set_window_active(&self, active: bool) {
-        let mut window_active = self.window_active.lock().unwrap();
-        *window_active = active;
     }
 
     pub fn handle_scheme_url(&self, raw_url: &str) {

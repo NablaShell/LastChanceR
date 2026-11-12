@@ -1,63 +1,33 @@
-// src/main.rs
-mod app;
-mod crypto;
-mod file_dialog;
-mod identity;
-mod network;
-mod storage;
-mod ui;
-
-use std::sync::Arc;
+// CLI-точка входа. Вся логика мессенджера находится в библиотеке (src/lib.rs).
+use anyhow::Result;
 use tokio::sync::mpsc;
 
-slint::include_modules!();
+use lastchance::{get_base_dir, App, AppEvent, Config};
 
-use crate::app::{App, AppEvent};
-use crate::network::Config;
-use crate::storage::get_base_dir;
-use crate::ui::controller::UiController;
-
-fn main() -> anyhow::Result<()> {
-    env_logger::init();
-
-    // ---- Backend init ----
+#[tokio::main]
+async fn main() -> Result<()> {
     let base_dir = get_base_dir()?;
     let config = Config::load(&base_dir)?;
-    let (event_tx, event_rx) = mpsc::unbounded_channel::<AppEvent>();
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<AppEvent>();
 
-    // ---- Tokio runtime ----
-    let rt = tokio::runtime::Runtime::new()?;
-    let handle = rt.handle().clone();
+    let app = App::new(config, base_dir, event_tx)?;
 
-    let app = {
-        let _guard = rt.enter();
-        Arc::new(App::new(config, base_dir, event_tx)?)
-    };
-
-    // Запускаем listener
-    {
-        let app = app.clone();
-        rt.spawn(async move {
-            if let Err(e) = app.start().await {
-                log::error!("App::start: {}", e);
-            }
-        });
+    // Обрабатываем deep link из argv (Linux/Windows).
+    for arg in std::env::args().skip(1) {
+        if arg.starts_with("lastchance://") {
+            app.handle_scheme_url(&arg);
+        }
     }
-	for arg in std::env::args().skip(1) {
-	    if arg.starts_with("lastchance://") {
-	        app.handle_scheme_url(&arg);
-	    }
-	}
-    // ---- Slint UI ----
-    let window = AppWindow::new()?;
-    let controller = UiController::new(app.clone(), window.clone_strong(), handle.clone());
-    controller.wire()?;
-    controller.start_event_listener(event_rx);
 
-    // ---- Run UI ----
-    window.run()?;
+    tokio::spawn(async move {
+        while let Some(event) = event_rx.recv().await {
+            println!("[event] {:?}", event);
+        }
+    });
 
-    // ---- Shutdown ----
-    rt.shutdown_timeout(std::time::Duration::from_secs(2));
+    app.start().await?;
+    println!("LastChance core is running. Press Ctrl+C to stop.");
+
+    tokio::signal::ctrl_c().await?;
     Ok(())
 }
