@@ -47,7 +47,10 @@ const HELP: &str = "\
   /join, /jn -f <path>        — добавить контакт из файла-инвайта
   /room, /r [hash|nick]       — показать или сменить активную комнату
   /messages [limit]           — последние сообщения комнаты
-  /sendfile, /sf <path>       — отправить файл в активную комнату
+  /sendfile, /sf [--force] <path>
+                              — отправить файл; путь ищется от текущей
+                                директории, поддерживает ~/ и абсолютные
+                                пути; системные папки — только с --force
   /download, /dl [id|name|hash] [path]
                               — скачать файл: без аргументов — последний
                                 файл комнаты; id — номер из ленты (#3);
@@ -61,6 +64,7 @@ const HELP: &str = "\
 Alt+Up/Alt+Down или Ctrl+P/Ctrl+N — переключение чатов.
 Tab — автодополнение команд и контактов (для /room).
 Tab после /dl — перебор файлов активной комнаты.
+Tab после /sf — автодополнение путей от текущей директории.
 Up/Down — история ввода (последние 50 строк).
 PgUp/PgDn или колесо мыши — прокрутка истории.
 Ctrl+V — вставка из системного буфера обмена.";
@@ -100,13 +104,13 @@ struct FileEntry {
     timestamp: i64,
 }
 
-/// Состояние циклического автодополнения `/dl` по Tab.
-struct DlCycle {
+/// Состояние циклического автодополнения аргумента по Tab (`/dl`, `/sf`).
+struct CompletionCycle {
     /// Начало дополняемого слова во вводе.
     start: usize,
     /// Индекс текущего кандидата.
     index: usize,
-    /// Токены для подстановки (`#1`, `#2`, ...).
+    /// Токены для подстановки (`#1`, `#2`, ... или пути).
     candidates: Vec<String>,
     /// Человекочитаемые подписи для статус-бара.
     labels: Vec<String>,
@@ -162,7 +166,9 @@ struct UiState {
     /// Следующий порядковый номер файла.
     next_file_id: usize,
     /// Циклическое дополнение `/dl` по Tab.
-    dl_cycle: Option<DlCycle>,
+    dl_cycle: Option<CompletionCycle>,
+    /// Циклическое дополнение путей `/sf` по Tab.
+    sf_cycle: Option<CompletionCycle>,
     /// Долгоживущий объект буфера обмена: на X11 он остаётся владельцем
     /// selection, пока жив процесс, поэтому вставка в других окнах работает.
     clipboard: Option<arboard::Clipboard>,
@@ -209,6 +215,7 @@ impl UiState {
             files: Vec::new(),
             next_file_id: 0,
             dl_cycle: None,
+            sf_cycle: None,
             clipboard,
             needs_clear: false,
         };
@@ -478,7 +485,7 @@ fn find_file<'a>(files: &'a [FileEntry], room: &str, token: &str) -> Option<&'a 
 /// Не даёт имени файла выйти за пределы папки сохранения.
 fn safe_file_name(file_name: &str) -> String {
     let base = file_name
-        .rsplit(|c| c == '/' || c == '\\')
+        .rsplit(['/', '\\'])
         .next()
         .unwrap_or(file_name)
         .replace('\0', "");
@@ -526,6 +533,32 @@ fn resolve_save_path(target: Option<&str>, file_name: &str) -> Result<PathBuf> {
     };
 
     Ok(path)
+}
+
+/// Разворачивает `~` и `~/...` в домашнюю директорию.
+fn expand_tilde(raw: &str) -> PathBuf {
+    if raw == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(raw)
+}
+
+/// Превращает путь пользователя в абсолютный от текущей рабочей директории.
+fn absolute_user_path(raw: &str) -> Result<PathBuf> {
+    let expanded = expand_tilde(raw);
+    if expanded.is_absolute() {
+        Ok(expanded)
+    } else {
+        let cwd = std::env::current_dir()
+            .map_err(|e| anyhow!("не удалось определить текущую директорию: {}", e))?;
+        Ok(cwd.join(expanded))
+    }
 }
 
 fn reload_room(app: &App, state: &mut UiState) {
@@ -869,12 +902,33 @@ fn complete_input(app: &App, state: &mut UiState) {
     let first = before.split_whitespace().next().unwrap_or("");
     let command = normalize_command(first);
     let words_before = before[..word_start].split_whitespace().count();
+    let prefix_parts: Vec<&str> = before[..word_start].split_whitespace().collect();
 
     // /dl <Tab> или /download <Tab> — перебираем файлы текущей комнаты.
     // Второй и последующие аргументы (путь сохранения) не дополняем.
     if command == "/download" && word_start > 0 && words_before == 1 {
         complete_download(state, word_start);
         return;
+    }
+
+    // /sf <Tab> или /sendfile <Tab> — пути от текущей директории.
+    if command == "/sendfile" && word_start > 0 {
+        let current = &before[word_start..];
+
+        // Первый аргумент может быть флагом --force.
+        if words_before == 1 && !current.is_empty() && "--force".starts_with(current) {
+            replace_input_before_cursor(state, word_start, "--force ");
+            state.sf_cycle = None;
+            state.status = "флаг --force: разрешить системные пути".to_string();
+            return;
+        }
+
+        let path_arg = words_before == 1
+            || (words_before == 2 && prefix_parts.get(1) == Some(&"--force"));
+        if path_arg {
+            complete_sendfile(state, word_start);
+            return;
+        }
     }
 
     // /room <Tab> или /r <Tab> — дополняем контакт.
@@ -951,7 +1005,7 @@ fn complete_download(state: &mut UiState, word_start: usize) {
 
             replace_input_before_cursor(state, word_start, &token);
             state.status = dl_status(index, total, &label);
-            state.dl_cycle = Some(DlCycle {
+            state.dl_cycle = Some(CompletionCycle {
                 start: word_start,
                 index,
                 candidates: cycle.candidates,
@@ -997,13 +1051,144 @@ fn complete_download(state: &mut UiState, word_start: usize) {
 
     replace_input_before_cursor(state, word_start, &token);
     state.status = dl_status(0, total, &label);
-    state.dl_cycle = Some(DlCycle {
+    state.dl_cycle = Some(CompletionCycle {
         start: word_start,
         index: 0,
         candidates,
         labels,
         last_insert: token,
     });
+}
+
+fn path_status(index: usize, total: usize, label: &str) -> String {
+    if total > 1 {
+        format!("путь {}/{}: {} (Tab — далее)", index + 1, total, label)
+    } else {
+        format!("файл: {}", label)
+    }
+}
+
+fn complete_sendfile(state: &mut UiState, word_start: usize) {
+    let before = state.input[..state.cursor].to_string();
+    let current = before[word_start..].to_string();
+
+    // Повторный Tab листает файлы. Папки не листаем: Tab по папке входит внутрь.
+    if let Some(cycle) = state.sf_cycle.take() {
+        if cycle.start == word_start
+            && cycle.last_insert == current
+            && !cycle.candidates.is_empty()
+        {
+            let index = (cycle.index + 1) % cycle.candidates.len();
+            let token = cycle.candidates[index].clone();
+            let label = cycle
+                .labels
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| token.clone());
+            let total = cycle.candidates.len();
+
+            replace_input_before_cursor(state, word_start, &token);
+            if token.ends_with('/') {
+                state.status = format!("папка: {} (Tab — войти)", label);
+            } else {
+                state.status = path_status(index, total, &label);
+                state.sf_cycle = Some(CompletionCycle {
+                    start: word_start,
+                    index,
+                    candidates: cycle.candidates,
+                    labels: cycle.labels,
+                    last_insert: token,
+                });
+            }
+            return;
+        }
+    }
+
+    // Отдельно обрабатываем `~`, чтобы не читать текущую директорию.
+    if current == "~" {
+        replace_input_before_cursor(state, word_start, "~/");
+        state.sf_cycle = None;
+        state.status = "домашняя директория".to_string();
+        return;
+    }
+
+    // Разделяем введённое на уже набранную папку и префикс имени.
+    let (dir_part, name_part) = match current.rfind('/') {
+        Some(pos) => (&current[..=pos], &current[pos + 1..]),
+        None => ("", current.as_str()),
+    };
+
+    let dir_for_read = if dir_part.is_empty() { "." } else { dir_part };
+    let dir_path = match absolute_user_path(dir_for_read) {
+        Ok(path) => path,
+        Err(e) => {
+            state.status = format!("{:#}", e);
+            return;
+        }
+    };
+
+    let entries = match std::fs::read_dir(&dir_path) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            state.status = format!("нет прав на чтение: {}", dir_path.display());
+            return;
+        }
+        Err(e) => {
+            state.status = format!("не удалось прочитать {}: {}", dir_path.display(), e);
+            return;
+        }
+    };
+
+    let show_hidden = name_part.starts_with('.');
+    let mut candidates: Vec<String> = Vec::new();
+
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with(name_part) {
+            continue;
+        }
+        if !show_hidden && name.starts_with('.') {
+            continue;
+        }
+
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        let suffix = if is_dir { "/" } else { "" };
+        candidates.push(format!("{}{}{}", dir_part, name, suffix));
+    }
+
+    candidates.sort();
+
+    if candidates.is_empty() {
+        state.status = if current.is_empty() {
+            format!("в {} нет файлов", dir_path.display())
+        } else {
+            format!("нет файлов по запросу «{}»", current)
+        };
+        return;
+    }
+
+    let total = candidates.len();
+    let token = candidates[0].clone();
+    let is_dir = token.ends_with('/');
+    let label = token.clone();
+
+    replace_input_before_cursor(state, word_start, &token);
+    if is_dir {
+        if total > 1 {
+            state.status = format!("папка: {} (Tab — войти, {} вариантов)", label, total);
+        } else {
+            state.status = format!("папка: {} (Tab — войти)", label);
+        }
+    } else {
+        state.status = path_status(0, total, &label);
+        state.sf_cycle = Some(CompletionCycle {
+            start: word_start,
+            index: 0,
+            labels: candidates.clone(),
+            candidates,
+            last_insert: token,
+        });
+    }
 }
 
 fn complete_contact(app: &App, state: &mut UiState, word_start: usize) {
@@ -1370,9 +1555,10 @@ async fn handle_terminal_event(
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             let alt = key.modifiers.contains(KeyModifiers::ALT);
 
-            // Любое действие, кроме повторного Tab, сбрасывает цикл подсказок /dl.
+            // Любое действие, кроме повторного Tab, сбрасывает цикл подсказок.
             if !matches!(key.code, KeyCode::Tab) {
                 state.dl_cycle = None;
+                state.sf_cycle = None;
             }
 
             if ctrl && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C')) {
@@ -1464,6 +1650,7 @@ async fn handle_terminal_event(
         },
         Event::Paste(text) => {
             state.dl_cycle = None;
+            state.sf_cycle = None;
             insert_text(state, &text);
         }
         Event::Resize(_, _) => {
@@ -1852,8 +2039,22 @@ async fn handle_command(
         }
 
         "/sendfile" => {
-            let Some(path) = parts.get(1) else {
-                push_error(state, "Использование: /sendfile <path>");
+            let mut force = false;
+            let mut path: Option<&str> = None;
+
+            for arg in parts.iter().skip(1) {
+                if *arg == "--force" {
+                    force = true;
+                } else if path.is_none() {
+                    path = Some(*arg);
+                } else {
+                    push_error(state, "Использование: /sendfile [--force] <path>");
+                    return Ok(false);
+                }
+            }
+
+            let Some(path) = path else {
+                push_error(state, "Использование: /sendfile [--force] <path>");
                 return Ok(false);
             };
             if state.room.is_empty() {
@@ -1865,10 +2066,18 @@ async fn handle_command(
             let room = state.room.clone();
             let path = path.to_string();
             let tx = ui_tx.clone();
-            state.status = "отправка файла...".to_string();
+            if force {
+                push_system(
+                    state,
+                    "⚠ --force: отправка из системной директории разрешена вручную",
+                );
+                state.status = format!("отправка файла (--force): {}...", path);
+            } else {
+                state.status = format!("отправка файла: {}...", path);
+            }
 
             tokio::spawn(async move {
-                match app_ref.send_file_native(&room, &path).await {
+                match app_ref.send_file_native(&room, &path, force).await {
                     Ok(()) => {
                         let _ = tx.send(UiNotice::Status("файл отправлен".to_string()));
                     }

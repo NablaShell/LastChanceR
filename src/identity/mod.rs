@@ -55,10 +55,10 @@ impl IdentityManager {
         let seed_phrase = mnemonic.to_string();
 
         let seed = mnemonic.to_seed("");
-        let (x_pub, x_priv, ed_pub, ed_priv, hash) = derive_keys_from_seed(&seed)?;
+        let keys = derive_keys_from_seed(&seed)?;
 
         let nickname = if nickname.is_empty() {
-            format!("user_{}", &hash[..8])
+            format!("user_{}", &keys.identity_hash[..8])
         } else {
             nickname.to_string()
         };
@@ -68,11 +68,11 @@ impl IdentityManager {
         let identity = Identity {
             nickname,
             seed_phrase,
-            public_key: x_pub,
-            private_key: x_priv,
-            ed25519_public_key: ed_pub,
-            ed25519_private_key: ed_priv,
-            hash,
+            public_key: keys.x25519_public,
+            private_key: keys.x25519_private,
+            ed25519_public_key: keys.ed25519_public,
+            ed25519_private_key: keys.ed25519_private,
+            hash: keys.identity_hash,
             created_at: now,
             updated_at: now,
         };
@@ -141,7 +141,15 @@ impl IdentityManager {
     }
 }
 
-fn derive_keys_from_seed(seed: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, String)> {
+struct DerivedKeys {
+    x25519_public: Vec<u8>,
+    x25519_private: Vec<u8>,
+    ed25519_public: Vec<u8>,
+    ed25519_private: Vec<u8>,
+    identity_hash: String,
+}
+
+fn derive_keys_from_seed(seed: &[u8]) -> Result<DerivedKeys> {
     // X25519 via HKDF
     let hkdf_x = Hkdf::<Sha256>::new(None, seed);
     let mut x_priv_raw = [0u8; 32];
@@ -174,7 +182,13 @@ fn derive_keys_from_seed(seed: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<
     let hash_result = hasher.finalize();
     let hash = hex::encode(hash_result);
 
-    Ok((x25519_pub, x25519_priv, ed25519_pub, ed25519_priv, hash))
+    Ok(DerivedKeys {
+        x25519_public: x25519_pub,
+        x25519_private: x25519_priv,
+        ed25519_public: ed25519_pub,
+        ed25519_private: ed25519_priv,
+        identity_hash: hash,
+    })
 }
 
 impl Identity {

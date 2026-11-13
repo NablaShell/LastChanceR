@@ -438,7 +438,7 @@ mod tests {
         let (storage, path) = setup_test_db();
 
         let hash = "b".repeat(64);
-        storage.add_contact(&hash, &vec![2u8; 32], "Test").unwrap();
+        storage.add_contact(&hash, &[2u8; 32], "Test").unwrap();
 
         storage.save_message(&hash, "in", "Hello").unwrap();
         storage.save_message(&hash, "out", "Hi!").unwrap();

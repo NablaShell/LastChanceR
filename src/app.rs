@@ -3,6 +3,7 @@ use anyhow::{anyhow, Result};
 use ed25519_dalek::SigningKey;
 use log::{info, warn};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -83,6 +84,99 @@ pub struct App {
     safe_fs: Arc<SafeFSOps>,
 
     event_sender: mpsc::UnboundedSender<AppEvent>,
+}
+
+/// Разворачивает `~` и `~/...` в домашнюю директорию пользователя.
+fn expand_tilde(raw: &str) -> PathBuf {
+    if raw == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(raw)
+}
+
+/// Запрещённые для отправки системные директории.
+fn is_protected_system_path(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        const BLOCKED: &[&str] = &["/etc", "/proc", "/sys", "/dev", "/boot", "/run"];
+        if BLOCKED.iter().any(|dir| path.starts_with(dir)) {
+            return true;
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let windows = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("C:\\Windows"));
+        let windows = std::fs::canonicalize(&windows).unwrap_or(windows);
+        if path.starts_with(&windows) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Разрешает путь отправки относительно PWD, а не каталога данных.
+///
+/// Поддерживает абсолютные пути и `~/`. Возвращает канонизированный путь,
+/// проверяет, что это обычный файл, и (без `force`) блокирует системные папки.
+fn resolve_upload_path(raw: &str, force: bool) -> Result<PathBuf> {
+    let expanded = expand_tilde(raw);
+    let path = if expanded.is_absolute() {
+        expanded
+    } else {
+        std::env::current_dir()
+            .map_err(|e| anyhow!("не удалось определить текущую директорию: {}", e))?
+            .join(expanded)
+    };
+
+    let metadata = match std::fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(anyhow!("файл не найден: {}", path.display()));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Err(anyhow!("нет прав на чтение: {}", path.display()));
+        }
+        Err(e) => {
+            return Err(anyhow!(
+                "не удалось получить информацию о {}: {}",
+                path.display(),
+                e
+            ));
+        }
+    };
+
+    if !metadata.is_file() {
+        return Err(anyhow!(
+            "это не обычный файл (возможно, директория): {}",
+            path.display()
+        ));
+    }
+
+    let canonical = std::fs::canonicalize(&path)
+        .map_err(|e| anyhow!("не удалось разрешить путь {}: {}", path.display(), e))?;
+
+    if !force && is_protected_system_path(&canonical) {
+        return Err(anyhow!(
+            "отправка из системной директории запрещена: {} (используйте /sf --force {})",
+            canonical.display(),
+            raw
+        ));
+    }
+
+    // Возвращаем исходный (но уже абсолютный) путь: имя файла и открытие
+    // должны соответствовать тому, что ввёл пользователь; canonical нужен
+    // только для проверки системных директорий.
+    Ok(path)
 }
 
 impl App {
@@ -471,10 +565,17 @@ impl App {
         Ok(())
     }
 
-    pub async fn send_file_native(&self, room_hash: &str, file_path: &str) -> Result<()> {
+    pub async fn send_file_native(
+        &self,
+        room_hash: &str,
+        file_path: &str,
+        force: bool,
+    ) -> Result<()> {
         use std::io::Read;
 
-        let file_name = std::path::Path::new(file_path)
+        // Путь читается из PWD (или абсолютный/~/), а не из каталога данных.
+        let path = resolve_upload_path(file_path, force)?;
+        let file_name = path
             .file_name()
             .and_then(|n| n.to_str())
             .ok_or_else(|| anyhow!("invalid file path"))?;
@@ -485,7 +586,15 @@ impl App {
         });
 
         // Open file
-        let mut file = self.safe_fs.safe_open_file(file_path)?;
+        let mut file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Err(anyhow!("нет прав на чтение: {}", path.display()));
+            }
+            Err(e) => {
+                return Err(anyhow!("не удалось открыть {}: {}", path.display(), e));
+            }
+        };
         let mut file_data = Vec::new();
         file.read_to_end(&mut file_data)
             .map_err(|e| anyhow!("failed to read file: {}", e))?;
@@ -677,12 +786,11 @@ impl App {
             .into_owned()
             .collect();
 
-        let hash = params.get("hash").map(|s| s.clone()).unwrap_or_default();
-        let x25519 = params.get("x25519").map(|s| s.clone()).unwrap_or_default();
-        let ed25519 = params.get("ed25519").map(|s| s.clone());
+        let hash = params.get("hash").cloned().unwrap_or_default();
+        let x25519 = params.get("x25519").cloned().unwrap_or_default();
+        let ed25519 = params.get("ed25519").cloned();
         let nickname = params
-            .get("nickname")
-            .map(|s| s.clone())
+            .get("nickname").cloned()
             .unwrap_or_default();
 
         if hash.is_empty() || x25519.is_empty() || nickname.is_empty() {
@@ -723,13 +831,13 @@ impl App {
 
 fn humanize_bytes(bytes: u64) -> String {
     if bytes < 1024 {
-        return format!("{} B", bytes);
+        format!("{} B", bytes)
     } else if bytes < 1024 * 1024 {
-        return format!("{:.1} KB", bytes as f64 / 1024.0);
+        format!("{:.1} KB", bytes as f64 / 1024.0)
     } else if bytes < 1024 * 1024 * 1024 {
-        return format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0));
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
     } else {
-        return format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0));
+        format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
     }
 }
 
