@@ -191,6 +191,9 @@ impl App {
         let identity_hash = self.identity.hash.clone();
         let identity_pub_key = self.identity.get_public_key_hex();
         let identity_priv_key = self.identity.private_key.clone();
+        // X-Identity-Key должен содержать hex(ed25519 public key), а не hash:
+        // сервер сам считает SHA256(decoded_key) и сравнивает с target_hash.
+        let ed25519_pub_key_hex = self.ed25519_pub_key_hex.clone();
         let signing_key = self.signing_key.clone();
         let shared_secrets = self.shared_secrets.clone();
         let storage = self.storage.clone();
@@ -207,7 +210,7 @@ impl App {
                 match listener
                     .pull_messages_with_auth(
                         &identity_hash,
-                        &identity_hash, // This should be ed25519 pub key
+                        &ed25519_pub_key_hex,
                         &signing_key,
                     )
                     .await
@@ -330,23 +333,52 @@ impl App {
 
     pub fn get_profile(&self) -> serde_json::Value {
         serde_json::json!({
-            "nickname": self.identity.nickname,
+            "nickname": self.current_nickname(),
             "hash": self.identity.hash,
             "publicKey": self.identity.get_public_key_hex(),
             "ed25519PublicKey": self.ed25519_pub_key_hex,
-            "seedPhrase": self.identity.seed_phrase,
         })
+    }
+
+    /// Seed-фраза вынесена из `/profile` в отдельную команду `/seed`.
+    pub fn get_seed_phrase(&self) -> String {
+        self.identity_manager
+            .lock()
+            .ok()
+            .and_then(|manager| {
+                manager
+                    .current()
+                    .map(|identity| identity.seed_phrase.clone())
+            })
+            .unwrap_or_else(|| self.identity.seed_phrase.clone())
+    }
+
+    /// Публичный геттер актуального ника (используется TUI-статус-баром).
+    pub fn get_nickname(&self) -> String {
+        self.current_nickname()
+    }
+
+    /// Источник истины для ника — `IdentityManager`, а не копия в `App`.
+    /// После `/nick` копия `self.identity` намеренно не обновляется, поэтому
+    /// читаем актуальное значение из менеджера.
+    fn current_nickname(&self) -> String {
+        self.identity_manager
+            .lock()
+            .ok()
+            .and_then(|manager| manager.current().map(|identity| identity.nickname.clone()))
+            .unwrap_or_else(|| self.identity.nickname.clone())
     }
 
     pub fn get_my_contact_link(&self) -> String {
         use url::form_urlencoded;
 
         let public_key_hex = self.identity.get_public_key_hex();
+        let nickname = self.current_nickname();
         let params = [
             ("hash", self.identity.hash.as_str()),
             ("x25519", public_key_hex.as_str()),
             ("ed25519", self.ed25519_pub_key_hex.as_str()),
-            ("nickname", self.identity.nickname.as_str()),
+            ("nickname", nickname.as_str()),
         ];
 
         let encoded: String = form_urlencoded::Serializer::new(String::new())
@@ -361,7 +393,7 @@ impl App {
             "hash": self.identity.hash,
             "x25519": self.identity.get_public_key_hex(),
             "ed25519": self.ed25519_pub_key_hex,
-            "nickname": self.identity.nickname,
+            "nickname": self.current_nickname(),
         });
 
         serde_json::to_string_pretty(&data).unwrap_or_default()
@@ -734,7 +766,9 @@ mod tests {
         assert!(profile["hash"].is_string());
         assert!(profile["publicKey"].is_string());
         assert!(profile["ed25519PublicKey"].is_string());
-        assert!(profile["seedPhrase"].is_string());
+        // seed-фраза больше не выводится в /profile
+        assert!(profile.get("seedPhrase").is_none());
+        assert!(!app.get_seed_phrase().is_empty());
     }
 
     #[test]

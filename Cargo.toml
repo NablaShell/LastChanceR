@@ -26,7 +26,9 @@ dirs = "5.0"
 async-trait = "0.1"
 futures = "0.3"
 bytes = "1"
-rustyline = "15"
+crossterm = { version = "0.28", features = ["event-stream"] }
+ratatui = "0.29"
+arboard = { version = "3", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"

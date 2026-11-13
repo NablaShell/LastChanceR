@@ -9,4 +9,4 @@ pub mod storage;
 
 pub use app::{App, AppEvent};
 pub use network::Config;
-pub use storage::get_base_dir;
+pub use storage::{get_base_dir, get_base_dir_with_override};

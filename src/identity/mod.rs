@@ -121,6 +121,10 @@ impl IdentityManager {
         Ok(identity)
     }
 
+    pub fn current(&self) -> Option<&Identity> {
+        self.cached_id.as_ref()
+    }
+
     pub fn update_nickname(&mut self, nickname: &str) -> Result<()> {
         if self.cached_id.is_none() {
             self.load_or_create(nickname)?;
