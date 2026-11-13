@@ -14,8 +14,8 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use crossterm::cursor::Show;
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEventKind,
-    KeyModifiers, MouseEventKind,
+    DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event,
+    EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -23,14 +23,15 @@ use crossterm::terminal::{
 };
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Layout, Position};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc;
 use zeroize::Zeroizing;
 
+use lastchance::network::config::notify_level_label;
 use lastchance::{get_base_dir_with_override, vault, App, AppEvent, Config, Vault};
 
 const HELP: &str = "\
@@ -58,10 +59,14 @@ const HELP: &str = "\
                                 path — файл или папка, иначе ./downloads/<name>
   /nick <name>                — сменить свой ник
   /rename <hash> <name>       — переименовать контакт
-  /set, /settings             — сетевые параметры: URL текстового и файлового
-                                серверов, имя и значение защитного заголовка
-                                (Enter на пустой строке — оставить как есть,
-                                Esc — отмена)
+  /set, /settings             — интерактивное меню настроек: Text API, File API,
+                                Guard Header Name/Value, Proxy URL, Notify Level,
+                                Stealth Title/Body/Seconds. Стрелки/Tab — выбор,
+                                Enter — редактировать поле, Esc — сохранить
+  /set notify <0|1|2|3>       — быстро задать режим уведомлений:
+                                0 — выкл., 1 — stealth, 2 — отправитель,
+                                3 — полный предпросмотр
+  /set test                   — показать тестовое системное уведомление
   /passwd                     — сменить мастер-пароль (файлы и база
                                 перешифровываются)
   /sidebar, /sb               — скрыть/показать панель чатов
@@ -184,9 +189,11 @@ struct UiState {
     /// Требуется очистка экрана перед следующей перерисовкой (после вывода
     /// диагностики библиотек в stderr, чтобы ratatui не «поехал»).
     needs_clear: bool,
+    /// Терминал сейчас в фокусе (события FocusGained/FocusLost).
+    is_terminal_focused: bool,
     /// Активный диалог смены мастер-пароля.
     passwd: Option<PasswdFlow>,
-    /// Активный пошаговый ввод сетевых настроек.
+    /// Активное меню настроек.
     settings: Option<SettingsFlow>,
 }
 
@@ -216,89 +223,189 @@ impl PasswdFlow {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum SettingsStage {
+enum SettingField {
     ServerUrl,
     FileServerUrl,
     HeaderName,
     HeaderValue,
+    ProxyUrl,
+    NotifyLevel,
+    StealthTitle,
+    StealthBody,
+    StealthSeconds,
 }
 
-/// Пошаговый ввод сетевых параметров для `/set`.
+const SETTINGS_FIELDS: [SettingField; 9] = [
+    SettingField::ServerUrl,
+    SettingField::FileServerUrl,
+    SettingField::HeaderName,
+    SettingField::HeaderValue,
+    SettingField::ProxyUrl,
+    SettingField::NotifyLevel,
+    SettingField::StealthTitle,
+    SettingField::StealthBody,
+    SettingField::StealthSeconds,
+];
+
+impl SettingField {
+    fn label(self) -> &'static str {
+        match self {
+            SettingField::ServerUrl => "Text API",
+            SettingField::FileServerUrl => "File API",
+            SettingField::HeaderName => "Guard Header Name",
+            SettingField::HeaderValue => "Guard Header Value",
+            SettingField::ProxyUrl => "Proxy URL",
+            SettingField::NotifyLevel => "Notify Level",
+            SettingField::StealthTitle => "Stealth Title",
+            SettingField::StealthBody => "Stealth Body",
+            SettingField::StealthSeconds => "Stealth Seconds",
+        }
+    }
+
+    fn is_notify_level(self) -> bool {
+        matches!(self, SettingField::NotifyLevel)
+    }
+
+    fn is_masked(self) -> bool {
+        matches!(self, SettingField::HeaderValue)
+    }
+}
+
+/// Модальное окно настроек `/set`.
 /// Значение защитного заголовка не показывается на экране.
 struct SettingsFlow {
-    stage: SettingsStage,
+    selected: usize,
+    editing: bool,
     server_url: String,
     file_server_url: String,
     header_name: String,
     header_value: Zeroizing<String>,
+    /// Пустая строка означает «прокси не используется».
+    proxy_url: String,
+    notify_level: u8,
+    stealth_title: String,
+    stealth_body: String,
+    stealth_seconds: String,
 }
 
 impl SettingsFlow {
     fn from_config(config: &Config) -> Self {
         Self {
-            stage: SettingsStage::ServerUrl,
+            selected: 0,
+            editing: false,
             server_url: config.server_url.clone(),
             file_server_url: config.file_server_url.clone(),
             header_name: config.mask_header_name.clone(),
             header_value: Zeroizing::new(config.mask_header_value.clone()),
+            proxy_url: config.proxy_url.clone().unwrap_or_default(),
+            notify_level: config.notify_level,
+            stealth_title: config.stealth_title.clone(),
+            stealth_body: config.stealth_body.clone(),
+            stealth_seconds: config.stealth_seconds.clone(),
         }
     }
 
-    fn value(&self, stage: SettingsStage) -> &str {
-        match stage {
-            SettingsStage::ServerUrl => &self.server_url,
-            SettingsStage::FileServerUrl => &self.file_server_url,
-            SettingsStage::HeaderName => &self.header_name,
-            SettingsStage::HeaderValue => self.header_value.as_str(),
+    fn field(&self) -> SettingField {
+        SETTINGS_FIELDS[self.selected.min(SETTINGS_FIELDS.len() - 1)]
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        let len = SETTINGS_FIELDS.len() as isize;
+        self.selected = (self.selected as isize + delta).rem_euclid(len) as usize;
+    }
+
+    fn cycle_notify(&mut self, delta: isize) {
+        self.notify_level = (self.notify_level as isize + delta).rem_euclid(4) as u8;
+    }
+
+    fn edit_value(&self, field: SettingField) -> String {
+        match field {
+            SettingField::ServerUrl => self.server_url.clone(),
+            SettingField::FileServerUrl => self.file_server_url.clone(),
+            SettingField::HeaderName => self.header_name.clone(),
+            SettingField::HeaderValue => self.header_value.to_string(),
+            SettingField::ProxyUrl => self.proxy_url.clone(),
+            SettingField::NotifyLevel => self.notify_level.to_string(),
+            SettingField::StealthTitle => self.stealth_title.clone(),
+            SettingField::StealthBody => self.stealth_body.clone(),
+            SettingField::StealthSeconds => self.stealth_seconds.clone(),
         }
     }
-}
 
-fn settings_stage_number(stage: SettingsStage) -> usize {
-    match stage {
-        SettingsStage::ServerUrl => 1,
-        SettingsStage::FileServerUrl => 2,
-        SettingsStage::HeaderName => 3,
-        SettingsStage::HeaderValue => 4,
+    fn apply_edit(&mut self, field: SettingField, raw: &str) {
+        let value = raw.trim();
+        match field {
+            SettingField::ServerUrl if !value.is_empty() => {
+                self.server_url = value.to_string();
+            }
+            SettingField::FileServerUrl if !value.is_empty() => {
+                self.file_server_url = value.to_string();
+            }
+            SettingField::HeaderName if !value.is_empty() => {
+                self.header_name = value.to_string();
+            }
+            SettingField::HeaderValue if !value.is_empty() => {
+                self.header_value = Zeroizing::new(value.to_string());
+            }
+            SettingField::ProxyUrl => {
+                self.proxy_url = if value == "-" || value.eq_ignore_ascii_case("none") {
+                    String::new()
+                } else {
+                    value.to_string()
+                };
+            }
+            SettingField::StealthTitle if !value.is_empty() => {
+                self.stealth_title = value.to_string();
+            }
+            SettingField::StealthBody if !value.is_empty() => {
+                self.stealth_body = value.to_string();
+            }
+            SettingField::StealthSeconds if !value.is_empty() => {
+                self.stealth_seconds = value.to_string();
+            }
+            _ => {}
+        }
     }
-}
 
-fn settings_stage_name(stage: SettingsStage) -> &'static str {
-    match stage {
-        SettingsStage::ServerUrl => "URL текстового сервера",
-        SettingsStage::FileServerUrl => "URL файлового сервера",
-        SettingsStage::HeaderName => "имя защитного заголовка",
-        SettingsStage::HeaderValue => "значение защитного заголовка",
+    fn display_value(&self, field: SettingField) -> String {
+        match field {
+            SettingField::ServerUrl => self.server_url.clone(),
+            SettingField::FileServerUrl => self.file_server_url.clone(),
+            SettingField::HeaderName => self.header_name.clone(),
+            SettingField::HeaderValue => "********".to_string(),
+            SettingField::ProxyUrl => {
+                if self.proxy_url.trim().is_empty() {
+                    "— (прямое подключение)".to_string()
+                } else {
+                    self.proxy_url.clone()
+                }
+            }
+            SettingField::NotifyLevel => notify_level_label(self.notify_level).to_string(),
+            SettingField::StealthTitle => self.stealth_title.clone(),
+            SettingField::StealthBody => self.stealth_body.clone(),
+            SettingField::StealthSeconds => self.stealth_seconds.clone(),
+        }
     }
-}
 
-fn settings_next_stage(stage: SettingsStage) -> Option<SettingsStage> {
-    match stage {
-        SettingsStage::ServerUrl => Some(SettingsStage::FileServerUrl),
-        SettingsStage::FileServerUrl => Some(SettingsStage::HeaderName),
-        SettingsStage::HeaderName => Some(SettingsStage::HeaderValue),
-        SettingsStage::HeaderValue => None,
+    fn to_config(&self) -> Config {
+        let mut config = Config {
+            server_url: self.server_url.clone(),
+            file_server_url: self.file_server_url.clone(),
+            mask_header_name: self.header_name.clone(),
+            mask_header_value: self.header_value.to_string(),
+            proxy_url: if self.proxy_url.trim().is_empty() {
+                None
+            } else {
+                Some(self.proxy_url.clone())
+            },
+            notify_level: self.notify_level,
+            stealth_title: self.stealth_title.clone(),
+            stealth_body: self.stealth_body.clone(),
+            stealth_seconds: self.stealth_seconds.clone(),
+        };
+        config.normalize();
+        config
     }
-}
-
-/// Не показывает реальное значение защитного заголовка даже в подсказке.
-fn settings_display_value(stage: SettingsStage, value: &str) -> String {
-    if value.is_empty() {
-        "(не задано)".to_string()
-    } else if stage == SettingsStage::HeaderValue {
-        "********".to_string()
-    } else {
-        value.to_string()
-    }
-}
-
-fn settings_prompt(flow: &SettingsFlow) -> String {
-    format!(
-        "Настройка сети ({}/4): {}.\nТекущее значение: {}\nВведите новое значение и нажмите Enter. Пустая строка — оставить текущее, Esc — отмена.",
-        settings_stage_number(flow.stage),
-        settings_stage_name(flow.stage),
-        settings_display_value(flow.stage, flow.value(flow.stage)),
-    )
 }
 
 enum UiNotice {
@@ -342,6 +449,7 @@ impl UiState {
             sf_cycle: None,
             clipboard,
             needs_clear: false,
+            is_terminal_focused: true,
             passwd: None,
             settings: None,
         };
@@ -364,7 +472,12 @@ impl Tui {
         enable_raw_mode()?;
 
         let mut stdout = io::stdout();
-        if let Err(e) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
+        if let Err(e) = execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableFocusChange
+        ) {
             let _ = disable_raw_mode();
             return Err(e.into());
         }
@@ -390,6 +503,7 @@ impl Drop for Tui {
             self.terminal.backend_mut(),
             LeaveAlternateScreen,
             DisableMouseCapture,
+            DisableFocusChange,
             Show
         );
         let _ = self.terminal.show_cursor();
@@ -402,7 +516,13 @@ fn install_panic_hook() {
         // Гарантированно возвращаем терминал в нормальный режим.
         let _ = disable_raw_mode();
         let mut stdout = io::stdout();
-        let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture, Show);
+        let _ = execute!(
+            stdout,
+            LeaveAlternateScreen,
+            DisableMouseCapture,
+            DisableFocusChange,
+            Show
+        );
         default_hook(info);
     }));
 }
@@ -1475,10 +1595,9 @@ fn draw_ui(frame: &mut Frame, state: &mut UiState) {
     };
     let status = if let Some(flow) = state.settings.as_ref() {
         format!(
-            " Настройка {}/4: {}   Текущее: {}   Enter — оставить, Esc — отмена ",
-            settings_stage_number(flow.stage),
-            settings_stage_name(flow.stage),
-            settings_display_value(flow.stage, flow.value(flow.stage)),
+            " Настройки: {} · {}   Esc — сохранить и закрыть ",
+            flow.field().label(),
+            if flow.editing { "ввод" } else { "выбор" }
         )
     } else {
         format!(
@@ -1495,15 +1614,9 @@ fn draw_ui(frame: &mut Frame, state: &mut UiState) {
     );
 
     // ---------- 3. Поле ввода ----------
-    let (input_title, masked) = if let Some(flow) = state.settings.as_ref() {
-        (
-            format!(
-                " Настройки: {} ({}/4) ",
-                settings_stage_name(flow.stage),
-                settings_stage_number(flow.stage)
-            ),
-            false,
-        )
+    let settings_open = state.settings.is_some();
+    let (input_title, masked) = if settings_open {
+        (" Настройки ".to_string(), false)
     } else if let Some(flow) = state.passwd.as_ref() {
         let title = match flow.stage {
             PasswdStage::Current => " Пароль: текущий ",
@@ -1520,32 +1633,127 @@ fn draw_ui(frame: &mut Frame, state: &mut UiState) {
     let input_inner = input_block.inner(chunks[2]);
     frame.render_widget(input_block, chunks[2]);
 
-    let prefix = "> ";
-    let avail = (input_inner.width as usize).saturating_sub(prefix.len());
-    let before = state.input[..state.cursor].chars().count();
-    let cursor_col = if avail == 0 {
-        0
+    if settings_open {
+        let hint = match state.settings.as_ref() {
+            Some(flow) if flow.editing => {
+                " Ввод: Enter — применить · Esc — отменить редактирование "
+            }
+            _ => {
+                " ↑/↓ или Tab/Shift+Tab — выбор · Enter — редактировать · \
+                 ←/→ или Space — Notify Level · Esc — сохранить и закрыть "
+            }
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                hint,
+                Style::default().fg(Color::Gray),
+            ))),
+            input_inner,
+        );
     } else {
-        before.min(avail - 1)
-    };
-    let start = before - cursor_col;
-    let visible: String = if masked {
-        "*".repeat(state.input.chars().count().min(avail))
-    } else {
-        state.input.chars().skip(start).take(avail).collect()
+        let prefix = "> ";
+        let avail = (input_inner.width as usize).saturating_sub(prefix.len());
+        let before = state.input[..state.cursor].chars().count();
+        let cursor_col = if avail == 0 {
+            0
+        } else {
+            before.min(avail - 1)
+        };
+        let start = before - cursor_col;
+        let visible: String = if masked {
+            "*".repeat(state.input.chars().count().min(avail))
+        } else {
+            state.input.chars().skip(start).take(avail).collect()
+        };
+
+        frame.render_widget(
+            Paragraph::new(Line::from(format!("{}{}", prefix, visible))),
+            input_inner,
+        );
+
+        let cursor_x = input_inner.x + prefix.len() as u16 + cursor_col as u16;
+        let cursor_y = input_inner.y;
+        frame.set_cursor_position(Position::new(
+            cursor_x.min(input_inner.right().saturating_sub(1)),
+            cursor_y,
+        ));
+    }
+
+    if settings_open {
+        draw_settings_modal(frame, state);
+    }
+}
+
+/// Рисует центрированное модальное окно `/set` поверх TUI.
+fn draw_settings_modal(frame: &mut Frame, state: &UiState) {
+    let Some(flow) = state.settings.as_ref() else {
+        return;
     };
 
-    frame.render_widget(
-        Paragraph::new(Line::from(format!("{}{}", prefix, visible))),
-        input_inner,
-    );
+    let area = frame.area();
+    let width = 78.min(area.width.saturating_sub(2)).max(20);
+    let height = (SETTINGS_FIELDS.len() as u16 + 5)
+        .min(area.height.saturating_sub(2))
+        .max(8);
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    let rect = Rect::new(x, y, width, height);
 
-    let cursor_x = input_inner.x + prefix.len() as u16 + cursor_col as u16;
-    let cursor_y = input_inner.y;
-    frame.set_cursor_position(Position::new(
-        cursor_x.min(input_inner.right().saturating_sub(1)),
-        cursor_y,
-    ));
+    frame.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Настройки · /set ");
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    const LABEL_WIDTH: usize = 20;
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(SETTINGS_FIELDS.len() + 2);
+
+    for (index, field) in SETTINGS_FIELDS.iter().enumerate() {
+        let selected = index == flow.selected;
+        let marker = if selected { "▸ " } else { "  " };
+        let label = format!("{:<width$}", field.label(), width = LABEL_WIDTH);
+
+        let value = if selected && flow.editing && !field.is_notify_level() {
+            if field.is_masked() {
+                "*".repeat(state.input.chars().count())
+            } else {
+                state.input.clone()
+            }
+        } else {
+            flow.display_value(*field)
+        };
+
+        let text = format!("{}{}  {}", marker, label, value);
+        let style = if selected {
+            Style::default().bg(Color::DarkGray).fg(Color::White)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        lines.push(Line::from(Span::styled(text, style)));
+    }
+
+    lines.push(Line::from(""));
+    let hint = if flow.editing {
+        "Enter — применить · Esc — отменить · Ctrl+V — вставить"
+    } else {
+        "↑/↓, Tab/Shift+Tab — выбор · Enter — изменить · Esc — сохранить и закрыть"
+    };
+    lines.push(Line::from(Span::styled(
+        hint,
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+
+    if flow.editing {
+        let prefix_width = 2 + LABEL_WIDTH + 2;
+        let before = state.input[..state.cursor].chars().count();
+        let max_x = inner.right().saturating_sub(1);
+        let cursor_x = (inner.x + prefix_width as u16 + before as u16).min(max_x);
+        let cursor_y = (inner.y + flow.selected as u16).min(inner.bottom().saturating_sub(1));
+        frame.set_cursor_position(Position::new(cursor_x, cursor_y));
+    }
 }
 
 // ============================================================
@@ -1569,6 +1777,13 @@ fn handle_app_event(app: &Arc<App>, state: &mut UiState, event: AppEvent) {
         } => {
             let outgoing = sender.ends_with("(self)");
             let incoming_file = parse_file_notification(&text);
+            let should_notify =
+                !outgoing && (!state.is_terminal_focused || room_hash != state.room);
+            let notify_unread = if room_hash == state.room {
+                1
+            } else {
+                state.unread.get(&room_hash).copied().unwrap_or(0) + 1
+            };
 
             if room_hash == state.room {
                 if let Some((file_name, file_hash)) = incoming_file {
@@ -1618,6 +1833,10 @@ fn handle_app_event(app: &Arc<App>, state: &mut UiState, event: AppEvent) {
                     count,
                     file_note
                 );
+            }
+
+            if should_notify {
+                notify_incoming(app, &sender, &text, notify_unread);
             }
         }
         AppEvent::ContactImport {
@@ -1702,6 +1921,23 @@ fn handle_app_event(app: &Arc<App>, state: &mut UiState, event: AppEvent) {
     }
 }
 
+/// Отправляет системное уведомление в фоне.
+///
+/// Ошибки демона (например, отсутствие D-Bus в голом SSH) намеренно
+/// игнорируются: входящее сообщение уже сохранено и отрисовано в TUI.
+fn notify_incoming(app: &Arc<App>, sender: &str, text: &str, unread: usize) {
+    let app = Arc::clone(app);
+    let sender = sender.to_string();
+    let text = text.to_string();
+
+    tokio::spawn(async move {
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = app.send_notification(&sender, &text, unread);
+        })
+        .await;
+    });
+}
+
 async fn handle_terminal_event(
     app: &Arc<App>,
     state: &mut UiState,
@@ -1728,7 +1964,20 @@ async fn handle_terminal_event(
             }
 
             if ctrl && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V')) {
-                paste_from_clipboard(state);
+                let can_paste = state
+                    .settings
+                    .as_ref()
+                    .map(|flow| flow.editing)
+                    .unwrap_or(true);
+                if can_paste {
+                    paste_from_clipboard(state);
+                }
+                return Ok(false);
+            }
+
+            // Модальное окно настроек перехватывает навигацию и ввод.
+            if state.settings.is_some() {
+                handle_settings_key(app, state, key);
                 return Ok(false);
             }
 
@@ -1747,15 +1996,6 @@ async fn handle_terminal_event(
 
             match key.code {
                 KeyCode::Enter => {
-                    if state.settings.is_some() {
-                        let raw = std::mem::take(&mut state.input);
-                        state.cursor = 0;
-                        state.history_index = None;
-                        state.history_draft.clear();
-                        submit_setting(app, state, raw);
-                        return Ok(false);
-                    }
-
                     if state.passwd.is_some() {
                         let raw = std::mem::take(&mut state.input);
                         state.cursor = 0;
@@ -1783,13 +2023,13 @@ async fn handle_terminal_event(
 
                     send_plain_message(app, state, &line).await;
                 }
-                KeyCode::Tab if state.passwd.is_none() && state.settings.is_none() => {
+                KeyCode::Tab if state.passwd.is_none() => {
                     complete_input(app, state)
                 }
-                KeyCode::Up if state.passwd.is_none() && state.settings.is_none() => {
+                KeyCode::Up if state.passwd.is_none() => {
                     history_prev(state)
                 }
-                KeyCode::Down if state.passwd.is_none() && state.settings.is_none() => {
+                KeyCode::Down if state.passwd.is_none() => {
                     history_next(state)
                 }
                 KeyCode::Char(c) => {
@@ -1821,16 +2061,6 @@ async fn handle_terminal_event(
                 KeyCode::PageUp => scroll_up(state, state.view_height.max(1)),
                 KeyCode::PageDown => scroll_down(state, state.view_height.max(1)),
                 KeyCode::Esc => {
-                    if state.settings.take().is_some() {
-                        state.input.clear();
-                        state.cursor = 0;
-                        state.history_index = None;
-                        state.history_draft.clear();
-                        push_system(state, "Настройка сети отменена");
-                        state.status = "настройка сети отменена".to_string();
-                        return Ok(false);
-                    }
-
                     if state.passwd.take().is_some() {
                         state.input.clear();
                         state.cursor = 0;
@@ -1855,14 +2085,26 @@ async fn handle_terminal_event(
             _ => {}
         },
         Event::Paste(text) => {
-            state.dl_cycle = None;
-            state.sf_cycle = None;
-            insert_text(state, &text);
+            let can_paste = state
+                .settings
+                .as_ref()
+                .map(|flow| flow.editing)
+                .unwrap_or(true);
+            if can_paste {
+                state.dl_cycle = None;
+                state.sf_cycle = None;
+                insert_text(state, &text);
+            }
+        }
+        Event::FocusGained => {
+            state.is_terminal_focused = true;
+        }
+        Event::FocusLost => {
+            state.is_terminal_focused = false;
         }
         Event::Resize(_, _) => {
             // Новые размеры будут учтены на следующем кадре.
         }
-        _ => {}
     }
 
     Ok(false)
@@ -1942,74 +2184,175 @@ fn submit_password(app: &App, state: &mut UiState, input: Zeroizing<String>) {
     }
 }
 
-/// Запускает пошаговый ввод сетевых параметров `/set`.
+/// Открывает модальное меню настроек `/set`.
 fn start_settings(app: &App, state: &mut UiState) {
     if state.passwd.is_some() {
         push_error(state, "Сначала завершите смену мастер-пароля");
         return;
     }
 
-    let flow = SettingsFlow::from_config(&app.get_config());
-    let prompt = settings_prompt(&flow);
-    state.settings = Some(flow);
+    state.settings = Some(SettingsFlow::from_config(&app.get_config()));
     state.input.clear();
     state.cursor = 0;
     state.history_index = None;
     state.history_draft.clear();
-    push_system(state, &prompt);
-    state.status = "настройка сети".to_string();
+    state.dl_cycle = None;
+    state.sf_cycle = None;
+    state.status = "настройки открыты".to_string();
 }
 
-/// Обрабатывает Enter в пошаговом вводе `/set`.
-fn submit_setting(app: &App, state: &mut UiState, raw: String) {
-    let Some(mut flow) = state.settings.take() else {
+/// Обрабатывает клавиши в модальном окне `/set`.
+fn handle_settings_key(app: &App, state: &mut UiState, key: KeyEvent) {
+    let (editing, field) = match state.settings.as_ref() {
+        Some(flow) => (flow.editing, flow.field()),
+        None => return,
+    };
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+    if editing {
+        match key.code {
+            KeyCode::Enter => {
+                let value = std::mem::take(&mut state.input);
+                if let Some(flow) = state.settings.as_mut() {
+                    flow.apply_edit(field, &value);
+                    flow.editing = false;
+                }
+                state.cursor = 0;
+                state.status = format!("настройки: {} обновлено", field.label());
+            }
+            KeyCode::Esc => {
+                if let Some(flow) = state.settings.as_mut() {
+                    flow.editing = false;
+                }
+                state.input.clear();
+                state.cursor = 0;
+                state.status = "редактирование отменено".to_string();
+            }
+            KeyCode::Char(c) if !ctrl => {
+                state.input.insert(state.cursor, c);
+                state.cursor += c.len_utf8();
+            }
+            KeyCode::Backspace => {
+                if state.cursor > 0 {
+                    let prev = prev_char_boundary(&state.input, state.cursor);
+                    state.input.remove(prev);
+                    state.cursor = prev;
+                }
+            }
+            KeyCode::Delete => {
+                if state.cursor < state.input.len() {
+                    state.input.remove(state.cursor);
+                }
+            }
+            KeyCode::Left => {
+                state.cursor = prev_char_boundary(&state.input, state.cursor);
+            }
+            KeyCode::Right => {
+                state.cursor = next_char_boundary(&state.input, state.cursor);
+            }
+            KeyCode::Home => state.cursor = 0,
+            KeyCode::End => state.cursor = state.input.len(),
+            _ => {}
+        }
+        return;
+    }
+
+    match key.code {
+        KeyCode::Esc => close_settings(app, state),
+        KeyCode::Up | KeyCode::BackTab => {
+            if let Some(flow) = state.settings.as_mut() {
+                flow.move_selection(-1);
+            }
+        }
+        KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            if let Some(flow) = state.settings.as_mut() {
+                flow.move_selection(-1);
+            }
+        }
+        KeyCode::Down | KeyCode::Tab => {
+            if let Some(flow) = state.settings.as_mut() {
+                flow.move_selection(1);
+            }
+        }
+        KeyCode::Left => {
+            if field.is_notify_level() {
+                if let Some(flow) = state.settings.as_mut() {
+                    flow.cycle_notify(-1);
+                }
+            }
+        }
+        KeyCode::Right => {
+            if field.is_notify_level() {
+                if let Some(flow) = state.settings.as_mut() {
+                    flow.cycle_notify(1);
+                }
+            }
+        }
+        KeyCode::Char(' ') => {
+            if field.is_notify_level() {
+                if let Some(flow) = state.settings.as_mut() {
+                    flow.cycle_notify(1);
+                }
+            }
+        }
+        KeyCode::Enter => {
+            if field.is_notify_level() {
+                if let Some(flow) = state.settings.as_mut() {
+                    flow.cycle_notify(1);
+                }
+                return;
+            }
+
+            if let Some(flow) = state.settings.as_mut() {
+                let value = flow.edit_value(field);
+                flow.editing = true;
+                state.input = value;
+                state.cursor = state.input.len();
+                state.history_index = None;
+                state.history_draft.clear();
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Закрывает `/set` с сохранением и немедленным применением настроек.
+fn close_settings(app: &App, state: &mut UiState) {
+    let Some(flow) = state.settings.take() else {
         return;
     };
 
-    // Пустая строка сохраняет прежнее значение параметра.
-    let value = raw.trim();
-    if !value.is_empty() {
-        match flow.stage {
-            SettingsStage::ServerUrl => flow.server_url = value.to_string(),
-            SettingsStage::FileServerUrl => flow.file_server_url = value.to_string(),
-            SettingsStage::HeaderName => flow.header_name = value.to_string(),
-            SettingsStage::HeaderValue => flow.header_value = Zeroizing::new(value.to_string()),
-        }
-    }
+    state.input.clear();
+    state.cursor = 0;
+    state.history_index = None;
+    state.history_draft.clear();
 
-    match settings_next_stage(flow.stage) {
-        Some(next) => {
-            flow.stage = next;
-            let prompt = settings_prompt(&flow);
-            state.settings = Some(flow);
-            push_system(state, &prompt);
-            state.status = format!(
-                "настройка: {} ({}/4)",
-                settings_stage_name(next),
-                settings_stage_number(next)
-            );
-        }
-        None => finish_settings(app, state, flow),
-    }
-}
-
-fn finish_settings(app: &App, state: &mut UiState, flow: SettingsFlow) {
-    let config = Config {
-        server_url: flow.server_url,
-        file_server_url: flow.file_server_url,
-        mask_header_name: flow.header_name,
-        mask_header_value: flow.header_value.to_string(),
-    };
+    let config = flow.to_config();
+    let proxy_note = config
+        .proxy_url
+        .as_deref()
+        .map(|url| format!(" Прокси: {}.", url))
+        .unwrap_or_else(|| " Прокси: прямое подключение.".to_string());
 
     match app.update_config(config) {
         Ok(()) => {
             push_system(
                 state,
-                "Сетевые настройки сохранены в зашифрованный конфиг и применены.",
+                &format!(
+                    "Настройки сохранены в зашифрованный конфиг и применены.{}",
+                    proxy_note
+                ),
             );
-            state.status = "сетевые настройки применены".to_string();
+            state.status = "настройки применены".to_string();
         }
-        Err(e) => push_error(state, &format!("Не удалось сохранить настройки: {:#}", e)),
+        Err(e) => {
+            push_error(
+                state,
+                &format!("Не удалось сохранить настройки: {:#}", e),
+            );
+            state.status = "ошибка настроек".to_string();
+            state.settings = Some(flow);
+        }
     }
 }
 
@@ -2553,11 +2896,78 @@ async fn handle_command(
             state.status = text.to_lowercase();
         }
 
-        "/set" => start_settings(app, state),
+        "/set" => match parts.get(1).copied() {
+            None => start_settings(app, state),
+            Some("notify") => {
+                let Some(raw) = parts.get(2).copied() else {
+                    let level = app.get_config().notify_level;
+                    push_system(
+                        state,
+                        &format!(
+                            "Notify Level: {}\nИспользование: /set notify <0|1|2|3>",
+                            notify_level_label(level)
+                        ),
+                    );
+                    return Ok(false);
+                };
+
+                let level = match raw.parse::<u8>() {
+                    Ok(level) if level <= 3 => level,
+                    _ => {
+                        push_error(state, "Использование: /set notify <0|1|2|3>");
+                        return Ok(false);
+                    }
+                };
+
+                let mut config = app.get_config();
+                config.notify_level = level;
+                match app.update_config(config) {
+                    Ok(()) => {
+                        push_system(
+                            state,
+                            &format!("Notify Level: {}", notify_level_label(level)),
+                        );
+                        state.status = "режим уведомлений обновлён".to_string();
+                    }
+                    Err(e) => push_error(
+                        state,
+                        &format!("Не удалось сохранить настройки: {:#}", e),
+                    ),
+                }
+            }
+            Some("test") => {
+                let app_ref = app.clone();
+                let tx = ui_tx.clone();
+                state.status = "отправка тестового уведомления...".to_string();
+
+                tokio::spawn(async move {
+                    let result =
+                        tokio::task::spawn_blocking(move || app_ref.send_test_notification())
+                            .await;
+
+                    let notice = match result {
+                        Ok(Ok(())) => UiNotice::Status(
+                            "тестовое уведомление отправлено".to_string(),
+                        ),
+                        Ok(Err(e)) => {
+                            UiNotice::Error(format!("Ошибка уведомления: {:#}", e))
+                        }
+                        Err(e) => {
+                            UiNotice::Error(format!("Ошибка уведомления: {}", e))
+                        }
+                    };
+                    let _ = tx.send(notice);
+                });
+            }
+            Some(_) => push_error(
+                state,
+                "Использование: /set, /set notify <0|1|2|3> или /set test",
+            ),
+        },
 
         "/passwd" => {
             if state.settings.is_some() {
-                push_error(state, "Сначала завершите настройку сети (Esc — отмена)");
+                push_error(state, "Сначала закройте настройки (Esc — сохранить и выйти)");
             } else if state.passwd.is_some() {
                 push_error(state, "Смена мастер-пароля уже начата");
             } else {

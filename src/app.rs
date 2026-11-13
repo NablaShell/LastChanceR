@@ -220,8 +220,8 @@ impl App {
         let ed25519_pub_key_hex = identity.get_ed25519_public_key_hex();
 
         // Initialize network
-        let sender = Arc::new(Sender::new(&config));
-        let listener = Arc::new(Listener::new(&config));
+        let sender = Arc::new(Sender::new(&config)?);
+        let listener = Arc::new(Listener::new(&config)?);
 
         // Load shared secrets
         let shared_secrets = Arc::new(Mutex::new(HashMap::new()));
@@ -302,13 +302,20 @@ impl App {
         let event_sender = self.event_sender.clone();
 
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(5));
-            let base_interval = Duration::from_secs(5);
-            let mut current_interval = base_interval;
+            // Пауза только перед повтором после ошибки: 1s -> 2s -> 5s -> 15s.
+            const BACKOFF: [Duration; 4] = [
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(5),
+                Duration::from_secs(15),
+            ];
+            // Не-ретраибельные ошибки (401, протокол) не должны вызывать
+            // busy-loop, поэтому повторяем их с максимальной паузой.
+            const NON_RETRYABLE_DELAY: Duration = Duration::from_secs(15);
+
+            let mut backoff_index = 0usize;
 
             loop {
-                interval.tick().await;
-
                 match listener
                     .pull_messages_with_auth(
                         &identity_hash,
@@ -318,10 +325,7 @@ impl App {
                     .await
                 {
                     Ok(messages) => {
-                        if current_interval != base_interval {
-                            current_interval = base_interval;
-                            interval = tokio::time::interval(current_interval);
-                        }
+                        backoff_index = 0;
 
                         for packet in messages {
                             Self::handle_incoming_packet(
@@ -335,20 +339,23 @@ impl App {
                             )
                             .await;
                         }
+
+                        // 200 OK и 204 No Content не требуют паузы: следующий
+                        // long-poll запрос уходит сразу же.
                     }
                     Err(e) => {
                         warn!("Pull error: {}", e);
 
-                        // Implement backoff for rate limiting
-                        if e.to_string().contains("rate limited") {
-                            current_interval =
-                                std::cmp::min(current_interval * 2, Duration::from_secs(60));
-                            interval = tokio::time::interval(current_interval);
-                            info!(
-                                "Rate limited, increasing interval to {:?}",
-                                current_interval
-                            );
-                        }
+                        let delay = if e.is_retryable() {
+                            let delay = BACKOFF[backoff_index.min(BACKOFF.len() - 1)];
+                            backoff_index = (backoff_index + 1).min(BACKOFF.len() - 1);
+                            delay
+                        } else {
+                            NON_RETRYABLE_DELAY
+                        };
+
+                        info!("Pull retry in {:?}", delay);
+                        tokio::time::sleep(delay).await;
                     }
                 }
             }
@@ -886,7 +893,9 @@ impl App {
 
     /// Сохраняет новые сетевые параметры и сразу применяет их в работающих
     /// `Sender`/`Listener`, не требуя перезапуска клиента.
-    pub fn update_config(&self, config: Config) -> Result<()> {
+    pub fn update_config(&self, mut config: Config) -> Result<()> {
+        config.normalize();
+        config.validate()?;
         config.save(&self.base_dir, &self.vault)?;
 
         self.sender.update_config(&config)?;
@@ -905,9 +914,45 @@ impl App {
         &self.storage
     }
 
+    /// Показывает системное уведомление о входящем сообщении.
+    ///
+    /// Ошибки демона уведомлений (например, при работе по SSH без D-Bus)
+    /// возвращаются вызывающему, который для входящих сообщений их игнорирует.
+    pub fn send_notification(&self, sender: &str, text: &str, unread: usize) -> Result<()> {
+        let config = self.get_config();
+        match config.notification_content(sender, text, unread) {
+            Some((title, body)) => show_system_notification(&title, &body),
+            None => Ok(()),
+        }
+    }
+
+    /// Отправляет тестовое уведомление с текущими настройками (`/set test`).
+    pub fn send_test_notification(&self) -> Result<()> {
+        let config = self.get_config();
+        let (title, body) = config
+            .notification_content(
+                "LastChance",
+                "Тестовое сообщение: уведомления настроены.",
+                1,
+            )
+            .ok_or_else(|| anyhow!("уведомления отключены (Notify Level: 0)"))?;
+
+        show_system_notification(&title, &body)
+    }
+
     pub fn get_safe_fs(&self) -> &Arc<SafeFSOps> {
         &self.safe_fs
     }
+}
+
+fn show_system_notification(title: &str, body: &str) -> Result<()> {
+    notify_rust::Notification::new()
+        .appname("LastChance")
+        .summary(title)
+        .body(body)
+        .show()
+        .map(|_| ())
+        .map_err(|e| anyhow!("notification daemon error: {}", e))
 }
 
 // ============================================================
@@ -990,6 +1035,11 @@ mod tests {
         config.file_server_url = "https://new-files.example".to_string();
         config.mask_header_name = "X-Custom-Guard".to_string();
         config.mask_header_value = "new-secret".to_string();
+        config.proxy_url = Some("socks5://127.0.0.1:9050".to_string());
+        config.notify_level = 1;
+        config.stealth_title = "Перерыв".to_string();
+        config.stealth_body = "Отдых {sec}, писем: {count}".to_string();
+        config.stealth_seconds = "10-15".to_string();
 
         app.update_config(config.clone()).unwrap();
 
@@ -998,6 +1048,14 @@ mod tests {
         assert_eq!(applied.file_server_url, config.file_server_url);
         assert_eq!(applied.mask_header_name, config.mask_header_name);
         assert_eq!(applied.mask_header_value, config.mask_header_value);
+        assert_eq!(
+            applied.proxy_url.as_deref(),
+            Some("socks5h://127.0.0.1:9050")
+        );
+        assert_eq!(applied.notify_level, 1);
+        assert_eq!(applied.stealth_title, "Перерыв");
+        assert_eq!(applied.stealth_body, "Отдых {sec}, писем: {count}");
+        assert_eq!(applied.stealth_seconds, "10-15");
 
         let config_path = temp_dir.path().join("global.conf");
         let raw = std::fs::read(&config_path).unwrap();
@@ -1008,6 +1066,14 @@ mod tests {
         let reopened_vault = Vault::unlock(base_dir, "test-password").unwrap();
         let saved = Config::load(base_dir, &reopened_vault).unwrap();
         assert_eq!(saved.mask_header_value, "new-secret");
+        assert_eq!(
+            saved.proxy_url.as_deref(),
+            Some("socks5h://127.0.0.1:9050")
+        );
+        assert_eq!(saved.notify_level, 1);
+        assert_eq!(saved.stealth_title, "Перерыв");
+        assert_eq!(saved.stealth_body, "Отдых {sec}, писем: {count}");
+        assert_eq!(saved.stealth_seconds, "10-15");
     }
 
     #[test]

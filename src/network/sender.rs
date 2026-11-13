@@ -3,38 +3,43 @@ use anyhow::{anyhow, Result};
 use reqwest::Client;
 use std::sync::RwLock;
 use std::time::Duration;
-use crate::network::Config;
+use crate::network::{build_http_client, Config};
 
 const MAX_UPLOAD_SIZE: usize = 100 * 1024 * 1024; // 100 MB
 const ALLOWED_PACKET_SIZES: [usize; 4] = [256, 1024, 4096, 65536];
+// Один клиент на всё; таймаут 120s покрывает upload до 100 MB.
+const CLIENT_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub struct Sender {
-    client: Client,
+    client: RwLock<Client>,
     config: RwLock<Config>,
 }
 
 impl Sender {
-    pub fn new(config: &Config) -> Self {
-        // Один клиент на всё; таймаут 120s покрывает upload до 100 MB.
-        let client = Client::builder()
-            .timeout(Duration::from_secs(120))
-            .pool_max_idle_per_host(10)
-            .build()
-            .unwrap_or_default();
+    pub fn new(config: &Config) -> Result<Self> {
+        let client = build_http_client(CLIENT_TIMEOUT, config.proxy_url.as_deref())?;
 
-        Self {
-            client,
+        Ok(Self {
+            client: RwLock::new(client),
             config: RwLock::new(config.clone()),
-        }
+        })
     }
 
-    /// Применяет новые сетевые параметры без перезапуска клиента.
+    /// Применяет новые сетевые параметры и пересобирает клиент под новый прокси.
     pub fn update_config(&self, config: &Config) -> Result<()> {
-        let mut guard = self
+        let client = build_http_client(CLIENT_TIMEOUT, config.proxy_url.as_deref())?;
+
+        let mut config_guard = self
             .config
             .write()
             .map_err(|_| anyhow!("конфигурация отправителя недоступна: блокировка повреждена"))?;
-        *guard = config.clone();
+        let mut client_guard = self
+            .client
+            .write()
+            .map_err(|_| anyhow!("HTTP-клиент отправителя недоступен: блокировка повреждена"))?;
+
+        *config_guard = config.clone();
+        *client_guard = client;
         Ok(())
     }
 
@@ -43,6 +48,13 @@ impl Sender {
             .read()
             .map(|config| config.clone())
             .map_err(|_| anyhow!("конфигурация отправителя недоступна: блокировка повреждена"))
+    }
+
+    fn current_client(&self) -> Result<Client> {
+        self.client
+            .read()
+            .map(|client| client.clone())
+            .map_err(|_| anyhow!("HTTP-клиент отправителя недоступен: блокировка повреждена"))
     }
 
     pub async fn send_message(&self, target_hash: &str, packet: &[u8]) -> Result<()> {
@@ -55,6 +67,7 @@ impl Sender {
         }
 
         let config = self.current_config()?;
+        let client = self.current_client()?;
         let url = format!("{}/push/{}", config.server_url, target_hash);
 
         let max_retries = 3;
@@ -62,8 +75,7 @@ impl Sender {
         let mut last_err: Option<String> = None;
 
         for attempt in 0..=max_retries {
-            let result = self
-                .client
+            let result = client
                 .post(&url)
                 .header("Content-Type", "application/octet-stream")
                 .header("Content-Length", packet.len().to_string())
@@ -132,9 +144,10 @@ impl Sender {
         }
 
         let config = self.current_config()?;
+        let client = self.current_client()?;
         let url = format!("{}/upload", config.file_server_url);
 
-        let response = self.client
+        let response = client
             .post(&url)
             .header("Content-Type", "application/octet-stream")
             // Content-Length обязателен (API.md §5.1). body(Bytes) его ставит сам,

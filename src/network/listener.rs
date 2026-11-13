@@ -5,37 +5,89 @@ use reqwest::header::CONTENT_TYPE;
 use reqwest::Client;
 use std::sync::RwLock;
 use std::time::Duration;
-use crate::network::Config;
+use crate::network::{build_http_client, Config};
 
 /// Один из допустимых размеров пакета (см. API.md §4.1).
 const ALLOWED_PACKET_SIZES: [usize; 4] = [256, 1024, 4096, 65536];
 
+/// Сколько секунд сервер держит входящий long-poll запрос.
+const LONG_POLL_WAIT_SECS: u64 = 25;
+/// Таймаут клиента должен быть больше `wait` с запасом на анонимные сети.
+const PULL_TIMEOUT: Duration = Duration::from_secs(45);
+/// Скачивание файла может идти дольше обычного запроса.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Ошибка long-poll запроса, от которой зависит стратегия повторов.
+#[derive(Debug)]
+pub enum PullError {
+    /// Транспортная ошибка: обрыв, таймаут, недоступный прокси.
+    Network(String),
+    /// Сервер ответил 429.
+    RateLimited,
+    /// Сервер ответил 401.
+    Unauthorized(String),
+    /// Сервер ответил 4xx/5xx.
+    Server(u16, String),
+    /// Нарушение протокола: неожиданный Content-Type, битый multipart.
+    Protocol(String),
+}
+
+impl std::fmt::Display for PullError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PullError::Network(message) => write!(f, "pull request failed: {}", message),
+            PullError::RateLimited => write!(f, "rate limited (429)"),
+            PullError::Unauthorized(body) => write!(f, "unauthorized (401): {}", body),
+            PullError::Server(code, body) => write!(f, "server returned {}: {}", code, body),
+            PullError::Protocol(message) => write!(f, "{}", message),
+        }
+    }
+}
+
+impl std::error::Error for PullError {}
+
+impl PullError {
+    /// Повторять запрос после паузы имеет смысл при сетевых сбоях,
+    /// ответах 5xx и 429.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            PullError::Network(_) | PullError::RateLimited => true,
+            PullError::Server(code, _) => *code >= 500,
+            PullError::Unauthorized(_) | PullError::Protocol(_) => false,
+        }
+    }
+}
+
 pub struct Listener {
-    client: Client,
+    client: RwLock<Client>,
     config: RwLock<Config>,
 }
 
 impl Listener {
-    pub fn new(config: &Config) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(60))
-            .pool_max_idle_per_host(10)
-            .build()
-            .unwrap_or_default();
+    pub fn new(config: &Config) -> Result<Self> {
+        let client = build_http_client(PULL_TIMEOUT, config.proxy_url.as_deref())?;
 
-        Self {
-            client,
+        Ok(Self {
+            client: RwLock::new(client),
             config: RwLock::new(config.clone()),
-        }
+        })
     }
 
-    /// Применяет новые сетевые параметры без перезапуска клиента.
+    /// Применяет новые сетевые параметры и пересобирает клиент под новый прокси.
     pub fn update_config(&self, config: &Config) -> Result<()> {
-        let mut guard = self
+        let client = build_http_client(PULL_TIMEOUT, config.proxy_url.as_deref())?;
+
+        let mut config_guard = self
             .config
             .write()
             .map_err(|_| anyhow!("конфигурация слушателя недоступна: блокировка повреждена"))?;
-        *guard = config.clone();
+        let mut client_guard = self
+            .client
+            .write()
+            .map_err(|_| anyhow!("HTTP-клиент слушателя недоступен: блокировка повреждена"))?;
+
+        *config_guard = config.clone();
+        *client_guard = client;
         Ok(())
     }
 
@@ -46,22 +98,39 @@ impl Listener {
             .map_err(|_| anyhow!("конфигурация слушателя недоступна: блокировка повреждена"))
     }
 
+    fn current_client(&self) -> Result<Client> {
+        self.client
+            .read()
+            .map(|client| client.clone())
+            .map_err(|_| anyhow!("HTTP-клиент слушателя недоступен: блокировка повреждена"))
+    }
+
     pub async fn pull_messages_with_auth(
         &self,
         identity_hash: &str,
         pub_key_hex: &str,          // hex(ed25519_public_key) — НЕ хеш!
         signing_key: &SigningKey,
-    ) -> Result<Vec<Vec<u8>>> {
-        let config = self.current_config()?;
+    ) -> std::result::Result<Vec<Vec<u8>>, PullError> {
+        let config = self
+            .current_config()
+            .map_err(|e| PullError::Protocol(e.to_string()))?;
+        let client = self
+            .current_client()
+            .map_err(|e| PullError::Protocol(e.to_string()))?;
         let now = chrono::Utc::now().timestamp().to_string();
         // message = timestamp + target_hash (без разделителя, API.md §4.2)
         let message = format!("{}{}", now, identity_hash);
         let signature = signing_key.sign(message.as_bytes());
         let sig_hex = hex::encode(signature.to_bytes());
 
-        let url = format!("{}/pull/{}", config.server_url, identity_hash);
+        // ?wait=25 включает серверный HTTP long-poll: пустая очередь держит
+        // соединение до появления сообщения или истечения wait.
+        let url = format!(
+            "{}/pull/{}?wait={}",
+            config.server_url, identity_hash, LONG_POLL_WAIT_SECS
+        );
 
-        let response = self.client
+        let response = client
             .get(&url)
             .header("X-Identity-Key", pub_key_hex)
             .header("X-Timestamp", &now)
@@ -72,7 +141,7 @@ impl Listener {
             .header(&config.mask_header_name, &config.mask_header_value)
             .send()
             .await
-            .map_err(|e| anyhow!("pull request failed: {}", e))?;
+            .map_err(|e| PullError::Network(e.to_string()))?;
 
         let status = response.status();
 
@@ -81,17 +150,17 @@ impl Listener {
         }
 
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            return Err(anyhow!("rate limited (429)"));
+            return Err(PullError::RateLimited);
         }
 
         if status == reqwest::StatusCode::UNAUTHORIZED {
             let body = response.text().await.unwrap_or_default();
-            return Err(anyhow!("unauthorized (401): {}", body));
+            return Err(PullError::Unauthorized(body));
         }
 
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            return Err(anyhow!("server returned {}: {}", status, body));
+            return Err(PullError::Server(status.as_u16(), body));
         }
 
         // Content-Type должен быть multipart/form-data; boundary=...
@@ -105,18 +174,19 @@ impl Listener {
         let bytes = response
             .bytes()
             .await
-            .map_err(|e| anyhow!("read body: {}", e))?;
+            .map_err(|e| PullError::Network(format!("read body: {}", e)))?;
 
         if !content_type.starts_with("multipart/") {
             // API.md гарантирует multipart на 200, но если сервер вернул
             // что-то иное — не молча делаем вид, что это один пакет.
-            return Err(anyhow!(
+            return Err(PullError::Protocol(format!(
                 "unexpected Content-Type on /pull: {:?}",
                 content_type
-            ));
+            )));
         }
 
-        let messages = parse_multipart(&content_type, &bytes)?;
+        let messages = parse_multipart(&content_type, &bytes)
+            .map_err(|e| PullError::Protocol(e.to_string()))?;
 
         // Валидация размеров (API.md §4.1: ровно 256/1024/4096/65536)
         for m in &messages {
@@ -138,10 +208,14 @@ impl Listener {
         }
 
         let config = self.current_config()?;
+        let client = self.current_client()?;
         let url = format!("{}/download/{}", config.file_server_url, file_hash);
 
-        let response = self.client
+        let response = client
             .get(&url)
+            // Общий таймаут клиента рассчитан на long-poll; файл может
+            // качаться дольше, поэтому для download задаём свой лимит.
+            .timeout(DOWNLOAD_TIMEOUT)
             .header("X-Requested-With", "XMLHttpRequest")
             .header("User-Agent", "Mozilla/5.0 (X11; Arch Linux; rv:130.0) Gecko/20100101 Firefox/130.0")
             .header(&config.mask_header_name, &config.mask_header_value)
