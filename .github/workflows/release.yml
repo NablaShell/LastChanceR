@@ -1,0 +1,48 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset_name: lastchance-linux-x86_64
+            bin_name: lastchance
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset_name: lastchance-windows-x86_64.exe
+            bin_name: lastchance.exe
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset_name: lastchance-macos-arm64
+            bin_name: lastchance
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Скачать код репозитория
+        uses: actions/checkout@v4
+
+      - name: Установить Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Собрать релизный бинарник
+        run: cargo build --release
+
+      - name: Подготовить файл к загрузке
+        shell: bash
+        run: cp target/release/${{ matrix.bin_name }} ${{ matrix.asset_name }}
+
+      - name: Прикрепить к GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.asset_name }}

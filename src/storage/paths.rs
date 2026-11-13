@@ -104,9 +104,37 @@ fn normalize_path(path: &Path) -> PathBuf {
     out
 }
 
+/// Возвращает базовую директорию с приоритетом:
+/// 1. явный аргумент `--data-dir` (передаётся из CLI);
+/// 2. переменная окружения `LASTCHANCE_DIR`;
+/// 3. переносимый режим (файл `.portable` рядом с бинарником);
+/// 4. стандартный системный путь.
+///
+/// Директория создаётся через `create_dir_all`, если её ещё нет.
 pub fn get_base_dir() -> Result<String> {
+    get_base_dir_with_override(None)
+}
+
+pub fn get_base_dir_with_override(cli_override: Option<&str>) -> Result<String> {
     use std::env;
 
+    // 1. Аргумент CLI.
+    if let Some(path) = cli_override {
+        let path = path.trim();
+        if path.is_empty() {
+            return Err(anyhow!("--data-dir: путь не должен быть пустым"));
+        }
+        return ensure_base_dir(PathBuf::from(path), "--data-dir");
+    }
+
+    // 2. Переменная окружения.
+    if let Some(dir) = env::var_os("LASTCHANCE_DIR") {
+        if !dir.is_empty() {
+            return ensure_base_dir(PathBuf::from(dir), "LASTCHANCE_DIR");
+        }
+    }
+
+    // 3. Переносимый режим.
     let exec_path =
         env::current_exe().map_err(|e| anyhow!("unable to get executable path: {}", e))?;
     let exec_dir = exec_path
@@ -115,12 +143,10 @@ pub fn get_base_dir() -> Result<String> {
 
     let portable_flag = exec_dir.join(".portable");
     if portable_flag.exists() {
-        let base_dir = exec_dir.join("data");
-        fs::create_dir_all(&base_dir)
-            .map_err(|e| anyhow!("failed to create portable data directory: {}", e))?;
-        return Ok(base_dir.to_string_lossy().to_string());
+        return ensure_base_dir(exec_dir.join("data"), "portable mode");
     }
 
+    // 4. Стандартный системный путь.
     let data_home = if cfg!(target_os = "windows") {
         env::var("LOCALAPPDATA").unwrap_or_else(|_| {
             dirs::home_dir()
@@ -141,12 +167,25 @@ pub fn get_base_dir() -> Result<String> {
         })
     };
 
-    let base_dir = PathBuf::from(data_home).join("lastchance");
-    fs::create_dir_all(&base_dir)
-        .map_err(|e| anyhow!("failed to create app data directory: {}", e))?;
-
-    Ok(base_dir.to_string_lossy().to_string())
+    ensure_base_dir(
+        PathBuf::from(data_home).join("lastchance"),
+        "system default",
+    )
 }
+
+fn ensure_base_dir(path: PathBuf, source: &str) -> Result<String> {
+    fs::create_dir_all(&path).map_err(|e| {
+        anyhow!(
+            "failed to create data directory from {} ({:?}): {}",
+            source,
+            path,
+            e
+        )
+    })?;
+
+    Ok(path.to_string_lossy().to_string())
+}
+
 
 #[cfg(test)]
 mod tests {
