@@ -3,6 +3,7 @@ use anyhow::{anyhow, Result};
 use ed25519_dalek::{Signer, SigningKey};
 use reqwest::header::CONTENT_TYPE;
 use reqwest::Client;
+use std::sync::RwLock;
 use std::time::Duration;
 use crate::network::Config;
 
@@ -11,7 +12,7 @@ const ALLOWED_PACKET_SIZES: [usize; 4] = [256, 1024, 4096, 65536];
 
 pub struct Listener {
     client: Client,
-    config: Config,
+    config: RwLock<Config>,
 }
 
 impl Listener {
@@ -24,8 +25,25 @@ impl Listener {
 
         Self {
             client,
-            config: config.clone(),
+            config: RwLock::new(config.clone()),
         }
+    }
+
+    /// Применяет новые сетевые параметры без перезапуска клиента.
+    pub fn update_config(&self, config: &Config) -> Result<()> {
+        let mut guard = self
+            .config
+            .write()
+            .map_err(|_| anyhow!("конфигурация слушателя недоступна: блокировка повреждена"))?;
+        *guard = config.clone();
+        Ok(())
+    }
+
+    fn current_config(&self) -> Result<Config> {
+        self.config
+            .read()
+            .map(|config| config.clone())
+            .map_err(|_| anyhow!("конфигурация слушателя недоступна: блокировка повреждена"))
     }
 
     pub async fn pull_messages_with_auth(
@@ -34,13 +52,14 @@ impl Listener {
         pub_key_hex: &str,          // hex(ed25519_public_key) — НЕ хеш!
         signing_key: &SigningKey,
     ) -> Result<Vec<Vec<u8>>> {
+        let config = self.current_config()?;
         let now = chrono::Utc::now().timestamp().to_string();
         // message = timestamp + target_hash (без разделителя, API.md §4.2)
         let message = format!("{}{}", now, identity_hash);
         let signature = signing_key.sign(message.as_bytes());
         let sig_hex = hex::encode(signature.to_bytes());
 
-        let url = format!("{}/pull/{}", self.config.server_url, identity_hash);
+        let url = format!("{}/pull/{}", config.server_url, identity_hash);
 
         let response = self.client
             .get(&url)
@@ -50,7 +69,7 @@ impl Listener {
             .header("X-Requested-With", "XMLHttpRequest")
             .header("Accept", "multipart/form-data")
             .header("User-Agent", "Mozilla/5.0 (X11; Arch Linux; rv:130.0) Gecko/20100101 Firefox/130.0")
-            .header(&self.config.mask_header_name, &self.config.mask_header_value)
+            .header(&config.mask_header_name, &config.mask_header_value)
             .send()
             .await
             .map_err(|e| anyhow!("pull request failed: {}", e))?;
@@ -118,13 +137,14 @@ impl Listener {
             return Err(anyhow!("empty file_hash"));
         }
 
-        let url = format!("{}/download/{}", self.config.file_server_url, file_hash);
+        let config = self.current_config()?;
+        let url = format!("{}/download/{}", config.file_server_url, file_hash);
 
         let response = self.client
             .get(&url)
             .header("X-Requested-With", "XMLHttpRequest")
             .header("User-Agent", "Mozilla/5.0 (X11; Arch Linux; rv:130.0) Gecko/20100101 Firefox/130.0")
-            .header(&self.config.mask_header_name, &self.config.mask_header_value)
+            .header(&config.mask_header_name, &config.mask_header_value)
             .send()
             .await
             .map_err(|e| anyhow!("download request failed: {}", e))?;
@@ -216,10 +236,14 @@ fn parse_multipart(content_type: &str, body: &[u8]) -> Result<Vec<Vec<u8>>> {
         }
         pos += 2;
 
-        // Ищем конец заголовков части (пустая строка)
-        let headers_end = find_subsequence(&body[pos..], b"\r\n\r\n")
+        // Ищем конец заголовков части (пустая строка).
+        // Отсчёт начинаем на два байта раньше: у части без заголовков
+        // терминатор `\r\n\r\n` состоит из CRLF после boundary и пустой
+        // строки заголовков. Иначе такой (валидный) multipart не разобрать.
+        let headers_start = pos.saturating_sub(2);
+        let headers_end = find_subsequence(&body[headers_start..], b"\r\n\r\n")
             .ok_or_else(|| anyhow!("multipart part has no header terminator"))?;
-        let payload_start = pos + headers_end + 4;
+        let payload_start = headers_start + headers_end + 4;
 
         // Ищем следующий delimiter
         let next = find_subsequence(&body[payload_start..], &delimiter)

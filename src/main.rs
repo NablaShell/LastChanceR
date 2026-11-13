@@ -29,8 +29,9 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc;
+use zeroize::Zeroizing;
 
-use lastchance::{get_base_dir_with_override, App, AppEvent, Config};
+use lastchance::{get_base_dir_with_override, vault, App, AppEvent, Config, Vault};
 
 const HELP: &str = "\
 Команды (алиасы):
@@ -57,6 +58,12 @@ const HELP: &str = "\
                                 path — файл или папка, иначе ./downloads/<name>
   /nick <name>                — сменить свой ник
   /rename <hash> <name>       — переименовать контакт
+  /set, /settings             — сетевые параметры: URL текстового и файлового
+                                серверов, имя и значение защитного заголовка
+                                (Enter на пустой строке — оставить как есть,
+                                Esc — отмена)
+  /passwd                     — сменить мастер-пароль (файлы и база
+                                перешифровываются)
   /sidebar, /sb               — скрыть/показать панель чатов
   /quit, /q, /exit            — выход
 
@@ -133,6 +140,8 @@ const COMMANDS: &[&str] = &[
     "/download",
     "/nick",
     "/rename",
+    "/set",
+    "/passwd",
     "/sidebar",
     "/quit",
     "/exit",
@@ -175,6 +184,121 @@ struct UiState {
     /// Требуется очистка экрана перед следующей перерисовкой (после вывода
     /// диагностики библиотек в stderr, чтобы ratatui не «поехал»).
     needs_clear: bool,
+    /// Активный диалог смены мастер-пароля.
+    passwd: Option<PasswdFlow>,
+    /// Активный пошаговый ввод сетевых настроек.
+    settings: Option<SettingsFlow>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PasswdStage {
+    Current,
+    New,
+    Confirm,
+}
+
+/// Пошаговый ввод паролей для `/passwd`.
+/// Пароли хранятся в `Zeroizing`, чтобы затираться при отмене/завершении.
+struct PasswdFlow {
+    stage: PasswdStage,
+    old: Zeroizing<String>,
+    new: Zeroizing<String>,
+}
+
+impl PasswdFlow {
+    fn new() -> Self {
+        Self {
+            stage: PasswdStage::Current,
+            old: Zeroizing::new(String::new()),
+            new: Zeroizing::new(String::new()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsStage {
+    ServerUrl,
+    FileServerUrl,
+    HeaderName,
+    HeaderValue,
+}
+
+/// Пошаговый ввод сетевых параметров для `/set`.
+/// Значение защитного заголовка не показывается на экране.
+struct SettingsFlow {
+    stage: SettingsStage,
+    server_url: String,
+    file_server_url: String,
+    header_name: String,
+    header_value: Zeroizing<String>,
+}
+
+impl SettingsFlow {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            stage: SettingsStage::ServerUrl,
+            server_url: config.server_url.clone(),
+            file_server_url: config.file_server_url.clone(),
+            header_name: config.mask_header_name.clone(),
+            header_value: Zeroizing::new(config.mask_header_value.clone()),
+        }
+    }
+
+    fn value(&self, stage: SettingsStage) -> &str {
+        match stage {
+            SettingsStage::ServerUrl => &self.server_url,
+            SettingsStage::FileServerUrl => &self.file_server_url,
+            SettingsStage::HeaderName => &self.header_name,
+            SettingsStage::HeaderValue => self.header_value.as_str(),
+        }
+    }
+}
+
+fn settings_stage_number(stage: SettingsStage) -> usize {
+    match stage {
+        SettingsStage::ServerUrl => 1,
+        SettingsStage::FileServerUrl => 2,
+        SettingsStage::HeaderName => 3,
+        SettingsStage::HeaderValue => 4,
+    }
+}
+
+fn settings_stage_name(stage: SettingsStage) -> &'static str {
+    match stage {
+        SettingsStage::ServerUrl => "URL текстового сервера",
+        SettingsStage::FileServerUrl => "URL файлового сервера",
+        SettingsStage::HeaderName => "имя защитного заголовка",
+        SettingsStage::HeaderValue => "значение защитного заголовка",
+    }
+}
+
+fn settings_next_stage(stage: SettingsStage) -> Option<SettingsStage> {
+    match stage {
+        SettingsStage::ServerUrl => Some(SettingsStage::FileServerUrl),
+        SettingsStage::FileServerUrl => Some(SettingsStage::HeaderName),
+        SettingsStage::HeaderName => Some(SettingsStage::HeaderValue),
+        SettingsStage::HeaderValue => None,
+    }
+}
+
+/// Не показывает реальное значение защитного заголовка даже в подсказке.
+fn settings_display_value(stage: SettingsStage, value: &str) -> String {
+    if value.is_empty() {
+        "(не задано)".to_string()
+    } else if stage == SettingsStage::HeaderValue {
+        "********".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn settings_prompt(flow: &SettingsFlow) -> String {
+    format!(
+        "Настройка сети ({}/4): {}.\nТекущее значение: {}\nВведите новое значение и нажмите Enter. Пустая строка — оставить текущее, Esc — отмена.",
+        settings_stage_number(flow.stage),
+        settings_stage_name(flow.stage),
+        settings_display_value(flow.stage, flow.value(flow.stage)),
+    )
 }
 
 enum UiNotice {
@@ -218,6 +342,8 @@ impl UiState {
             sf_cycle: None,
             clipboard,
             needs_clear: false,
+            passwd: None,
+            settings: None,
         };
         refresh_chats(app, &mut state);
         reload_room(app, &mut state);
@@ -690,6 +816,7 @@ fn normalize_command(cmd: &str) -> &str {
         "/p" => "/profile",
         "/h" | "/?" => "/help",
         "/sb" => "/sidebar",
+        "/settings" => "/set",
         other => other,
     }
 }
@@ -706,6 +833,7 @@ fn alias_to_command(cmd: &str) -> Option<&'static str> {
         "/p" => Some("/profile"),
         "/h" | "/?" => Some("/help"),
         "/sb" => Some("/sidebar"),
+        "/settings" => Some("/set"),
         _ => None,
     }
 }
@@ -1345,10 +1473,19 @@ fn draw_ui(frame: &mut Frame, state: &mut UiState) {
     } else {
         format!("{} ({})", state.room_label, short_hash(&state.room))
     };
-    let status = format!(
-        " {}   Room: {}   {} ",
-        state.nickname, room, state.status
-    );
+    let status = if let Some(flow) = state.settings.as_ref() {
+        format!(
+            " Настройка {}/4: {}   Текущее: {}   Enter — оставить, Esc — отмена ",
+            settings_stage_number(flow.stage),
+            settings_stage_name(flow.stage),
+            settings_display_value(flow.stage, flow.value(flow.stage)),
+        )
+    } else {
+        format!(
+            " {}   Room: {}   {} ",
+            state.nickname, room, state.status
+        )
+    };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             status,
@@ -1358,7 +1495,28 @@ fn draw_ui(frame: &mut Frame, state: &mut UiState) {
     );
 
     // ---------- 3. Поле ввода ----------
-    let input_block = Block::default().borders(Borders::ALL).title(" Ввод ");
+    let (input_title, masked) = if let Some(flow) = state.settings.as_ref() {
+        (
+            format!(
+                " Настройки: {} ({}/4) ",
+                settings_stage_name(flow.stage),
+                settings_stage_number(flow.stage)
+            ),
+            false,
+        )
+    } else if let Some(flow) = state.passwd.as_ref() {
+        let title = match flow.stage {
+            PasswdStage::Current => " Пароль: текущий ",
+            PasswdStage::New => " Пароль: новый ",
+            PasswdStage::Confirm => " Пароль: повтор ",
+        };
+        (title.to_string(), true)
+    } else {
+        (" Ввод ".to_string(), false)
+    };
+    let input_block = Block::default()
+        .borders(Borders::ALL)
+        .title(input_title);
     let input_inner = input_block.inner(chunks[2]);
     frame.render_widget(input_block, chunks[2]);
 
@@ -1371,7 +1529,11 @@ fn draw_ui(frame: &mut Frame, state: &mut UiState) {
         before.min(avail - 1)
     };
     let start = before - cursor_col;
-    let visible: String = state.input.chars().skip(start).take(avail).collect();
+    let visible: String = if masked {
+        "*".repeat(state.input.chars().count().min(avail))
+    } else {
+        state.input.chars().skip(start).take(avail).collect()
+    };
 
     frame.render_widget(
         Paragraph::new(Line::from(format!("{}{}", prefix, visible))),
@@ -1585,6 +1747,24 @@ async fn handle_terminal_event(
 
             match key.code {
                 KeyCode::Enter => {
+                    if state.settings.is_some() {
+                        let raw = std::mem::take(&mut state.input);
+                        state.cursor = 0;
+                        state.history_index = None;
+                        state.history_draft.clear();
+                        submit_setting(app, state, raw);
+                        return Ok(false);
+                    }
+
+                    if state.passwd.is_some() {
+                        let raw = std::mem::take(&mut state.input);
+                        state.cursor = 0;
+                        state.history_index = None;
+                        state.history_draft.clear();
+                        submit_password(app, state, Zeroizing::new(raw));
+                        return Ok(false);
+                    }
+
                     let line = state.input.trim().to_string();
                     state.input.clear();
                     state.cursor = 0;
@@ -1603,9 +1783,15 @@ async fn handle_terminal_event(
 
                     send_plain_message(app, state, &line).await;
                 }
-                KeyCode::Tab => complete_input(app, state),
-                KeyCode::Up => history_prev(state),
-                KeyCode::Down => history_next(state),
+                KeyCode::Tab if state.passwd.is_none() && state.settings.is_none() => {
+                    complete_input(app, state)
+                }
+                KeyCode::Up if state.passwd.is_none() && state.settings.is_none() => {
+                    history_prev(state)
+                }
+                KeyCode::Down if state.passwd.is_none() && state.settings.is_none() => {
+                    history_next(state)
+                }
                 KeyCode::Char(c) => {
                     if !ctrl {
                         state.input.insert(state.cursor, c);
@@ -1635,6 +1821,26 @@ async fn handle_terminal_event(
                 KeyCode::PageUp => scroll_up(state, state.view_height.max(1)),
                 KeyCode::PageDown => scroll_down(state, state.view_height.max(1)),
                 KeyCode::Esc => {
+                    if state.settings.take().is_some() {
+                        state.input.clear();
+                        state.cursor = 0;
+                        state.history_index = None;
+                        state.history_draft.clear();
+                        push_system(state, "Настройка сети отменена");
+                        state.status = "настройка сети отменена".to_string();
+                        return Ok(false);
+                    }
+
+                    if state.passwd.take().is_some() {
+                        state.input.clear();
+                        state.cursor = 0;
+                        state.history_index = None;
+                        state.history_draft.clear();
+                        push_system(state, "Смена мастер-пароля отменена");
+                        state.status = "смена пароля отменена".to_string();
+                        return Ok(false);
+                    }
+
                     state.input.clear();
                     state.cursor = 0;
                     state.history_index = None;
@@ -1660,6 +1866,151 @@ async fn handle_terminal_event(
     }
 
     Ok(false)
+}
+
+/// Обрабатывает Enter в режиме смены мастер-пароля.
+fn submit_password(app: &App, state: &mut UiState, input: Zeroizing<String>) {
+    let Some(mut flow) = state.passwd.take() else {
+        return;
+    };
+
+    match flow.stage {
+        PasswdStage::Current => {
+            if input.is_empty() {
+                push_error(state, "Пароль не может быть пустым");
+                state.passwd = Some(flow);
+                return;
+            }
+
+            match app.verify_master_password(input.as_str()) {
+                Ok(()) => {
+                    flow.old = input;
+                    flow.stage = PasswdStage::New;
+                    state.passwd = Some(flow);
+                    push_system(
+                        state,
+                        "Текущий пароль подтверждён. Введите новый мастер-пароль.",
+                    );
+                    state.status = "новый мастер-пароль".to_string();
+                }
+                Err(e) => {
+                    push_error(state, &format!("Неверный мастер-пароль: {:#}", e));
+                }
+            }
+        }
+        PasswdStage::New => {
+            if input.chars().count() < vault::MIN_PASSWORD_LEN {
+                push_error(
+                    state,
+                    &format!(
+                        "Пароль должен быть не короче {} символов",
+                        vault::MIN_PASSWORD_LEN
+                    ),
+                );
+                state.passwd = Some(flow);
+                return;
+            }
+
+            flow.new = input;
+            flow.stage = PasswdStage::Confirm;
+            state.passwd = Some(flow);
+            push_system(state, "Повторите новый мастер-пароль.");
+            state.status = "повторите новый пароль".to_string();
+        }
+        PasswdStage::Confirm => {
+            if input.as_str() != flow.new.as_str() {
+                push_error(state, "Пароли не совпадают — введите новый пароль заново");
+                flow.new = Zeroizing::new(String::new());
+                flow.stage = PasswdStage::New;
+                state.passwd = Some(flow);
+                return;
+            }
+
+            match app.change_master_password(flow.old.as_str(), flow.new.as_str()) {
+                Ok(()) => {
+                    push_system(
+                        state,
+                        "Мастер-пароль изменён. Файлы профиля и база перешифрованы.",
+                    );
+                    state.status = "мастер-пароль изменён".to_string();
+                }
+                Err(e) => {
+                    push_error(state, &format!("Не удалось сменить мастер-пароль: {:#}", e))
+                }
+            }
+        }
+    }
+}
+
+/// Запускает пошаговый ввод сетевых параметров `/set`.
+fn start_settings(app: &App, state: &mut UiState) {
+    if state.passwd.is_some() {
+        push_error(state, "Сначала завершите смену мастер-пароля");
+        return;
+    }
+
+    let flow = SettingsFlow::from_config(&app.get_config());
+    let prompt = settings_prompt(&flow);
+    state.settings = Some(flow);
+    state.input.clear();
+    state.cursor = 0;
+    state.history_index = None;
+    state.history_draft.clear();
+    push_system(state, &prompt);
+    state.status = "настройка сети".to_string();
+}
+
+/// Обрабатывает Enter в пошаговом вводе `/set`.
+fn submit_setting(app: &App, state: &mut UiState, raw: String) {
+    let Some(mut flow) = state.settings.take() else {
+        return;
+    };
+
+    // Пустая строка сохраняет прежнее значение параметра.
+    let value = raw.trim();
+    if !value.is_empty() {
+        match flow.stage {
+            SettingsStage::ServerUrl => flow.server_url = value.to_string(),
+            SettingsStage::FileServerUrl => flow.file_server_url = value.to_string(),
+            SettingsStage::HeaderName => flow.header_name = value.to_string(),
+            SettingsStage::HeaderValue => flow.header_value = Zeroizing::new(value.to_string()),
+        }
+    }
+
+    match settings_next_stage(flow.stage) {
+        Some(next) => {
+            flow.stage = next;
+            let prompt = settings_prompt(&flow);
+            state.settings = Some(flow);
+            push_system(state, &prompt);
+            state.status = format!(
+                "настройка: {} ({}/4)",
+                settings_stage_name(next),
+                settings_stage_number(next)
+            );
+        }
+        None => finish_settings(app, state, flow),
+    }
+}
+
+fn finish_settings(app: &App, state: &mut UiState, flow: SettingsFlow) {
+    let config = Config {
+        server_url: flow.server_url,
+        file_server_url: flow.file_server_url,
+        mask_header_name: flow.header_name,
+        mask_header_value: flow.header_value.to_string(),
+    };
+
+    match app.update_config(config) {
+        Ok(()) => {
+            push_system(
+                state,
+                "Сетевые настройки сохранены в зашифрованный конфиг и применены.",
+            );
+            state.status = "сетевые настройки применены".to_string();
+        }
+        Err(e) => push_error(state, &format!("Не удалось сохранить настройки: {:#}", e)),
+    }
 }
 
 async fn send_plain_message(app: &Arc<App>, state: &mut UiState, text: &str) {
@@ -2202,6 +2553,25 @@ async fn handle_command(
             state.status = text.to_lowercase();
         }
 
+        "/set" => start_settings(app, state),
+
+        "/passwd" => {
+            if state.settings.is_some() {
+                push_error(state, "Сначала завершите настройку сети (Esc — отмена)");
+            } else if state.passwd.is_some() {
+                push_error(state, "Смена мастер-пароля уже начата");
+            } else {
+                state.passwd = Some(PasswdFlow::new());
+                state.input.clear();
+                state.cursor = 0;
+                push_system(
+                    state,
+                    "Смена мастер-пароля.\nВведите текущий пароль (Esc — отмена).",
+                );
+                state.status = "введите текущий мастер-пароль".to_string();
+            }
+        }
+
         "/quit" | "/exit" => return Ok(true),
 
         _ => push_error(
@@ -2304,6 +2674,110 @@ async fn run_loop(
     }
 }
 
+/// Выключает raw mode после ввода пароля, в том числе при ошибке.
+struct RawModeGuard;
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+    }
+}
+
+/// Читает строку без эха, отображая `*` на каждый введённый символ.
+fn read_password(prompt: &str) -> Result<Zeroizing<String>> {
+    use std::io::Write;
+
+    let mut stdout = io::stdout();
+    write!(stdout, "{}", prompt)?;
+    stdout.flush()?;
+
+    enable_raw_mode()?;
+    let _guard = RawModeGuard;
+    let mut password = Zeroizing::new(String::new());
+
+    loop {
+        match crossterm::event::read()? {
+            Event::Key(key) if key.kind != KeyEventKind::Release => {
+                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                match key.code {
+                    KeyCode::Enter => {
+                        write!(stdout, "\r\n")?;
+                        stdout.flush()?;
+                        break;
+                    }
+                    KeyCode::Esc => {
+                        write!(stdout, "\r\n")?;
+                        stdout.flush()?;
+                        return Err(anyhow!("ввод пароля отменён"));
+                    }
+                    KeyCode::Char('c') | KeyCode::Char('C') if ctrl => {
+                        write!(stdout, "\r\n")?;
+                        stdout.flush()?;
+                        return Err(anyhow!("ввод пароля прерван"));
+                    }
+                    KeyCode::Backspace => {
+                        if password.pop().is_some() {
+                            write!(stdout, "\x08 \x08")?;
+                            stdout.flush()?;
+                        }
+                    }
+                    KeyCode::Char(c) => {
+                        password.push(c);
+                        write!(stdout, "*")?;
+                        stdout.flush()?;
+                    }
+                    _ => {}
+                }
+            }
+            Event::Paste(text) => {
+                for c in text.chars().filter(|c| !c.is_control()) {
+                    password.push(c);
+                    write!(stdout, "*")?;
+                }
+                stdout.flush()?;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(password)
+}
+
+/// Запрашивает мастер-пароль и открывает либо создаёт хранилище.
+fn unlock_vault(base_dir: &str) -> Result<Vault> {
+    if Vault::is_initialized(base_dir)? {
+        for _ in 0..3 {
+            let password = read_password("Мастер-пароль: ")?;
+            match Vault::unlock(base_dir, password.as_str()) {
+                Ok(vault) => return Ok(vault),
+                Err(e) => eprintln!("{:#}", e),
+            }
+        }
+        Err(anyhow!("не удалось разблокировать профиль"))
+    } else {
+        println!("Первый запуск: создаётся защищённый профиль LastChance.");
+        for _ in 0..3 {
+            let password = read_password("Новый мастер-пароль: ")?;
+            if password.chars().count() < vault::MIN_PASSWORD_LEN {
+                eprintln!(
+                    "Пароль должен быть не короче {} символов.",
+                    vault::MIN_PASSWORD_LEN
+                );
+                continue;
+            }
+
+            let confirm = read_password("Повторите мастер-пароль: ")?;
+            if password.as_str() != confirm.as_str() {
+                eprintln!("Пароли не совпадают — попробуйте ещё раз.");
+                continue;
+            }
+
+            return Vault::create(base_dir, password.as_str());
+        }
+        Err(anyhow!("не удалось создать мастер-пароль"))
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     install_panic_hook();
@@ -2311,9 +2785,10 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let data_dir = parse_data_dir(&args)?;
     let base_dir = get_base_dir_with_override(data_dir.as_deref())?;
-    let config = Config::load(&base_dir)?;
+    let vault = unlock_vault(&base_dir)?;
+    let config = Config::load(&base_dir, &vault)?;
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<AppEvent>();
-    let app = Arc::new(App::new(config, base_dir, event_tx)?);
+    let app = Arc::new(App::new(config, base_dir, vault, event_tx)?);
 
     // Deep link из argv (Linux/Windows): lastchance://contact?...
     for arg in args.iter().skip(1) {

@@ -55,14 +55,30 @@ impl SafeFSOps {
                 .map_err(|e| anyhow!("cannot create directory {:?}: {}", parent, e))?;
         }
 
-        use std::os::unix::fs::PermissionsExt;
-        let permissions = fs::Permissions::from_mode(perm);
-
         fs::write(&safe_path, data)
             .map_err(|e| anyhow!("cannot write file {:?}: {}", safe_path, e))?;
 
-        fs::set_permissions(&safe_path, permissions)
-            .map_err(|e| anyhow!("cannot set permissions {:?}: {}", safe_path, e))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let permissions = fs::Permissions::from_mode(perm);
+            fs::set_permissions(&safe_path, permissions)
+                .map_err(|e| anyhow!("cannot set permissions {:?}: {}", safe_path, e))?;
+        }
+
+        // Windows не поддерживает POSIX-права. Безопасная заглушка:
+        // если владелец лишён права записи, помечаем файл как readonly.
+        #[cfg(not(unix))]
+        {
+            if perm & 0o200 == 0 {
+                let mut permissions = fs::metadata(&safe_path)
+                    .map_err(|e| anyhow!("cannot stat file {:?}: {}", safe_path, e))?
+                    .permissions();
+                permissions.set_readonly(true);
+                fs::set_permissions(&safe_path, permissions)
+                    .map_err(|e| anyhow!("cannot set permissions {:?}: {}", safe_path, e))?;
+            }
+        }
 
         Ok(())
     }

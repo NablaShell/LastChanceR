@@ -4,7 +4,7 @@ use ed25519_dalek::SigningKey;
 use log::{info, warn};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -12,6 +12,7 @@ use crate::crypto;
 use crate::identity::{Identity, IdentityManager};
 use crate::network::{Config, Listener, Sender};
 use crate::storage::{Contact, Message, SafeFSOps, Storage};
+use crate::vault::{self, MasterKey, Vault};
 
 // ============================================================
 // EVENT SYSTEM
@@ -63,7 +64,7 @@ pub enum AppEvent {
 // ============================================================
 
 pub struct App {
-    config: Config,
+    config: RwLock<Config>,
     base_dir: String,
 
     storage: Arc<Storage>,
@@ -82,6 +83,8 @@ pub struct App {
     current_room_hash: Arc<Mutex<String>>,
 
     safe_fs: Arc<SafeFSOps>,
+
+    vault: Vault,
 
     event_sender: mpsc::UnboundedSender<AppEvent>,
 }
@@ -183,6 +186,7 @@ impl App {
     pub fn new(
         config: Config,
         base_dir: String,
+        vault: Vault,
         event_sender: mpsc::UnboundedSender<AppEvent>,
     ) -> Result<Self> {
         let safe_fs = Arc::new(SafeFSOps::new(&base_dir)?);
@@ -191,10 +195,13 @@ impl App {
         safe_fs.ensure_dir(".")?;
 
         // Initialize storage
-        let storage = Arc::new(Storage::new(&base_dir)?);
+        let storage = Arc::new(Storage::new(&base_dir, vault.clone())?);
 
         // Initialize identity
-        let identity_manager = Arc::new(Mutex::new(IdentityManager::new(base_dir.clone())));
+        let identity_manager = Arc::new(Mutex::new(IdentityManager::new(
+            base_dir.clone(),
+            vault.clone(),
+        )));
         let identity = {
             let mut manager = identity_manager.lock().unwrap();
             manager.load_or_create("")?
@@ -256,7 +263,7 @@ impl App {
         );
 
         Ok(Self {
-            config,
+            config: RwLock::new(config),
             base_dir,
             storage,
             identity_manager,
@@ -269,6 +276,7 @@ impl App {
             ed25519_pub_key_hex,
             current_room_hash,
             safe_fs,
+            vault,
             event_sender,
         })
     }
@@ -546,6 +554,63 @@ impl App {
             .update_contact_nickname(contact_hash, new_nickname)
     }
 
+    /// Проверяет мастер-пароль без изменения хранилища (команда `/passwd`).
+    pub fn verify_master_password(&self, password: &str) -> Result<()> {
+        Vault::verify_password(&self.base_dir, password)
+    }
+
+    /// Меняет мастер-пароль и перешифровывает файлы профиля и базу.
+    pub fn change_master_password(&self, old_password: &str, new_password: &str) -> Result<()> {
+        if new_password.chars().count() < vault::MIN_PASSWORD_LEN {
+            return Err(anyhow!(
+                "новый пароль должен быть не короче {} символов",
+                vault::MIN_PASSWORD_LEN
+            ));
+        }
+
+        Vault::verify_password(&self.base_dir, old_password)?;
+
+        let old_key = self.vault.key()?;
+        let (new_salt, new_key) = vault::derive_new(new_password)?;
+
+        let rewrite_files =
+            |from: &MasterKey, to: &MasterKey| -> Result<()> {
+                {
+                    let mut manager = self
+                        .identity_manager
+                        .lock()
+                        .map_err(|_| anyhow!("identity lock poisoned"))?;
+                    manager.reencrypt(from, to)?;
+                }
+                Config::reencrypt(&self.base_dir, from, to)?;
+                Ok(())
+            };
+
+        if let Err(e) = rewrite_files(&old_key, &new_key) {
+            // Без отдельного журнала транзакций делаем best-effort откат,
+            // чтобы данные остались доступны старым паролем.
+            let _ = rewrite_files(&new_key, &old_key);
+            return Err(e);
+        }
+
+        // База перешифровывается и переключается на новый ключ под своей
+        // блокировкой, поэтому фоновые записи не потеряются.
+        if let Err(e) = self
+            .storage
+            .reencrypt_fields_and_replace_key(&old_key, &new_key)
+        {
+            let _ = self.storage.reencrypt_fields(&new_key, &old_key);
+            let _ = rewrite_files(&new_key, &old_key);
+            return Err(e);
+        }
+
+        // Метаданные пишем последними: до этого момента профиль ещё
+        // открывается старым паролем.
+        vault::write_meta(&self.base_dir, &new_salt, &new_key)?;
+
+        Ok(())
+    }
+
     pub async fn send_message(&self, room_hash: &str, text: &str) -> Result<()> {
         let shared_secret = self.get_shared_secret(room_hash)?;
 
@@ -812,8 +877,28 @@ impl App {
         &self.base_dir
     }
 
-    pub fn get_config(&self) -> &Config {
-        &self.config
+    pub fn get_config(&self) -> Config {
+        match self.config.read() {
+            Ok(config) => config.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// Сохраняет новые сетевые параметры и сразу применяет их в работающих
+    /// `Sender`/`Listener`, не требуя перезапуска клиента.
+    pub fn update_config(&self, config: Config) -> Result<()> {
+        config.save(&self.base_dir, &self.vault)?;
+
+        self.sender.update_config(&config)?;
+        self.listener.update_config(&config)?;
+
+        let mut guard = self
+            .config
+            .write()
+            .map_err(|_| anyhow!("конфигурация недоступна: блокировка повреждена"))?;
+        *guard = config;
+
+        Ok(())
     }
 
     pub fn get_storage(&self) -> &Arc<Storage> {
@@ -852,7 +937,8 @@ mod tests {
         let config = Config::default();
         let (event_sender, event_receiver) = mpsc::unbounded_channel();
 
-        let app = App::new(config, base_dir, event_sender).unwrap();
+        let vault = Vault::create(&base_dir, "test-password").unwrap();
+        let app = App::new(config, base_dir, vault, event_sender).unwrap();
         (app, temp_dir, event_receiver)
     }
 
@@ -896,6 +982,35 @@ mod tests {
     }
 
     #[test]
+    fn test_update_config_is_encrypted_and_applied() {
+        let (app, temp_dir, _receiver) = setup_test_app();
+
+        let mut config = app.get_config();
+        config.server_url = "https://new-text.example".to_string();
+        config.file_server_url = "https://new-files.example".to_string();
+        config.mask_header_name = "X-Custom-Guard".to_string();
+        config.mask_header_value = "new-secret".to_string();
+
+        app.update_config(config.clone()).unwrap();
+
+        let applied = app.get_config();
+        assert_eq!(applied.server_url, config.server_url);
+        assert_eq!(applied.file_server_url, config.file_server_url);
+        assert_eq!(applied.mask_header_name, config.mask_header_name);
+        assert_eq!(applied.mask_header_value, config.mask_header_value);
+
+        let config_path = temp_dir.path().join("global.conf");
+        let raw = std::fs::read(&config_path).unwrap();
+        assert!(vault::is_sealed(&raw));
+        assert!(!String::from_utf8_lossy(&raw).contains("new-secret"));
+
+        let base_dir = temp_dir.path().to_str().unwrap();
+        let reopened_vault = Vault::unlock(base_dir, "test-password").unwrap();
+        let saved = Config::load(base_dir, &reopened_vault).unwrap();
+        assert_eq!(saved.mask_header_value, "new-secret");
+    }
+
+    #[test]
     fn test_contact_link() {
         let (app, _temp_dir, _receiver) = setup_test_app();
 
@@ -905,5 +1020,54 @@ mod tests {
         assert!(link.contains("x25519="));
         assert!(link.contains("ed25519="));
         assert!(link.contains("nickname="));
+    }
+
+    #[test]
+    fn test_change_master_password_reencrypts_all_data() {
+        let temp_dir = tempdir().unwrap();
+        let base_dir = temp_dir.path().to_str().unwrap().to_string();
+        let (event_sender, _event_receiver) = mpsc::unbounded_channel();
+
+        let vault = Vault::create(&base_dir, "old-password-123").unwrap();
+        // Создаём зашифрованный global.conf, как это делает main().
+        Config::load(&base_dir, &vault).unwrap();
+        let app = App::new(
+            Config::default(),
+            base_dir.clone(),
+            vault,
+            event_sender,
+        )
+        .unwrap();
+
+        let hash = "f".repeat(64);
+        app.add_contact(&hash, &"a".repeat(64), "Alice").unwrap();
+        app.get_storage()
+            .save_message(&hash, "out", "secret message")
+            .unwrap();
+        let identity_hash = app.identity.hash.clone();
+
+        app.change_master_password("old-password-123", "new-password-456")
+            .unwrap();
+
+        // Старый пароль больше не открывает хранилище.
+        assert!(Vault::unlock(&base_dir, "old-password-123").is_err());
+
+        let new_vault = Vault::unlock(&base_dir, "new-password-456").unwrap();
+        Config::load(&base_dir, &new_vault).unwrap();
+
+        let (event_sender, _event_receiver) = mpsc::unbounded_channel();
+        let reopened = App::new(
+            Config::default(),
+            base_dir,
+            new_vault,
+            event_sender,
+        )
+        .unwrap();
+
+        assert_eq!(reopened.identity.hash, identity_hash);
+        let contacts = reopened.get_contacts().unwrap();
+        assert_eq!(contacts[0].nickname, "Alice");
+        let messages = reopened.get_messages(&hash, 10).unwrap();
+        assert_eq!(messages[0].text, "secret message");
     }
 }

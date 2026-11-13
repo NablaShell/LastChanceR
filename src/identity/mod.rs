@@ -1,5 +1,6 @@
 // src/identity/mod.rs
 use crate::storage::SafeFSOps;
+use crate::vault::{self, MasterKey, Vault};
 use anyhow::{anyhow, Result};
 use bip39::Mnemonic;
 use ed25519_dalek::SigningKey;
@@ -10,6 +11,8 @@ use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 pub const IDENTITY_FILE_NAME: &str = "identity.json";
+
+const IDENTITY_AAD: &[u8] = b"lastchance:identity.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Identity {
@@ -28,14 +31,16 @@ pub struct IdentityManager {
     storage_path: String,
     safe_fs: Option<SafeFSOps>,
     cached_id: Option<Identity>,
+    vault: Vault,
 }
 
 impl IdentityManager {
-    pub fn new(storage_path: String) -> Self {
+    pub fn new(storage_path: String, vault: Vault) -> Self {
         Self {
             storage_path,
             safe_fs: None,
             cached_id: None,
+            vault,
         }
     }
 
@@ -84,14 +89,17 @@ impl IdentityManager {
     pub fn load_or_create(&mut self, nickname: &str) -> Result<Identity> {
         self.init_safe_fs()?;
 
-        let safe_fs = self.safe_fs.as_ref().unwrap();
-        match safe_fs.safe_stat(IDENTITY_FILE_NAME) {
-            Ok(_) => self.load(),
-            Err(_) => {
-                let identity = self.generate_new_identity(nickname)?;
-                self.save(&identity)?;
-                Ok(identity)
-            }
+        let exists = match self.safe_fs.as_ref() {
+            Some(safe_fs) => safe_fs.safe_stat(IDENTITY_FILE_NAME).is_ok(),
+            None => false,
+        };
+
+        if exists {
+            self.load()
+        } else {
+            let identity = self.generate_new_identity(nickname)?;
+            self.save(&identity)?;
+            Ok(identity)
         }
     }
 
@@ -100,9 +108,13 @@ impl IdentityManager {
 
         let data = serde_json::to_string_pretty(identity)
             .map_err(|e| anyhow!("failed to marshal identity: {}", e))?;
+        let sealed = self.vault.seal_file(IDENTITY_AAD, data.as_bytes())?;
 
-        let safe_fs = self.safe_fs.as_ref().unwrap();
-        safe_fs.safe_write_file(IDENTITY_FILE_NAME, data.as_bytes(), 0o600)?;
+        let safe_fs = self
+            .safe_fs
+            .as_ref()
+            .ok_or_else(|| anyhow!("safe fs is not initialized"))?;
+        safe_fs.safe_write_file(IDENTITY_FILE_NAME, &sealed, 0o600)?;
 
         self.cached_id = Some(identity.clone());
         Ok(())
@@ -111,14 +123,54 @@ impl IdentityManager {
     pub fn load(&mut self) -> Result<Identity> {
         self.init_safe_fs()?;
 
-        let safe_fs = self.safe_fs.as_ref().unwrap();
-        let data = safe_fs.safe_read_file(IDENTITY_FILE_NAME)?;
+        let data = self
+            .safe_fs
+            .as_ref()
+            .ok_or_else(|| anyhow!("safe fs is not initialized"))?
+            .safe_read_file(IDENTITY_FILE_NAME)?;
 
-        let identity: Identity = serde_json::from_slice(&data)
+        let legacy = !vault::is_sealed(&data);
+        let plaintext = if legacy {
+            data
+        } else {
+            self.vault.open_file(IDENTITY_AAD, &data)?
+        };
+
+        let identity: Identity = serde_json::from_slice(&plaintext)
             .map_err(|e| anyhow!("failed to unmarshal identity: {}", e))?;
+
+        // Файл старого формата сразу перезаписываем зашифрованным.
+        if legacy {
+            self.save(&identity)?;
+        }
 
         self.cached_id = Some(identity.clone());
         Ok(identity)
+    }
+
+    /// Перешифровывает файл личности со старого ключа на новый (`/passwd`).
+    pub fn reencrypt(&mut self, old_key: &MasterKey, new_key: &MasterKey) -> Result<()> {
+        self.init_safe_fs()?;
+
+        let data = self
+            .safe_fs
+            .as_ref()
+            .ok_or_else(|| anyhow!("safe fs is not initialized"))?
+            .safe_read_file(IDENTITY_FILE_NAME)?;
+
+        let plaintext = if vault::is_sealed(&data) {
+            vault::open_file(old_key, IDENTITY_AAD, &data)?
+        } else {
+            data
+        };
+
+        let sealed = vault::seal_file(new_key, IDENTITY_AAD, &plaintext)?;
+        self.safe_fs
+            .as_ref()
+            .ok_or_else(|| anyhow!("safe fs is not initialized"))?
+            .safe_write_file(IDENTITY_FILE_NAME, &sealed, 0o600)?;
+
+        Ok(())
     }
 
     pub fn current(&self) -> Option<&Identity> {

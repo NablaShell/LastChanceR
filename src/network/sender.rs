@@ -1,6 +1,7 @@
 // src/network/sender.rs
 use anyhow::{anyhow, Result};
 use reqwest::Client;
+use std::sync::RwLock;
 use std::time::Duration;
 use crate::network::Config;
 
@@ -9,7 +10,7 @@ const ALLOWED_PACKET_SIZES: [usize; 4] = [256, 1024, 4096, 65536];
 
 pub struct Sender {
     client: Client,
-    config: Config,
+    config: RwLock<Config>,
 }
 
 impl Sender {
@@ -23,8 +24,25 @@ impl Sender {
 
         Self {
             client,
-            config: config.clone(),
+            config: RwLock::new(config.clone()),
         }
+    }
+
+    /// Применяет новые сетевые параметры без перезапуска клиента.
+    pub fn update_config(&self, config: &Config) -> Result<()> {
+        let mut guard = self
+            .config
+            .write()
+            .map_err(|_| anyhow!("конфигурация отправителя недоступна: блокировка повреждена"))?;
+        *guard = config.clone();
+        Ok(())
+    }
+
+    fn current_config(&self) -> Result<Config> {
+        self.config
+            .read()
+            .map(|config| config.clone())
+            .map_err(|_| anyhow!("конфигурация отправителя недоступна: блокировка повреждена"))
     }
 
     pub async fn send_message(&self, target_hash: &str, packet: &[u8]) -> Result<()> {
@@ -36,7 +54,8 @@ impl Sender {
             ));
         }
 
-        let url = format!("{}/push/{}", self.config.server_url, target_hash);
+        let config = self.current_config()?;
+        let url = format!("{}/push/{}", config.server_url, target_hash);
 
         let max_retries = 3;
         let base_delay = Duration::from_secs(1);
@@ -50,7 +69,7 @@ impl Sender {
                 .header("Content-Length", packet.len().to_string())
                 .header("X-Requested-With", "XMLHttpRequest")
                 .header("User-Agent", "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:149.0) Gecko/20100101 Firefox/149.0")
-                .header(&self.config.mask_header_name, &self.config.mask_header_value)
+                .header(&config.mask_header_name, &config.mask_header_value)
                 // bytes::Bytes — без лишней копии Vec
                 .body(bytes::Bytes::copy_from_slice(packet))
                 .send()
@@ -112,7 +131,8 @@ impl Sender {
             ));
         }
 
-        let url = format!("{}/upload", self.config.file_server_url);
+        let config = self.current_config()?;
+        let url = format!("{}/upload", config.file_server_url);
 
         let response = self.client
             .post(&url)
@@ -123,7 +143,7 @@ impl Sender {
             .header("X-File-Name", file_name)
             .header("X-Requested-With", "XMLHttpRequest")
             .header("User-Agent", "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:149.0) Gecko/20100101 Firefox/149.0")
-            .header(&self.config.mask_header_name, &self.config.mask_header_value)
+            .header(&config.mask_header_name, &config.mask_header_value)
             .body(bytes::Bytes::copy_from_slice(payload))
             .send()
             .await
