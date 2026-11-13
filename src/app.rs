@@ -553,8 +553,8 @@ impl App {
 
     pub async fn download_and_save_file(
         &self,
+        room_hash: &str,
         file_hash: &str,
-        _suggested_file_name: &str,
         save_path: &str,
     ) -> Result<()> {
         // Emit download started event
@@ -571,9 +571,9 @@ impl App {
             }
         };
 
-        // Get shared secret
-        let room_hash = self.current_room_hash.lock().unwrap().clone();
-        let shared_secret = self.get_shared_secret(&room_hash)?;
+        // Shared secret берём именно у комнаты файла: /dl может найти файл
+        // среди полученных за сессию, не переключая активную комнату.
+        let shared_secret = self.get_shared_secret(room_hash)?;
 
         // Decrypt file
         let file_data = match crypto::decrypt_file(&encrypted_data, &shared_secret) {
@@ -586,12 +586,28 @@ impl App {
             }
         };
 
-        // Save file
-        if let Err(e) = self.safe_fs.safe_write_file(save_path, &file_data, 0o600) {
+        // Save file. Путь выбирает пользователь (например, ./downloads/...),
+        // поэтому пишем напрямую: SafeFSOps ограничивает запись каталогом данных.
+        if let Some(parent) = std::path::Path::new(save_path).parent() {
+            if !parent.as_os_str().is_empty() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    self.emit_event(AppEvent::DownloadError {
+                        error: e.to_string(),
+                    });
+                    return Err(anyhow!("create directory failed: {}", e));
+                }
+            }
+        }
+        if let Err(e) = std::fs::write(save_path, &file_data) {
             self.emit_event(AppEvent::DownloadError {
                 error: e.to_string(),
             });
             return Err(anyhow!("save failed: {}", e));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(save_path, std::fs::Permissions::from_mode(0o600));
         }
 
         // Emit download completed event
