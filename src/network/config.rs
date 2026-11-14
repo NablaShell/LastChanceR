@@ -1,6 +1,7 @@
 // src/network/config.rs
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
+use crate::i18n::Lang;
 use crate::storage::SafeFSOps;
 use crate::vault::{self, MasterKey, Vault};
 
@@ -8,9 +9,9 @@ const CONFIG_FILE_NAME: &str = "global.conf";
 const CONFIG_AAD: &[u8] = b"lastchance:global.conf";
 
 pub const DEFAULT_NOTIFY_LEVEL: u8 = 2;
-pub const DEFAULT_STEALTH_TITLE: &str = "Перерыв для глаз";
+pub const DEFAULT_STEALTH_TITLE: &str = "Eye break";
 pub const DEFAULT_STEALTH_BODY: &str =
-    "Время отдыха. Сделайте разминку для глаз на {sec} секунд";
+    "Time to rest. Take an eye break for {sec} seconds";
 pub const DEFAULT_STEALTH_SECONDS: &str = "10";
 
 fn default_notify_level() -> u8 {
@@ -51,6 +52,9 @@ pub struct Config {
     /// Строка для `{sec}`: например `10` или диапазон `10-15`.
     #[serde(default = "default_stealth_seconds")]
     pub stealth_seconds: String,
+    /// Язык интерфейса. Старые конфиги без этого поля получают английский.
+    #[serde(default)]
+    pub lang: Lang,
 }
 
 impl Default for Config {
@@ -65,19 +69,14 @@ impl Default for Config {
             stealth_title: default_stealth_title(),
             stealth_body: default_stealth_body(),
             stealth_seconds: default_stealth_seconds(),
+            lang: Lang::En,
         }
     }
 }
 
 /// Человекочитаемая подпись режима уведомлений для меню `/set`.
-pub fn notify_level_label(level: u8) -> &'static str {
-    match level {
-        0 => "0 — отключены",
-        1 => "1 — Stealth (маскировка)",
-        2 => "2 — только отправитель",
-        3 => "3 — полный предпросмотр",
-        _ => "неизвестный уровень",
-    }
+pub fn notify_level_label(lang: Lang, level: u8) -> &'static str {
+    lang.notify_level_label(level)
 }
 
 /// Приводит пользовательский адрес прокси к каноническому виду.
@@ -109,6 +108,26 @@ impl Config {
         self.notify_level = self.notify_level.min(3);
     }
 
+    /// Переключает язык и, если stealth-шаблоны не менялись вручную,
+    /// заменяет их стандартными строками новой локали.
+    pub fn apply_lang(&mut self, lang: Lang) {
+        // Стандартный шаблон любой локали считаем «нетронутым»: так старые
+        // конфиги с русскими значениями корректно переводятся на English.
+        let untouched_title = [Lang::En, Lang::Ru]
+            .iter()
+            .any(|l| self.stealth_title == l.default_stealth_title());
+        let untouched_body = [Lang::En, Lang::Ru]
+            .iter()
+            .any(|l| self.stealth_body == l.default_stealth_body());
+        if untouched_title {
+            self.stealth_title = lang.default_stealth_title().to_string();
+        }
+        if untouched_body {
+            self.stealth_body = lang.default_stealth_body().to_string();
+        }
+        self.lang = lang;
+    }
+
     /// Формирует заголовок и тело системного уведомления по текущему режиму.
     ///
     /// Возвращает `None`, если уведомления отключены. Текст намеренно не
@@ -119,6 +138,7 @@ impl Config {
         text: &str,
         unread: usize,
     ) -> Option<(String, String)> {
+        let texts = self.lang.texts();
         match self.notify_level {
             0 => None,
             1 => {
@@ -135,12 +155,12 @@ impl Config {
                 let body = substitute_stealth(&self.stealth_body, seconds, &count);
                 Some((
                     if title.trim().is_empty() {
-                        DEFAULT_STEALTH_TITLE.to_string()
+                        self.lang.default_stealth_title().to_string()
                     } else {
                         title
                     },
                     if body.trim().is_empty() {
-                        DEFAULT_STEALTH_BODY.to_string()
+                        self.lang.default_stealth_body().to_string()
                     } else {
                         body
                     },
@@ -148,11 +168,12 @@ impl Config {
             }
             2 => Some((
                 "LastChance".to_string(),
-                format!("Новое сообщение от {}", sender),
+                texts.notify_new_message.replace("{}", sender),
             )),
             3 => Some((
                 sender.to_string(),
-                preview_body(text).unwrap_or_else(|| "Новое сообщение".to_string()),
+                preview_body(text, self.lang)
+                    .unwrap_or_else(|| texts.notify_new_message_default.to_string()),
             )),
             _ => None,
         }
@@ -172,6 +193,14 @@ impl Config {
     /// Если найден файл старого формата (открытый JSON), он сразу
     /// перезаписывается зашифрованным.
     pub fn load(base_dir: &str, vault: &Vault) -> Result<Self> {
+        Ok(Self::load_with_language_flag(base_dir, vault)?.0)
+    }
+
+    /// Загружает конфигурацию и сообщает, нужно ли показать выбор языка.
+    ///
+    /// Флаг `true` означает, что `global.conf` ещё не существовал или в нём
+    /// нет поля `lang` (конфиг старой версии).
+    pub fn load_with_language_flag(base_dir: &str, vault: &Vault) -> Result<(Self, bool)> {
         let safe_fs = SafeFSOps::new(base_dir)?;
 
         match safe_fs.safe_read_file(CONFIG_FILE_NAME) {
@@ -183,7 +212,11 @@ impl Config {
                     vault.open_file(CONFIG_AAD, &data)?
                 };
 
-                let mut cfg: Config = serde_json::from_slice(&plaintext)
+                let value: serde_json::Value = serde_json::from_slice(&plaintext)
+                    .map_err(|e| anyhow!("invalid config file: {}", e))?;
+                let language_missing = value.get("lang").is_none();
+
+                let mut cfg: Config = serde_json::from_value(value)
                     .map_err(|e| anyhow!("invalid config file: {}", e))?;
 
                 // Fill empty fields with defaults
@@ -201,13 +234,23 @@ impl Config {
                     cfg.mask_header_value = defaults.mask_header_value;
                 }
                 if cfg.stealth_title.trim().is_empty() {
-                    cfg.stealth_title = defaults.stealth_title;
+                    cfg.stealth_title = cfg.lang.default_stealth_title().to_string();
                 }
                 if cfg.stealth_body.trim().is_empty() {
-                    cfg.stealth_body = defaults.stealth_body;
+                    cfg.stealth_body = cfg.lang.default_stealth_body().to_string();
                 }
                 if cfg.stealth_seconds.trim().is_empty() {
                     cfg.stealth_seconds = defaults.stealth_seconds;
+                }
+                // Старые конфиги получали английские шаблоны из serde-default;
+                // для русской локали заменяем их на русские стандартные.
+                if cfg.lang != Lang::En {
+                    if cfg.stealth_title == DEFAULT_STEALTH_TITLE {
+                        cfg.stealth_title = cfg.lang.default_stealth_title().to_string();
+                    }
+                    if cfg.stealth_body == DEFAULT_STEALTH_BODY {
+                        cfg.stealth_body = cfg.lang.default_stealth_body().to_string();
+                    }
                 }
                 cfg.normalize();
 
@@ -215,14 +258,14 @@ impl Config {
                     save_encrypted(&safe_fs, vault, &cfg)?;
                 }
 
-                Ok(cfg)
+                Ok((cfg, language_missing))
             }
             Err(_) => {
                 // File doesn't exist, create with defaults
                 let default_cfg = Config::default();
                 save_encrypted(&safe_fs, vault, &default_cfg)?;
 
-                Ok(default_cfg)
+                Ok((default_cfg, true))
             }
         }
     }
@@ -267,9 +310,9 @@ fn substitute_stealth(template: &str, seconds: &str, count: &str) -> String {
 ///
 /// Управляющие символы превращаются в пробелы, пробельные серии
 /// схлопываются, а длина ограничивается 120 символами.
-fn preview_body(text: &str) -> Option<String> {
+fn preview_body(text: &str, lang: Lang) -> Option<String> {
     if let Some(file_name) = file_name_from_notification(text) {
-        return Some(format!("Файл: {}", file_name));
+        return Some(lang.texts().notify_file.replace("{}", &file_name));
     }
 
     let cleaned: String = text
@@ -295,7 +338,10 @@ fn file_name_from_notification(text: &str) -> Option<String> {
     for line in text.lines() {
         let line = line.trim();
         let line = line.strip_prefix("📎 ").unwrap_or(line);
-        let Some(name) = line.strip_prefix("Файл: ") else {
+        let Some(name) = line
+            .strip_prefix("Файл: ")
+            .or_else(|| line.strip_prefix("File: "))
+        else {
             continue;
         };
         let name = name.trim();
@@ -350,21 +396,31 @@ mod tests {
         let mut config = Config::default();
         assert_eq!(config.notify_level, 2);
         assert_eq!(
+            config.notification_content("Alice", "hello", 1),
+            Some((
+                "LastChance".to_string(),
+                "New message from Alice".to_string()
+            ))
+        );
+
+        config.lang = Lang::Ru;
+        assert_eq!(
             config.notification_content("Алиса", "привет", 1),
             Some((
                 "LastChance".to_string(),
                 "Новое сообщение от Алиса".to_string()
             ))
         );
+        config.lang = Lang::En;
 
         config.notify_level = 3;
         assert_eq!(
-            config.notification_content("Алиса", "привет", 1),
-            Some(("Алиса".to_string(), "привет".to_string()))
+            config.notification_content("Alice", "hello", 1),
+            Some(("Alice".to_string(), "hello".to_string()))
         );
 
         config.notify_level = 0;
-        assert_eq!(config.notification_content("Алиса", "привет", 1), None);
+        assert_eq!(config.notification_content("Alice", "hello", 1), None);
     }
 
     #[test]
@@ -378,7 +434,7 @@ mod tests {
         };
 
         assert_eq!(
-            config.notification_content("Алиса", "секрет", 3),
+            config.notification_content("Alice", "secret", 3),
             Some((
                 "Пауза 3".to_string(),
                 "Отдых 10-15, писем: 3".to_string()
@@ -394,19 +450,19 @@ mod tests {
         };
 
         let long = "а".repeat(200);
-        let (_, body) = config.notification_content("Алиса", &long, 1).unwrap();
+        let (_, body) = config.notification_content("Alice", &long, 1).unwrap();
         assert_eq!(body.chars().count(), 120);
         assert!(body.ends_with("..."));
 
         let (_, body) = config
-            .notification_content("Алиса", "строка\nс\tуправляющими  символами", 1)
+            .notification_content("Alice", "строка\nс\tуправляющими  символами", 1)
             .unwrap();
         assert_eq!(body, "строка с управляющими символами");
 
         let (_, body) = config
-            .notification_content("Алиса", "📎 Файл: secret.pdf\nРазмер: 10 B", 1)
+            .notification_content("Alice", "📎 Файл: secret.pdf\nРазмер: 10 B", 1)
             .unwrap();
-        assert_eq!(body, "Файл: secret.pdf");
+        assert_eq!(body, "File: secret.pdf");
     }
 
     #[test]

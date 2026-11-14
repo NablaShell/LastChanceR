@@ -3,8 +3,9 @@
 //!
 //! Мастер-ключ выводится из пароля через Argon2id и хранится в памяти только
 //! внутри [`zeroize::Zeroizing`]. Файлы (`identity.json`, `global.conf`)
-//! шифруются XChaCha20-Poly1305 целиком, а чувствительные поля SQLite — по
-//! значению (формат `lc1:<hex(nonce || ciphertext)>`).
+//! шифруются XChaCha20-Poly1305 целиком. Локальная база контактов и сообщений
+//! (`vault.dat`) тоже шифруется целиком: `nonce || ciphertext || tag` без
+//! магических байтов и открытых заголовков.
 
 use anyhow::{anyhow, Result};
 use argon2::{Algorithm, Argon2, Params, Version};

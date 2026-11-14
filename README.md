@@ -37,7 +37,7 @@ The crate is split into a reusable core library and a thin TUI binary:
 | `src/network/config.rs` | Encrypted `global.conf`, proxy/notification settings |
 | `src/network/sender.rs` | `POST /push/<hash>`, file upload |
 | `src/network/listener.rs` | Long-poll `GET /pull/<hash>`, multipart parsing, file download |
-| `src/storage/` | Safe filesystem operations and SQLite persistence |
+| `src/storage/` | Safe filesystem operations and the encrypted local vault |
 | `src/vault.rs` | Master-key derivation and local encryption |
 | `src/app.rs` | Core application logic, events, contacts, sending/receiving |
 | `src/main.rs` | Terminal UI, commands, modals and startup flow |
@@ -50,7 +50,7 @@ keyboard ──> TUI (main.rs)
                 ▼
              App (app.rs) ──> Sender ──> text API server
                 │
-                ├──> Storage (SQLite, encrypted fields)
+                ├──> Storage (in-memory SQLite, `vault.dat`)
                 ├──> Vault (master key, Argon2id)
                 └──> Listener <── long-poll <── text API server
 
@@ -120,9 +120,10 @@ On first launch the client asks for a master password (minimum 8 characters). Th
 - The master key is derived with Argon2id (19 MiB, 2 passes, 1 lane) and kept in memory inside `Zeroizing`.
 - `vault.check` is an encrypted marker used to detect a wrong password.
 - `identity.json` and `global.conf` are sealed as `LCVAULT1 || nonce || ciphertext || tag` with XChaCha20-Poly1305 and associated data.
-- Sensitive SQLite fields (message text, nicknames, room names, file names and file sizes) are encrypted individually as `lc1:<hex>`.
-- Legacy plaintext files and database fields are migrated to encrypted form on load.
-- `PRAGMA secure_delete=ON` and a WAL checkpoint are used for the database.
+- Contacts, rooms, messages and file records live in an in-memory SQLite database; nothing is ever written to `user.db`, `user.db-wal` or `user.db-shm`.
+- On every change the whole database is serialized, padded with random bytes to a multiple of 4096 and sealed with XChaCha20-Poly1305 into `vault.dat` as `nonce || ciphertext || tag`; no magic bytes or open headers are stored on disk. The schema version and payload length sit inside the encrypted block.
+- `vault.dat` is replaced atomically through a temporary file and receives mode `0600` on Unix.
+- A legacy plaintext `user.db` is imported on first open, after which `user.db`, `user.db-wal` and `user.db-shm` are overwritten with zeros and deleted.
 - Files created by the client are written with mode `0600` on Unix; a read-only fallback is used where POSIX permissions are unavailable.
 
 `/passwd` verifies the old password, re-encrypts `identity.json`, `global.conf` and all sensitive database fields, replaces the in-memory key and only then writes the new salt/check files. If a step fails, the client tries to roll the old key back.
@@ -131,12 +132,14 @@ Contact hashes, public keys, room hashes, message direction/status and timestamp
 
 The data directory is chosen in this order:
 
-1. `--data-dir <path>` or `--data-dir=<path>`.
+1. `--profile-dir <path>` or `--profile-dir=<path>` (`--data-dir` is a legacy alias).
 2. The `LASTCHANCE_DIR` environment variable.
 3. Portable mode: if a `.portable` file exists next to the executable, use `data/` beside it.
-4. Default: `$XDG_DATA_HOME/lastchance` (or `~/.local/share/lastchance`) on Unix-like systems, `%LOCALAPPDATA%\lastchance` on Windows.
+4. Default: `dirs::config_dir()/lastchance` — `~/.config/lastchance` on Linux (`$XDG_CONFIG_HOME/lastchance` when set), `~/Library/Application Support/lastchance` on macOS, `%APPDATA%\lastchance` on Windows.
 
-The directory contains `identity.json`, `global.conf`, `user.db`, `vault.salt` and `vault.check`.
+On first start, if the new directory does not exist and the old data directory (`~/.local/share/lastchance` on Linux, `%LOCALAPPDATA%\lastchance` on Windows) is non-empty, the client copies the profile automatically. Directories are set to `0700` and files to `0600`; the old directory is kept intact.
+
+The directory contains `identity.json`, `global.conf`, `vault.dat`, `vault.salt` and `vault.check`.
 
 ---
 
@@ -314,10 +317,20 @@ The binary is `target/release/lastchance` (`lastchance.exe` on Windows).
 Optional arguments:
 
 ```bash
-lastchance --data-dir /path/to/profile
-lastchance --data-dir=/path/to/profile
+lastchance --profile-dir /path/to/profile
+lastchance --profile-dir=/path/to/profile
 LASTCHANCE_DIR=/path/to/profile lastchance
 ```
+
+Headless sending (no TUI, no raw mode):
+
+```bash
+LASTCHANCE_PASS=secret lastchance --to alice --send "hello"
+echo "secret text" | LASTCHANCE_PASS=secret lastchance --to alice --send -
+LASTCHANCE_PASS=secret lastchance --to alice --file ./report.pdf
+```
+
+`--to` accepts a contact name from the local database, an identity hash or a full `lastchance://contact?...` link. `--send -` reads the message from stdin so the text does not appear in `ps aux`. The master password is taken from `LASTCHANCE_PASS`; without it, an interactive TTY is prompted with hidden input. Headless mode exits with code `0` on success and `1` on error.
 
 A `lastchance://contact?...` link passed as a command-line argument is imported as a contact.
 
@@ -390,7 +403,7 @@ LastChance — мессенджер на Rust с фокусом на прива�
 | `src/network/config.rs` | Зашифрованный `global.conf`, настройки прокси и уведомлений |
 | `src/network/sender.rs` | `POST /push/<hash>`, загрузка файлов |
 | `src/network/listener.rs` | Long-poll `GET /pull/<hash>`, разбор multipart, скачивание файлов |
-| `src/storage/` | Безопасная работа с ФС и хранение в SQLite |
+| `src/storage/` | Безопасная работа с ФС и зашифрованное локальное хранилище |
 | `src/vault.rs` | Вывод мастер-ключа и локальное шифрование |
 | `src/app.rs` | Ядро приложения, события, контакты, отправка и приём |
 | `src/main.rs` | Терминальный интерфейс, команды, модальные окна, запуск |
@@ -403,7 +416,7 @@ LastChance — мессенджер на Rust с фокусом на прива�
                   ▼
                App (app.rs) ──> Sender ──> текстовый API-сервер
                   │
-                  ├──> Storage (SQLite, зашифрованные поля)
+                  ├──> Storage (SQLite в памяти, `vault.dat`)
                   ├──> Vault (мастер-ключ, Argon2id)
                   └──> Listener <── long-poll <── текстовый API-сервер
 
@@ -469,23 +482,26 @@ lastchance://contact?hash=...&x25519=...&ed25519=...&nickname=...
 - Мастер-ключ выводится через Argon2id (19 МиБ, 2 прохода, 1 поток) и хранится в памяти внутри `Zeroizing`.
 - `vault.check` — зашифрованный маркер для проверки пароля.
 - `identity.json` и `global.conf` целиком шифруются как `LCVAULT1 || nonce || ciphertext || tag` с XChaCha20-Poly1305 и associated data.
-- Чувствительные поля SQLite (текст сообщений, ники, имена комнат, имена и размеры файлов) шифруются по значению в формате `lc1:<hex>`.
-- Старые открытые файлы и поля базы мигрируют в зашифрованный вид при загрузке.
-- Для базы включены `PRAGMA secure_delete=ON` и checkpoint WAL.
+- Контакты, комнаты, сообщения и файловые записи живут в SQLite исключительно в оперативной памяти; на диск никогда не пишутся `user.db`, `user.db-wal` или `user.db-shm`.
+- При каждом изменении вся база сериализуется, дополняется случайным паддингом до размера, кратного 4096, и шифруется XChaCha20-Poly1305 в `vault.dat` как `nonce || ciphertext || tag`; магические байты и открытые заголовки на диск не попадают. Версия схемы и длина полезной нагрузки хранятся внутри зашифрованного блока.
+- `vault.dat` заменяется атомарно через временный файл и получает права `0600` на Unix.
+- Старая открытая `user.db` импортируется при первом открытии, после чего `user.db`, `user.db-wal` и `user.db-shm` перезаписываются нулями и удаляются.
 - Созданные клиентом файлы получают права `0600` на Unix; там, где POSIX-права недоступны, используется read-only заглушка.
 
-`/passwd` проверяет старый пароль, перешифровывает `identity.json`, `global.conf` и все чувствительные поля базы, заменяет ключ в памяти и только затем пишет новую соль и check-файл. При сбое клиент пытается откатиться на старый ключ.
+`/passwd` проверяет старый пароль, перешифровывает `identity.json`, `global.conf`, контейнер базы `vault.dat`, заменяет ключ в памяти и только затем пишет новую соль и check-файл. При сбое клиент пытается откатиться на старый ключ.
 
-Хеши контактов, публичные ключи, хеши комнат, направление/статус сообщений и время остаются открытыми метаданными локальной базы — они нужны для поиска и сортировки.
+Все метаданные локальной базы (хеши контактов, публичные ключи, хеши комнат, направление/статус сообщений и время) находятся внутри зашифрованного контейнера и на диске в открытом виде не хранятся.
 
 Порядок выбора каталога данных:
 
-1. `--data-dir <path>` или `--data-dir=<path>`.
+1. `--profile-dir <path>` или `--profile-dir=<path>` (`--data-dir` — устаревший синоним).
 2. Переменная окружения `LASTCHANCE_DIR`.
 3. Переносимый режим: если рядом с бинарником есть файл `.portable`, используется `data/` рядом с ним.
-4. По умолчанию: `$XDG_DATA_HOME/lastchance` (или `~/.local/share/lastchance`) на Unix-подобных системах, `%LOCALAPPDATA%\lastchance` на Windows.
+4. По умолчанию: `dirs::config_dir()/lastchance` — `~/.config/lastchance` на Linux (`$XDG_CONFIG_HOME/lastchance`, если задан), `~/Library/Application Support/lastchance` на macOS, `%APPDATA%\lastchance` на Windows.
 
-В каталоге лежат `identity.json`, `global.conf`, `user.db`, `vault.salt` и `vault.check`.
+При первом запуске, если новой директории ещё нет, а старая data-директория (`~/.local/share/lastchance` на Linux, `%LOCALAPPDATA%\lastchance` на Windows) не пуста, клиент автоматически копирует профиль. Каталоги получают права `0700`, файлы — `0600`; старая директория сохраняется без изменений.
+
+В каталоге лежат `identity.json`, `global.conf`, `vault.dat`, `vault.salt` и `vault.check`.
 
 ## Транспорт
 
@@ -655,10 +671,20 @@ cargo test
 Необязательные аргументы:
 
 ```bash
-lastchance --data-dir /path/to/profile
-lastchance --data-dir=/path/to/profile
+lastchance --profile-dir /path/to/profile
+lastchance --profile-dir=/path/to/profile
 LASTCHANCE_DIR=/path/to/profile lastchance
 ```
+
+Headless-отправка (без TUI и raw-mode):
+
+```bash
+LASTCHANCE_PASS=secret lastchance --to alice --send "привет"
+echo "секретный текст" | LASTCHANCE_PASS=secret lastchance --to alice --send -
+LASTCHANCE_PASS=secret lastchance --to alice --file ./report.pdf
+```
+
+`--to` принимает имя контакта из локальной базы, identity_hash или полную ссылку `lastchance://contact?...`. `--send -` читает сообщение из stdin, чтобы текст не светился в `ps aux`. Мастер-пароль берётся из `LASTCHANCE_PASS`; без него в интерактивном TTY запрашивается скрытый ввод. Headless-режим завершается с кодом `0` при успехе и `1` при ошибке.
 
 Ссылка `lastchance://contact?...`, переданная аргументом командной строки, импортируется как контакт.
 

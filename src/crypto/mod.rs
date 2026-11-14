@@ -174,6 +174,119 @@ pub fn decrypt_message(packet: &[u8], shared_secret: &[u8; 32]) -> Result<(Vec<u
     Ok((message, session_id))
 }
 
+// ---------------------------------------------------------------------------
+// E2E application envelope (внутри уже зашифрованного кадра)
+// ---------------------------------------------------------------------------
+
+/// Магия внутреннего конверта. Она зашифрована вместе с кадром и на диск
+/// никогда не попадает.
+pub const E2E_MAGIC: &[u8; 4] = b"LCE1";
+
+const E2E_KIND_TEXT: u8 = 1;
+const E2E_KIND_SET_TTL: u8 = 2;
+const E2E_HEADER_MIN: usize = 6; // magic + kind + optional-flag
+
+/// Расшифрованная полезная нагрузка E2E-сообщения.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum E2ePayload {
+    /// Обычный текст. `ttl_seconds` приходит только от клиентов,
+    /// поддерживающих синхронизированный RAM-TTL.
+    Text {
+        text: String,
+        ttl_seconds: Option<u64>,
+    },
+    /// Управляющий сигнал двустороннего TTL.
+    SetTtl { seconds: Option<u64> },
+}
+
+fn write_optional_u64(out: &mut Vec<u8>, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            out.push(1);
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        None => out.push(0),
+    }
+}
+
+fn read_optional_u64(payload: &[u8], pos: &mut usize) -> Result<Option<u64>> {
+    let flag = *payload
+        .get(*pos)
+        .ok_or_else(|| anyhow!("truncated e2e payload"))?;
+    *pos += 1;
+
+    match flag {
+        0 => Ok(None),
+        1 => {
+            let end = pos
+                .checked_add(8)
+                .ok_or_else(|| anyhow!("e2e payload length overflow"))?;
+            let bytes = payload
+                .get(*pos..end)
+                .ok_or_else(|| anyhow!("truncated e2e payload"))?;
+            *pos = end;
+            let value = u64::from_le_bytes(
+                bytes
+                    .try_into()
+                    .map_err(|_| anyhow!("invalid e2e ttl field"))?,
+            );
+            Ok(Some(value))
+        }
+        other => Err(anyhow!("invalid e2e optional flag: {}", other)),
+    }
+}
+
+/// Собирает текстовый конверт с необязательным TTL.
+pub fn encode_text_payload(text: &str, ttl_seconds: Option<u64>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(E2E_HEADER_MIN + 8 + text.len());
+    out.extend_from_slice(E2E_MAGIC);
+    out.push(E2E_KIND_TEXT);
+    write_optional_u64(&mut out, ttl_seconds);
+    out.extend_from_slice(text.as_bytes());
+    out
+}
+
+/// Собирает управляющий пакет `SetTtl { seconds }`.
+pub fn encode_set_ttl(seconds: Option<u64>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(E2E_HEADER_MIN + 8);
+    out.extend_from_slice(E2E_MAGIC);
+    out.push(E2E_KIND_SET_TTL);
+    write_optional_u64(&mut out, seconds);
+    out
+}
+
+/// Разбирает полезную нагрузку. Сообщения без магии считаются обычным
+/// текстом: это сохраняет совместимость со старыми клиентами.
+pub fn decode_payload(payload: &[u8]) -> Result<E2ePayload> {
+    if payload.len() < E2E_HEADER_MIN || &payload[..E2E_MAGIC.len()] != E2E_MAGIC {
+        return Ok(E2ePayload::Text {
+            text: String::from_utf8_lossy(payload).to_string(),
+            ttl_seconds: None,
+        });
+    }
+
+    let kind = payload[E2E_MAGIC.len()];
+    let mut pos = E2E_MAGIC.len() + 1;
+
+    match kind {
+        E2E_KIND_TEXT => {
+            let ttl_seconds = read_optional_u64(payload, &mut pos)?;
+            Ok(E2ePayload::Text {
+                text: String::from_utf8_lossy(&payload[pos..]).to_string(),
+                ttl_seconds,
+            })
+        }
+        E2E_KIND_SET_TTL => {
+            let seconds = read_optional_u64(payload, &mut pos)?;
+            if pos != payload.len() {
+                return Err(anyhow!("trailing bytes in SetTtl payload"));
+            }
+            Ok(E2ePayload::SetTtl { seconds })
+        }
+        other => Err(anyhow!("unknown e2e payload kind: {}", other)),
+    }
+}
+
 // File Encryption
 pub fn encrypt_file(plaintext: &[u8], shared_secret: &[u8; 32]) -> Result<Vec<u8>> {
     let cipher = XChaCha20Poly1305::new(shared_secret.into());
@@ -285,5 +398,40 @@ mod tests {
         
         assert_eq!(plaintext.to_vec(), decrypted);
         assert_eq!(session_id, decrypted_session_id);
+    }
+
+    #[test]
+    fn e2e_text_envelope_round_trips_ttl() {
+        let payload = encode_text_payload("исчезающее сообщение", Some(30));
+        assert_eq!(
+            decode_payload(&payload).unwrap(),
+            E2ePayload::Text {
+                text: "исчезающее сообщение".to_string(),
+                ttl_seconds: Some(30),
+            }
+        );
+    }
+
+    #[test]
+    fn e2e_set_ttl_envelope_round_trips() {
+        assert_eq!(
+            decode_payload(&encode_set_ttl(Some(5 * 60))).unwrap(),
+            E2ePayload::SetTtl { seconds: Some(300) }
+        );
+        assert_eq!(
+            decode_payload(&encode_set_ttl(None)).unwrap(),
+            E2ePayload::SetTtl { seconds: None }
+        );
+    }
+
+    #[test]
+    fn legacy_plaintext_is_still_text() {
+        assert_eq!(
+            decode_payload(b"hello old client").unwrap(),
+            E2ePayload::Text {
+                text: "hello old client".to_string(),
+                ttl_seconds: None,
+            }
+        );
     }
 }

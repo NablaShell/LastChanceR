@@ -7,7 +7,7 @@
 //   - Вся отрисовка — ratatui: история чата, статус-бар и поле ввода.
 
 use std::collections::{HashMap, VecDeque};
-use std::io::{self, Stdout};
+use std::io::{self, Read, Stdout};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -31,206 +31,12 @@ use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc;
 use zeroize::Zeroizing;
 
+use lastchance::cli::{parse_headless_args, parse_profile_dir, HeadlessArgs};
+use lastchance::i18n::{tr, Lang, Texts, WelcomeText};
 use lastchance::identity::{Identity, IdentityManager, IDENTITY_FILE_NAME};
 use lastchance::network::config::notify_level_label;
-use lastchance::storage::{Storage, DB_FILE_NAME};
+use lastchance::storage::{Storage, LEGACY_DB_FILE_NAME, VAULT_FILE_NAME};
 use lastchance::{get_base_dir_with_override, vault, App, AppEvent, Config, Vault};
-
-/// Строка таблицы справки: слева — команда и её алиасы.
-struct HelpRow {
-    keys: &'static str,
-    desc: &'static str,
-}
-
-/// Секция справки для модального окна (F1).
-struct HelpSection {
-    title: &'static str,
-    rows: &'static [HelpRow],
-}
-
-const HELP_SECTIONS: &[HelpSection] = &[
-    HelpSection {
-        title: "Навигация и чаты",
-        rows: &[
-            HelpRow {
-                keys: "/help, /h, /?",
-                desc: "Открыть эту справку",
-            },
-            HelpRow {
-                keys: "/contacts, /ls, /c",
-                desc: "Список контактов",
-            },
-            HelpRow {
-                keys: "/join, /jn <link | hash x25519 nick>",
-                desc: "Добавить контакт и открыть чат",
-            },
-            HelpRow {
-                keys: "/join, /jn -f <path>",
-                desc: "Добавить контакт из файла-инвайта",
-            },
-            HelpRow {
-                keys: "/room, /r [hash | nick]",
-                desc: "Показать или сменить активную комнату",
-            },
-            HelpRow {
-                keys: "/sidebar, /sb",
-                desc: "Скрыть или показать панель чатов",
-            },
-            HelpRow {
-                keys: "Alt+Up/Down, Ctrl+P/N",
-                desc: "Переключение между чатами",
-            },
-            HelpRow {
-                keys: "Tab",
-                desc: "Автодополнение команд и контактов",
-            },
-        ],
-    },
-    HelpSection {
-        title: "Сообщения и файлы",
-        rows: &[
-            HelpRow {
-                keys: "/messages [limit]",
-                desc: "Последние сообщения активной комнаты",
-            },
-            HelpRow {
-                keys: "/sendfile, /sf [--force] <path>",
-                desc: "Отправить файл; путь от текущей директории, ~/ и абсолютный; системные папки — только с --force",
-            },
-            HelpRow {
-                keys: "/download, /dl [id | name | hash] [path]",
-                desc: "Скачать файл комнаты (по умолчанию последний) в ./downloads",
-            },
-            HelpRow {
-                keys: "Tab после /dl",
-                desc: "Перебор файлов активной комнаты",
-            },
-            HelpRow {
-                keys: "Tab после /sf",
-                desc: "Автодополнение путей от текущей директории",
-            },
-            HelpRow {
-                keys: "Текст без ведущего /",
-                desc: "Отправить сообщение в активную комнату",
-            },
-        ],
-    },
-    HelpSection {
-        title: "Профиль и настройки",
-        rows: &[
-            HelpRow {
-                keys: "/profile, /p",
-                desc: "Профиль: ник, hash и ключи",
-            },
-            HelpRow {
-                keys: "/recovery",
-                desc: "Восстановить идентичность из BIP-39 фразы (с подтверждением перезаписи)",
-            },
-            HelpRow {
-                keys: "/invite, /in [-f [dir | file]]",
-                desc: "Скопировать ссылку-приглашение в буфер; с -f сохранить в файл",
-            },
-            HelpRow {
-                keys: "/export",
-                desc: "Контакт в формате JSON",
-            },
-            HelpRow {
-                keys: "/nick <name>",
-                desc: "Сменить свой ник",
-            },
-            HelpRow {
-                keys: "/rename <hash> <name>",
-                desc: "Переименовать контакт",
-            },
-            HelpRow {
-                keys: "/set, /settings",
-                desc: "Интерактивное меню настроек: API, Guard Header, Proxy, Notify Level, Stealth",
-            },
-            HelpRow {
-                keys: "/set notify <0|1|2|3>",
-                desc: "Режим уведомлений: выкл. / stealth / отправитель / полный",
-            },
-            HelpRow {
-                keys: "/set test",
-                desc: "Показать тестовое системное уведомление",
-            },
-            HelpRow {
-                keys: "/passwd",
-                desc: "Сменить мастер-пароль (файлы и база перешифровываются)",
-            },
-            HelpRow {
-                keys: "/quit, /q, /exit",
-                desc: "Выйти из клиента",
-            },
-        ],
-    },
-    HelpSection {
-        title: "Редактирование ввода",
-        rows: &[
-            HelpRow {
-                keys: "Ctrl+W, Ctrl+Backspace, Alt+Backspace",
-                desc: "Удалить слово слева от курсора",
-            },
-            HelpRow {
-                keys: "Ctrl+Delete, Alt+D",
-                desc: "Удалить слово справа от курсора",
-            },
-            HelpRow {
-                keys: "Ctrl+U / Ctrl+K",
-                desc: "Удалить до начала / до конца строки",
-            },
-            HelpRow {
-                keys: "Ctrl+Left, Alt+B / Ctrl+Right, Alt+F",
-                desc: "Перемещение по словам",
-            },
-            HelpRow {
-                keys: "Home, Ctrl+A / End, Ctrl+E",
-                desc: "В начало / в конец строки",
-            },
-        ],
-    },
-    HelpSection {
-        title: "Горячие клавиши TUI",
-        rows: &[
-            HelpRow {
-                keys: "F1",
-                desc: "Открыть или закрыть справку",
-            },
-            HelpRow {
-                keys: "Esc, q, Enter",
-                desc: "Закрыть справку",
-            },
-            HelpRow {
-                keys: "Up/Down, j/k",
-                desc: "Прокрутка справки построчно",
-            },
-            HelpRow {
-                keys: "PgUp/PgDn",
-                desc: "Прокрутка справки страницами",
-            },
-            HelpRow {
-                keys: "Up/Down",
-                desc: "История ввода (последние 50 строк)",
-            },
-            HelpRow {
-                keys: "PgUp/PgDn, колесо мыши",
-                desc: "Прокрутка истории чата",
-            },
-            HelpRow {
-                keys: "Ctrl+V",
-                desc: "Вставить из системного буфера обмена",
-            },
-            HelpRow {
-                keys: "Ctrl+S",
-                desc: "Открыть настройки (/set)",
-            },
-            HelpRow {
-                keys: "Ctrl+C",
-                desc: "Скопировать ввод и очистить; на пустой строке — выход",
-            },
-        ],
-    },
-];
 
 // ============================================================
 // МОДЕЛЬ ИНТЕРФЕЙСА
@@ -247,6 +53,8 @@ enum FeedKind {
 struct FeedEntry {
     kind: FeedKind,
     text: String,
+    /// Unix timestamp исчезновения RAM-only сообщения.
+    expires_at: Option<u64>,
 }
 
 /// Элемент боковой панели: контакт или активная комната.
@@ -289,14 +97,18 @@ const COMMANDS: &[&str] = &[
     "/invite",
     "/export",
     "/contacts",
+    "/cnt",
     "/join",
     "/room",
     "/messages",
+    "/ttl",
+    "/ttl-syn",
     "/sendfile",
     "/download",
     "/nick",
     "/rename",
     "/set",
+    "/lang",
     "/passwd",
     "/sidebar",
     "/quit",
@@ -350,6 +162,16 @@ struct UiState {
     help: Option<HelpFlow>,
     /// Модальное окно восстановления идентичности (`/recovery`).
     recovery: Option<RecoveryFlow>,
+    /// Менеджер контактов (`/contacts`, `/cnt`).
+    contacts: Option<ContactsFlow>,
+    /// Текущий язык интерфейса.
+    lang: Lang,
+    /// Активный RAM-TTL текущей комнаты (секунды).
+    ttl_seconds: Option<u64>,
+    /// Включён ли двусторонний режим `/ttl-syn`.
+    ttl_synced: bool,
+    /// Приветственное окно выбора языка при первом запуске.
+    welcome: Option<WelcomeFlow>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -426,9 +248,10 @@ enum SettingField {
     StealthTitle,
     StealthBody,
     StealthSeconds,
+    Language,
 }
 
-const SETTINGS_FIELDS: [SettingField; 9] = [
+const SETTINGS_FIELDS: [SettingField; 10] = [
     SettingField::ServerUrl,
     SettingField::FileServerUrl,
     SettingField::HeaderName,
@@ -438,25 +261,29 @@ const SETTINGS_FIELDS: [SettingField; 9] = [
     SettingField::StealthTitle,
     SettingField::StealthBody,
     SettingField::StealthSeconds,
+    SettingField::Language,
 ];
 
 impl SettingField {
-    fn label(self) -> &'static str {
+    fn label(self, lang: Lang) -> &'static str {
+        let texts = lang.texts();
         match self {
-            SettingField::ServerUrl => "Text API",
-            SettingField::FileServerUrl => "File API",
-            SettingField::HeaderName => "Guard Header Name",
-            SettingField::HeaderValue => "Guard Header Value",
-            SettingField::ProxyUrl => "Proxy URL",
-            SettingField::NotifyLevel => "Notify Level",
-            SettingField::StealthTitle => "Stealth Title",
-            SettingField::StealthBody => "Stealth Body",
-            SettingField::StealthSeconds => "Stealth Seconds",
+            SettingField::ServerUrl => texts.label_text_api,
+            SettingField::FileServerUrl => texts.label_file_api,
+            SettingField::HeaderName => texts.label_guard_name,
+            SettingField::HeaderValue => texts.label_guard_value,
+            SettingField::ProxyUrl => texts.label_proxy,
+            SettingField::NotifyLevel => texts.label_notify,
+            SettingField::StealthTitle => texts.label_stealth_title,
+            SettingField::StealthBody => texts.label_stealth_body,
+            SettingField::StealthSeconds => texts.label_stealth_seconds,
+            SettingField::Language => texts.label_language,
         }
     }
 
-    fn is_notify_level(self) -> bool {
-        matches!(self, SettingField::NotifyLevel)
+    /// Поле переключается стрелками/Space, а не редактируется как текст.
+    fn is_toggle(self) -> bool {
+        matches!(self, SettingField::NotifyLevel | SettingField::Language)
     }
 
     fn is_masked(self) -> bool {
@@ -483,6 +310,113 @@ impl HelpFlow {
     }
 }
 
+/// Экран модального окна контактов.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ContactsStage {
+    List,
+    Info,
+    /// Переименование: текст и курсор живут в `UiState::input`.
+    Rename,
+    ConfirmDelete,
+}
+
+/// Строка списка контактов с уже расшифрованными данными.
+#[derive(Clone)]
+struct ContactRow {
+    hash: String,
+    nickname: String,
+    x25519: String,
+    ed25519: Option<String>,
+    messages: usize,
+}
+
+/// Модальное окно `/contacts`: список, фильтр, карточка и действия.
+struct ContactsFlow {
+    stage: ContactsStage,
+    rows: Vec<ContactRow>,
+    /// Индексы `rows`, прошедшие фильтр.
+    filtered: Vec<usize>,
+    selected: usize,
+    filter: String,
+    filter_active: bool,
+    /// Краткое уведомление в подвале (копирование, переименование).
+    notice: Option<String>,
+}
+
+impl ContactsFlow {
+    fn new(rows: Vec<ContactRow>) -> Self {
+        let mut flow = Self {
+            stage: ContactsStage::List,
+            rows,
+            filtered: Vec::new(),
+            selected: 0,
+            filter: String::new(),
+            filter_active: false,
+            notice: None,
+        };
+        flow.apply_filter();
+        flow
+    }
+
+    fn apply_filter(&mut self) {
+        let needle = self.filter.trim().to_lowercase();
+        self.filtered = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                needle.is_empty()
+                    || row.nickname.to_lowercase().contains(&needle)
+                    || row.hash.to_lowercase().contains(&needle)
+            })
+            .map(|(index, _)| index)
+            .collect();
+
+        if self.selected >= self.filtered.len() {
+            self.selected = self.filtered.len().saturating_sub(1);
+        }
+    }
+
+    fn selected_row(&self) -> Option<&ContactRow> {
+        self.filtered
+            .get(self.selected)
+            .and_then(|index| self.rows.get(*index))
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        if self.filtered.is_empty() {
+            self.selected = 0;
+            return;
+        }
+        let len = self.filtered.len() as isize;
+        self.selected = (self.selected as isize + delta).rem_euclid(len) as usize;
+    }
+
+    /// Обновляет строку после успешного переименования.
+    fn rename_row(&mut self, hash: &str, nickname: &str) {
+        if let Some(row) = self.rows.iter_mut().find(|row| row.hash == hash) {
+            row.nickname = nickname.to_string();
+        }
+        self.apply_filter();
+    }
+}
+
+/// Приветственное окно первого запуска с выбором языка.
+struct WelcomeFlow {
+    selected: Lang,
+}impl WelcomeFlow {
+    fn new(selected: Lang) -> Self {
+        Self { selected }
+    }
+
+    fn toggle(&mut self) {
+        self.selected = match self.selected {
+            Lang::En => Lang::Ru,
+            Lang::Ru => Lang::En,
+        };
+    }
+}
+
 /// Модальное окно настроек `/set`.
 /// Значение защитного заголовка не показывается на экране.
 struct SettingsFlow {
@@ -498,6 +432,7 @@ struct SettingsFlow {
     stealth_title: String,
     stealth_body: String,
     stealth_seconds: String,
+    lang: Lang,
 }
 
 impl SettingsFlow {
@@ -514,6 +449,7 @@ impl SettingsFlow {
             stealth_title: config.stealth_title.clone(),
             stealth_body: config.stealth_body.clone(),
             stealth_seconds: config.stealth_seconds.clone(),
+            lang: config.lang,
         }
     }
 
@@ -530,6 +466,21 @@ impl SettingsFlow {
         self.notify_level = (self.notify_level as isize + delta).rem_euclid(4) as u8;
     }
 
+    /// Циклически переключает язык и переводит нетронутые stealth-шаблоны.
+    fn cycle_lang(&mut self) {
+        let next = match self.lang {
+            Lang::En => Lang::Ru,
+            Lang::Ru => Lang::En,
+        };
+        if self.stealth_title == self.lang.default_stealth_title() {
+            self.stealth_title = next.default_stealth_title().to_string();
+        }
+        if self.stealth_body == self.lang.default_stealth_body() {
+            self.stealth_body = next.default_stealth_body().to_string();
+        }
+        self.lang = next;
+    }
+
     fn edit_value(&self, field: SettingField) -> String {
         match field {
             SettingField::ServerUrl => self.server_url.clone(),
@@ -541,6 +492,7 @@ impl SettingsFlow {
             SettingField::StealthTitle => self.stealth_title.clone(),
             SettingField::StealthBody => self.stealth_body.clone(),
             SettingField::StealthSeconds => self.stealth_seconds.clone(),
+            SettingField::Language => self.lang.native_name().to_string(),
         }
     }
 
@@ -575,6 +527,7 @@ impl SettingsFlow {
             SettingField::StealthSeconds if !value.is_empty() => {
                 self.stealth_seconds = value.to_string();
             }
+            SettingField::Language => self.cycle_lang(),
             _ => {}
         }
     }
@@ -587,15 +540,16 @@ impl SettingsFlow {
             SettingField::HeaderValue => "********".to_string(),
             SettingField::ProxyUrl => {
                 if self.proxy_url.trim().is_empty() {
-                    "— (прямое подключение)".to_string()
+                    self.lang.texts().direct_connection.to_string()
                 } else {
                     self.proxy_url.clone()
                 }
             }
-            SettingField::NotifyLevel => notify_level_label(self.notify_level).to_string(),
+            SettingField::NotifyLevel => self.lang.notify_level_label(self.notify_level).to_string(),
             SettingField::StealthTitle => self.stealth_title.clone(),
             SettingField::StealthBody => self.stealth_body.clone(),
             SettingField::StealthSeconds => self.stealth_seconds.clone(),
+            SettingField::Language => self.lang.native_name().to_string(),
         }
     }
 
@@ -614,6 +568,7 @@ impl SettingsFlow {
             stealth_title: self.stealth_title.clone(),
             stealth_body: self.stealth_body.clone(),
             stealth_seconds: self.stealth_seconds.clone(),
+            lang: self.lang,
         };
         config.normalize();
         config
@@ -629,12 +584,17 @@ impl UiState {
     fn new(app: &App) -> Self {
         let room = app.get_current_room();
         let room_label = room_label(app, &room);
+        let lang = app.get_config().lang;
+        let texts = lang.texts();
 
         // Создаём буфер обмена один раз: пересоздание на каждый вызов
         // приводило к предупреждению arboard «dropped too quickly».
         let (clipboard, status) = match arboard::Clipboard::new() {
-            Ok(clipboard) => (Some(clipboard), "готово".to_string()),
-            Err(e) => (None, format!("буфер обмена недоступен: {}", e)),
+            Ok(clipboard) => (Some(clipboard), texts.ready.to_string()),
+            Err(e) => (
+                None,
+                texts.clipboard_unavailable.replacen("{}", &e.to_string(), 1),
+            ),
         };
 
         let mut state = Self {
@@ -666,8 +626,14 @@ impl UiState {
             settings: None,
             help: None,
             recovery: None,
+            contacts: None,
+            lang,
+            ttl_seconds: None,
+            ttl_synced: false,
+            welcome: None,
         };
         refresh_chats(app, &mut state);
+        sync_ttl_state(app, &mut state);
         reload_room(app, &mut state);
         state
     }
@@ -768,6 +734,94 @@ fn event_time(ts: i64) -> String {
         .unwrap_or_else(|| "??:??:??".to_string())
 }
 
+/// Текущее Unix-время в секундах.
+fn now_unix() -> u64 {
+    chrono::Utc::now().timestamp().max(0) as u64
+}
+
+/// Обратный отсчёт в формате `mm:ss` (для RAM-only сообщений).
+fn ttl_countdown(expires_at: u64, now: u64) -> String {
+    let remaining = expires_at.saturating_sub(now);
+    format!("{:02}:{:02}", remaining / 60, remaining % 60)
+}
+
+/// Синхронизирует UI-поля TTL с RAM-состоянием активной комнаты.
+fn sync_ttl_state(app: &App, state: &mut UiState) {
+    let ttl = app.get_room_ttl(&state.room);
+    state.ttl_seconds = ttl.and_then(|value| value.seconds);
+    state.ttl_synced = ttl.map(|value| value.synced).unwrap_or(false);
+}
+
+/// Бейдж TTL для заголовка активного чата.
+fn ttl_badge(state: &UiState, texts: &Texts) -> String {
+    match state.ttl_seconds {
+        Some(seconds) if state.ttl_synced => {
+            tr(texts.ttl_badge_synced, &[&seconds.to_string()])
+        }
+        Some(seconds) => tr(texts.ttl_badge, &[&seconds.to_string()]),
+        None => String::new(),
+    }
+}
+
+/// Разбирает аргумент `/ttl` и `/ttl-syn`.
+///
+/// Поддерживаются суффиксы `s`, `m`, `h`, а также `off`.
+/// Голое число трактуется как секунды.
+fn parse_ttl_duration(raw: &str) -> Result<Option<u64>> {
+    let raw = raw.trim();
+    if raw.eq_ignore_ascii_case("off") {
+        return Ok(None);
+    }
+
+    let (number, multiplier) = match raw.chars().last() {
+        Some('s') | Some('S') => (&raw[..raw.len() - 1], 1u64),
+        Some('m') | Some('M') => (&raw[..raw.len() - 1], 60u64),
+        Some('h') | Some('H') => (&raw[..raw.len() - 1], 3600u64),
+        _ => (raw, 1u64),
+    };
+
+    let value: u64 = number
+        .parse()
+        .map_err(|_| anyhow!("invalid TTL duration: {}", raw))?;
+    let seconds = value
+        .checked_mul(multiplier)
+        .ok_or_else(|| anyhow!("TTL duration is too large"))?;
+
+    if seconds == 0 {
+        return Err(anyhow!("TTL duration must be positive"));
+    }
+
+    Ok(Some(seconds))
+}
+
+/// Перерисовывает состояние TTL и удаляет истёкшие сообщения из RAM.
+fn tick_ttl(app: &App, state: &mut UiState) {
+    let now = now_unix();
+
+    if let Err(e) = app.purge_expired_messages() {
+        state.status = tr(
+            state.lang.texts().ttl_purge_error,
+            &[&format!("{:#}", e)],
+        );
+    }
+
+    // Удаляем истёкшие строки из UI и затираем их буферы нулями.
+    let mut kept = Vec::with_capacity(state.feed.len());
+    for entry in std::mem::take(&mut state.feed) {
+        if entry
+            .expires_at
+            .is_some_and(|expires| expires <= now)
+        {
+            let _ = Zeroizing::new(entry.text);
+        } else {
+            kept.push(entry);
+        }
+    }
+    state.feed = kept;
+    sync_ttl_state(app, state);
+}
+
+
 fn room_label(app: &App, room: &str) -> String {
     if room.is_empty() {
         return "—".to_string();
@@ -820,17 +874,25 @@ fn load_room_feed(app: &App, state: &mut UiState) -> Vec<FeedEntry> {
                         } else {
                             room_title.as_str()
                         };
-                        file_feed_line(&time, sender, id, &file_name, outgoing)
+                        file_feed_line(&time, sender, id, &file_name, outgoing, state.lang)
                     }
                     None => format!("[{}] {}", time, m.text),
                 };
 
-                FeedEntry { kind, text }
+                FeedEntry {
+                    kind,
+                    text,
+                    expires_at: m.expires_at,
+                }
             })
             .collect(),
         Err(e) => vec![FeedEntry {
             kind: FeedKind::Error,
-            text: format!("Не удалось загрузить историю: {:#}", e),
+            text: tr(
+                state.lang.texts().history_load_failed,
+                &[&format!("{:#}", e)],
+            ),
+            expires_at: None,
         }],
     }
 }
@@ -846,9 +908,15 @@ fn parse_file_notification(text: &str) -> Option<(String, String)> {
 
     for line in text.lines() {
         let line = line.trim();
-        if let Some(rest) = line.strip_prefix("📎 Файл:") {
+        if let Some(rest) = line
+            .strip_prefix("📎 Файл:")
+            .or_else(|| line.strip_prefix("📎 File:"))
+        {
             file_name = Some(rest.trim().to_string());
-        } else if let Some(rest) = line.strip_prefix("Хеш:") {
+        } else if let Some(rest) = line
+            .strip_prefix("Хеш:")
+            .or_else(|| line.strip_prefix("Hash:"))
+        {
             file_hash = Some(rest.trim().to_string());
         }
     }
@@ -897,16 +965,19 @@ fn file_feed_line(
     id: usize,
     file_name: &str,
     outgoing: bool,
+    lang: Lang,
 ) -> String {
+    let texts = lang.texts();
+    let id = id.to_string();
     if outgoing {
-        format!(
-            "[{}] 📎 вы отправили файл [#{}] {} (введите /dl или /dl {})",
-            time, id, file_name, id
+        tr(
+            texts.file_sent_out,
+            &[time, &id, file_name, &id],
         )
     } else {
-        format!(
-            "[{}] 📎 {} отправил файл [#{}] {} (введите /dl или /dl {})",
-            time, sender, id, file_name, id
+        tr(
+            texts.file_sent_in,
+            &[time, sender, &id, file_name, &id],
         )
     }
 }
@@ -959,14 +1030,19 @@ fn safe_file_name(file_name: &str) -> String {
 }
 
 /// Выбирает путь сохранения: аргумент-папка, аргумент-файл или ./downloads/<name>.
-fn resolve_save_path(target: Option<&str>, file_name: &str) -> Result<PathBuf> {
+fn resolve_save_path(target: Option<&str>, file_name: &str, lang: Lang) -> Result<PathBuf> {
     let file_name = safe_file_name(file_name);
+    let create_failed = lang.texts().create_dir_failed;
 
     let path = match target.map(str::trim).filter(|s| !s.is_empty()) {
         None => {
             let dir = PathBuf::from("./downloads");
-            std::fs::create_dir_all(&dir)
-                .map_err(|e| anyhow!("не удалось создать {}: {}", dir.display(), e))?;
+            std::fs::create_dir_all(&dir).map_err(|e| {
+                anyhow!(
+                    "{}",
+                    tr(create_failed, &[&dir.display().to_string(), &e.to_string()])
+                )
+            })?;
             dir.join(file_name)
         }
         Some(raw) => {
@@ -976,14 +1052,26 @@ fn resolve_save_path(target: Option<&str>, file_name: &str) -> Result<PathBuf> {
 
             if looks_like_dir {
                 std::fs::create_dir_all(&candidate).map_err(|e| {
-                    anyhow!("не удалось создать {}: {}", candidate.display(), e)
+                    anyhow!(
+                        "{}",
+                        tr(
+                            create_failed,
+                            &[&candidate.display().to_string(), &e.to_string()]
+                        )
+                    )
                 })?;
                 candidate.join(file_name)
             } else {
                 if let Some(parent) = candidate.parent() {
                     if !parent.as_os_str().is_empty() {
                         std::fs::create_dir_all(parent).map_err(|e| {
-                            anyhow!("не удалось создать {}: {}", parent.display(), e)
+                            anyhow!(
+                                "{}",
+                                tr(
+                                    create_failed,
+                                    &[&parent.display().to_string(), &e.to_string()]
+                                )
+                            )
                         })?;
                     }
                 }
@@ -1010,13 +1098,17 @@ fn expand_tilde(raw: &str) -> PathBuf {
 }
 
 /// Превращает путь пользователя в абсолютный от текущей рабочей директории.
-fn absolute_user_path(raw: &str) -> Result<PathBuf> {
+fn absolute_user_path(raw: &str, lang: Lang) -> Result<PathBuf> {
     let expanded = expand_tilde(raw);
     if expanded.is_absolute() {
         Ok(expanded)
     } else {
-        let cwd = std::env::current_dir()
-            .map_err(|e| anyhow!("не удалось определить текущую директорию: {}", e))?;
+        let cwd = std::env::current_dir().map_err(|e| {
+            anyhow!(
+                "{}",
+                tr(lang.texts().cwd_failed, &[&e.to_string()])
+            )
+        })?;
         Ok(cwd.join(expanded))
     }
 }
@@ -1083,6 +1175,7 @@ fn switch_to_room(app: &App, state: &mut UiState, hash: &str) {
     state.unread.remove(hash);
     let label = state.room_label.clone();
     ensure_chat_entry(state, hash, &label);
+    sync_ttl_state(app, state);
     reload_room(app, state);
 }
 
@@ -1092,7 +1185,7 @@ fn cycle_chat(app: &App, state: &mut UiState, delta: isize) {
         refresh_chats(app, state);
     }
     if state.chats.is_empty() {
-        state.status = "чатов нет".to_string();
+        state.status = state.lang.texts().status_no_chats.to_string();
         return;
     }
 
@@ -1110,7 +1203,7 @@ fn cycle_chat(app: &App, state: &mut UiState, delta: isize) {
 
     let hash = state.chats[index].hash.clone();
     switch_to_room(app, state, &hash);
-    state.status = format!("чат: {}", state.room_label);
+    state.status = tr(state.lang.texts().status_chat, &[&state.room_label]);
 }
 
 /// Приводит hash или ник из `/room` к hash контакта.
@@ -1144,6 +1237,7 @@ fn normalize_command(cmd: &str) -> &str {
         "/jn" => "/join",
         "/in" => "/invite",
         "/ls" | "/c" => "/contacts",
+        "/cnt" => "/contacts",
         "/r" => "/room",
         "/sf" => "/sendfile",
         "/dl" => "/download",
@@ -1161,6 +1255,7 @@ fn alias_to_command(cmd: &str) -> Option<&'static str> {
         "/jn" => Some("/join"),
         "/in" => Some("/invite"),
         "/ls" | "/c" => Some("/contacts"),
+        "/cnt" => Some("/contacts"),
         "/r" => Some("/room"),
         "/sf" => Some("/sendfile"),
         "/dl" => Some("/download"),
@@ -1176,6 +1271,7 @@ fn push_system(state: &mut UiState, text: &str) {
     state.feed.push(FeedEntry {
         kind: FeedKind::System,
         text: text.to_string(),
+        expires_at: None,
     });
     state.follow = true;
 }
@@ -1184,6 +1280,7 @@ fn push_error(state: &mut UiState, text: &str) {
     state.feed.push(FeedEntry {
         kind: FeedKind::Error,
         text: text.to_string(),
+        expires_at: None,
     });
     state.follow = true;
     state.status = text.to_string();
@@ -1197,27 +1294,48 @@ fn entry_lines(entry: &FeedEntry) -> Vec<Line<'static>> {
         FeedKind::Error => ("! ", Style::default().fg(Color::Red)),
     };
 
+    let countdown = entry
+        .expires_at
+        .map(|expires| format!(" [{}]", ttl_countdown(expires, now_unix())));
+
     entry
         .text
         .split('\n')
         .enumerate()
         .map(|(i, part)| {
             let prefix = if i == 0 { marker } else { "  " };
-            Line::from(vec![
+            let mut spans = vec![
                 Span::styled(prefix.to_string(), style),
                 Span::styled(part.to_string(), style),
-            ])
+            ];
+            if i == 0 {
+                if let Some(countdown) = &countdown {
+                    spans.push(Span::styled(
+                        countdown.clone(),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+            }
+            Line::from(spans)
         })
         .collect()
 }
 
 fn entry_line_count(entry: &FeedEntry, width: usize) -> usize {
     let width = width.max(1);
+    let countdown_len = entry
+        .expires_at
+        .map(|expires| ttl_countdown(expires, now_unix()).chars().count() + 3) // " [mm:ss]"
+        .unwrap_or(0);
     entry
         .text
         .split('\n')
-        .map(|line| {
-            let chars = line.chars().count() + 2; // маркер/отступ
+        .enumerate()
+        .map(|(index, line)| {
+            let mut chars = line.chars().count() + 2; // маркер/отступ
+            if index == 0 {
+                chars += countdown_len;
+            }
             chars.div_ceil(width).max(1)
         })
         .sum::<usize>()
@@ -1569,7 +1687,7 @@ fn complete_input(app: &App, state: &mut UiState) {
         if words_before == 1 && !current.is_empty() && "--force".starts_with(current) {
             replace_input_before_cursor(state, word_start, "--force ");
             state.sf_cycle = None;
-            state.status = "флаг --force: разрешить системные пути".to_string();
+            state.status = state.lang.texts().comp_force.to_string();
             return;
         }
 
@@ -1599,7 +1717,7 @@ fn complete_command(state: &mut UiState) {
     // Точный алиас (/r, /q, /sf...) сразу раскрывается в каноническую команду.
     if let Some(target) = alias_to_command(&before) {
         replace_input_before_cursor(state, 0, target);
-        state.status = format!("команда: {}", target);
+        state.status = tr(state.lang.texts().comp_command, &[target]);
         return;
     }
 
@@ -1609,28 +1727,32 @@ fn complete_command(state: &mut UiState) {
         .filter(|command| command.starts_with(&before))
         .collect();
 
+    let texts = state.lang.texts();
     match matches.len() {
-        0 => state.status = format!("нет команд по запросу «{}»", before),
+        0 => state.status = tr(texts.comp_no_commands, &[&before]),
         1 => {
             let target = matches[0];
             replace_input_before_cursor(state, 0, target);
-            state.status = format!("команда: {}", target);
+            state.status = tr(texts.comp_command, &[target]);
         }
         _ => {
             push_system(
                 state,
-                &format!("Подходящие команды:\n{}", matches.join("  ")),
+                &tr(texts.comp_matching_commands, &[&matches.join("  ")]),
             );
-            state.status = format!("{} вариантов — см. чат", matches.len());
+            state.status = tr(texts.comp_variants, &[&matches.len().to_string()]);
         }
     }
 }
 
-fn dl_status(index: usize, total: usize, label: &str) -> String {
+fn dl_status(lang: Lang, index: usize, total: usize, label: &str) -> String {
+    let texts = lang.texts();
     if total > 1 {
-        format!("файл {}/{}: {} (Tab — далее)", index + 1, total, label)
+        let current = (index + 1).to_string();
+        let total = total.to_string();
+        tr(texts.dl_status_many, &[&current, &total, label])
     } else {
-        format!("файл: {}", label)
+        tr(texts.dl_status_one, &[label])
     }
 }
 
@@ -1654,7 +1776,7 @@ fn complete_download(state: &mut UiState, word_start: usize) {
             let total = cycle.candidates.len();
 
             replace_input_before_cursor(state, word_start, &token);
-            state.status = dl_status(index, total, &label);
+            state.status = dl_status(state.lang, index, total, &label);
             state.dl_cycle = Some(CompletionCycle {
                 start: word_start,
                 index,
@@ -1674,7 +1796,7 @@ fn complete_download(state: &mut UiState, word_start: usize) {
         .collect();
 
     if files.is_empty() {
-        state.status = "в этой комнате нет файлов".to_string();
+        state.status = state.lang.texts().dl_no_files_room.to_string();
         return;
     }
 
@@ -1685,7 +1807,7 @@ fn complete_download(state: &mut UiState, word_start: usize) {
     };
 
     if matching.is_empty() {
-        state.status = format!("нет файлов по запросу «{}»", current);
+        state.status = tr(state.lang.texts().dl_no_match, &[&current]);
         return;
     }
 
@@ -1700,7 +1822,7 @@ fn complete_download(state: &mut UiState, word_start: usize) {
     let total = candidates.len();
 
     replace_input_before_cursor(state, word_start, &token);
-    state.status = dl_status(0, total, &label);
+    state.status = dl_status(state.lang, 0, total, &label);
     state.dl_cycle = Some(CompletionCycle {
         start: word_start,
         index: 0,
@@ -1710,11 +1832,14 @@ fn complete_download(state: &mut UiState, word_start: usize) {
     });
 }
 
-fn path_status(index: usize, total: usize, label: &str) -> String {
+fn path_status(lang: Lang, index: usize, total: usize, label: &str) -> String {
+    let texts = lang.texts();
     if total > 1 {
-        format!("путь {}/{}: {} (Tab — далее)", index + 1, total, label)
+        let current = (index + 1).to_string();
+        let total = total.to_string();
+        tr(texts.path_status_many, &[&current, &total, label])
     } else {
-        format!("файл: {}", label)
+        tr(texts.path_status_one, &[label])
     }
 }
 
@@ -1739,9 +1864,9 @@ fn complete_sendfile(state: &mut UiState, word_start: usize) {
 
             replace_input_before_cursor(state, word_start, &token);
             if token.ends_with('/') {
-                state.status = format!("папка: {} (Tab — войти)", label);
+                state.status = tr(state.lang.texts().sf_folder, &[&label]);
             } else {
-                state.status = path_status(index, total, &label);
+                state.status = path_status(state.lang, index, total, &label);
                 state.sf_cycle = Some(CompletionCycle {
                     start: word_start,
                     index,
@@ -1758,7 +1883,7 @@ fn complete_sendfile(state: &mut UiState, word_start: usize) {
     if current == "~" {
         replace_input_before_cursor(state, word_start, "~/");
         state.sf_cycle = None;
-        state.status = "домашняя директория".to_string();
+        state.status = state.lang.texts().sf_home.to_string();
         return;
     }
 
@@ -1769,7 +1894,7 @@ fn complete_sendfile(state: &mut UiState, word_start: usize) {
     };
 
     let dir_for_read = if dir_part.is_empty() { "." } else { dir_part };
-    let dir_path = match absolute_user_path(dir_for_read) {
+    let dir_path = match absolute_user_path(dir_for_read, state.lang) {
         Ok(path) => path,
         Err(e) => {
             state.status = format!("{:#}", e);
@@ -1780,11 +1905,11 @@ fn complete_sendfile(state: &mut UiState, word_start: usize) {
     let entries = match std::fs::read_dir(&dir_path) {
         Ok(entries) => entries,
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-            state.status = format!("нет прав на чтение: {}", dir_path.display());
+            state.status = tr(state.lang.texts().sf_permission, &[&dir_path.display().to_string()]);
             return;
         }
         Err(e) => {
-            state.status = format!("не удалось прочитать {}: {}", dir_path.display(), e);
+            state.status = tr(state.lang.texts().sf_read_failed, &[&dir_path.display().to_string(), &e.to_string()]);
             return;
         }
     };
@@ -1810,9 +1935,9 @@ fn complete_sendfile(state: &mut UiState, word_start: usize) {
 
     if candidates.is_empty() {
         state.status = if current.is_empty() {
-            format!("в {} нет файлов", dir_path.display())
+            tr(state.lang.texts().sf_no_files_dir, &[&dir_path.display().to_string()])
         } else {
-            format!("нет файлов по запросу «{}»", current)
+            tr(state.lang.texts().sf_no_match, &[&current])
         };
         return;
     }
@@ -1825,12 +1950,13 @@ fn complete_sendfile(state: &mut UiState, word_start: usize) {
     replace_input_before_cursor(state, word_start, &token);
     if is_dir {
         if total > 1 {
-            state.status = format!("папка: {} (Tab — войти, {} вариантов)", label, total);
+            let total_text = total.to_string();
+            state.status = tr(state.lang.texts().sf_folder_many, &[&label, &total_text]);
         } else {
-            state.status = format!("папка: {} (Tab — войти)", label);
+            state.status = tr(state.lang.texts().sf_folder, &[&label]);
         }
     } else {
-        state.status = path_status(0, total, &label);
+        state.status = path_status(state.lang, 0, total, &label);
         state.sf_cycle = Some(CompletionCycle {
             start: word_start,
             index: 0,
@@ -1849,7 +1975,7 @@ fn complete_contact(app: &App, state: &mut UiState, word_start: usize) {
     let contacts = match app.get_contacts() {
         Ok(contacts) => contacts,
         Err(e) => {
-            state.status = format!("ошибка получения контактов: {:#}", e);
+            state.status = tr(state.lang.texts().contacts_fetch_error, &[&format!("{:#}", e)]);
             return;
         }
     };
@@ -1870,19 +1996,17 @@ fn complete_contact(app: &App, state: &mut UiState, word_start: usize) {
         }
     }
 
+    let texts = state.lang.texts();
     match candidates.len() {
-        0 => push_system(state, &format!("Нет контактов по запросу «{}»", partial)),
+        0 => push_system(state, &tr(texts.no_contacts_query, &[&partial])),
         1 => {
             let choice = candidates.remove(0);
             replace_input_before_cursor(state, word_start, &choice);
-            state.status = format!("контакт: {}", choice);
+            state.status = tr(texts.comp_contact, &[&choice]);
         }
         _ => {
-            push_system(
-                state,
-                &format!("Подходящие контакты:\n{}", candidates.join("\n")),
-            );
-            state.status = format!("{} вариантов — см. чат", candidates.len());
+            push_system(state, &tr(texts.matching_contacts, &[&candidates.join("\n")]));
+            state.status = tr(texts.comp_variants, &[&candidates.len().to_string()]);
         }
     }
 }
@@ -1934,6 +2058,7 @@ fn sidebar_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
 }
 
 fn draw_ui(frame: &mut Frame, state: &mut UiState) {
+    let texts = state.lang.texts();
     let chunks = Layout::vertical([
         Constraint::Min(3),
         Constraint::Length(1),
@@ -1959,16 +2084,26 @@ fn draw_ui(frame: &mut Frame, state: &mut UiState) {
     if let Some(area) = sidebar_area {
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(format!(" Чаты ({}) ", state.chats.len()));
+            .title(tr(texts.sidebar_title, &[&state.chats.len().to_string()]));
         let inner = block.inner(area);
         let lines = sidebar_lines(state, inner.width as usize);
         frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
     }
 
     let title = if state.room.is_empty() {
-        "Чат — нет активной комнаты".to_string()
+        texts.chat_no_room.to_string()
     } else {
-        format!(" {} · {} ", state.room_label, short_hash(&state.room))
+        let badge = ttl_badge(state, texts);
+        if badge.is_empty() {
+            format!(" {} · {} ", state.room_label, short_hash(&state.room))
+        } else {
+            format!(
+                " {} · {}  {} ",
+                state.room_label,
+                short_hash(&state.room),
+                badge
+            )
+        }
     };
     let chat_block = Block::default().borders(Borders::ALL).title(title);
     let chat_inner = chat_block.inner(chat_area);
@@ -1996,23 +2131,34 @@ fn draw_ui(frame: &mut Frame, state: &mut UiState) {
         format!("{} ({})", state.room_label, short_hash(&state.room))
     };
     let status = if let Some(flow) = state.settings.as_ref() {
-        format!(
-            " Настройки: {} · {}   Esc — сохранить и закрыть ",
-            flow.field().label(),
-            if flow.editing { "ввод" } else { "выбор" }
+        let mode = if flow.editing {
+            flow.lang.texts().settings_mode_edit
+        } else {
+            flow.lang.texts().settings_mode_select
+        };
+        tr(
+            flow.lang.texts().settings_status_bar,
+            &[flow.field().label(flow.lang), mode],
+        )
+    } else if let Some(flow) = state.contacts.as_ref() {
+        let total = flow.filtered.len();
+        let position = if total == 0 { 0 } else { flow.selected + 1 };
+        tr(
+            texts.contacts_status_bar,
+            &[&position.to_string(), &total.to_string()],
         )
     } else if let Some(flow) = state.recovery.as_ref() {
         let stage = match flow.stage {
-            RecoveryStage::Password => "пароль",
-            RecoveryStage::View => "просмотр фразы",
-            RecoveryStage::Confirm => "подтверждение",
-            RecoveryStage::Input => "новая фраза",
+            RecoveryStage::Password => texts.recovery_stage_password,
+            RecoveryStage::View => texts.recovery_stage_view,
+            RecoveryStage::Confirm => texts.recovery_stage_confirm,
+            RecoveryStage::Input => texts.recovery_stage_input,
         };
-        format!(" Восстановление: {}   Esc — закрыть ", stage)
+        tr(texts.recovery_status_bar, &[stage])
     } else {
         format!(
-            " {}   Room: {}   {} ",
-            state.nickname, room, state.status
+            " {}   {}: {}   {} ",
+            state.nickname, texts.room_label, room, state.status
         )
     };
     frame.render_widget(
@@ -2025,26 +2171,29 @@ fn draw_ui(frame: &mut Frame, state: &mut UiState) {
 
     // ---------- 3. Поле ввода ----------
     let settings_open = state.settings.is_some();
+    let contacts_open = state.contacts.is_some();
     let recovery_password = state
         .recovery
         .as_ref()
         .map(|flow| flow.stage == RecoveryStage::Password)
         .unwrap_or(false);
-    let (input_title, masked) = if settings_open {
-        (" Настройки ".to_string(), false)
+    let (input_title, masked) = if contacts_open {
+        (texts.contacts_input_title.to_string(), false)
+    } else if settings_open {
+        (texts.settings_input_title.to_string(), false)
     } else if let Some(flow) = state.passwd.as_ref() {
         let title = match flow.stage {
-            PasswdStage::Current => " Пароль: текущий ",
-            PasswdStage::New => " Пароль: новый ",
-            PasswdStage::Confirm => " Пароль: повтор ",
+            PasswdStage::Current => texts.passwd_input_current,
+            PasswdStage::New => texts.passwd_input_new,
+            PasswdStage::Confirm => texts.passwd_input_confirm,
         };
         (title.to_string(), true)
     } else if recovery_password {
-        (" Пароль: текущий ".to_string(), true)
+        (texts.recovery_input_password_title.to_string(), true)
     } else if state.recovery.is_some() {
-        (" Восстановление · /recovery ".to_string(), false)
+        (texts.recovery_input_title.to_string(), false)
     } else {
-        (" Ввод ".to_string(), false)
+        (texts.input_title.to_string(), false)
     };
     let input_block = Block::default()
         .borders(Borders::ALL)
@@ -2054,17 +2203,36 @@ fn draw_ui(frame: &mut Frame, state: &mut UiState) {
 
     if settings_open {
         let hint = match state.settings.as_ref() {
-            Some(flow) if flow.editing => {
-                " Ввод: Enter — применить · Esc — отменить редактирование "
-            }
-            _ => {
-                " ↑/↓ или Tab/Shift+Tab — выбор · Enter — редактировать · \
-                 ←/→ или Space — Notify Level · Esc — сохранить и закрыть "
-            }
+            Some(flow) if flow.editing => flow.lang.texts().settings_hint_edit,
+            Some(flow) => flow.lang.texts().settings_hint_select,
+            None => texts.settings_hint_select,
         };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 hint,
+                Style::default().fg(Color::Gray),
+            ))),
+            input_inner,
+        );
+    } else if contacts_open {
+        let hint: String = match state.contacts.as_ref() {
+            Some(flow) if flow.stage == ContactsStage::Rename => {
+                texts.contacts_hint_rename.to_string()
+            }
+            Some(flow) if flow.stage == ContactsStage::Info => {
+                texts.contacts_hint_info.to_string()
+            }
+            Some(flow) if flow.stage == ContactsStage::ConfirmDelete => {
+                texts.contacts_hint_confirm.to_string()
+            }
+            Some(flow) if flow.filter_active => {
+                tr(texts.contacts_hint_filter, &[&flow.filter])
+            }
+            _ => texts.contacts_hint_list.to_string(),
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                truncate_chars(&hint, input_inner.width as usize),
                 Style::default().fg(Color::Gray),
             ))),
             input_inner,
@@ -2095,7 +2263,7 @@ fn draw_ui(frame: &mut Frame, state: &mut UiState) {
 
         let cursor_x = input_inner.x + prefix.len() as u16 + cursor_col as u16;
         let cursor_y = input_inner.y;
-        if state.help.is_none() && state.recovery.is_none() {
+        if state.help.is_none() && state.recovery.is_none() && state.welcome.is_none() && state.contacts.is_none() {
             frame.set_cursor_position(Position::new(
                 cursor_x.min(input_inner.right().saturating_sub(1)),
                 cursor_y,
@@ -2111,6 +2279,12 @@ fn draw_ui(frame: &mut Frame, state: &mut UiState) {
     }
     if state.recovery.is_some() {
         draw_recovery_modal(frame, state);
+    }
+    if state.contacts.is_some() {
+        draw_contacts_modal(frame, state);
+    }
+    if state.welcome.is_some() {
+        draw_welcome_modal(frame, state);
     }
 }
 
@@ -2132,7 +2306,7 @@ fn draw_settings_modal(frame: &mut Frame, state: &UiState) {
     frame.render_widget(Clear, rect);
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" Настройки · /set ");
+        .title(flow.lang.texts().settings_title);
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
@@ -2142,9 +2316,13 @@ fn draw_settings_modal(frame: &mut Frame, state: &UiState) {
     for (index, field) in SETTINGS_FIELDS.iter().enumerate() {
         let selected = index == flow.selected;
         let marker = if selected { "▸ " } else { "  " };
-        let label = format!("{:<width$}", field.label(), width = LABEL_WIDTH);
+        let label = format!(
+            "{:<width$}",
+            field.label(flow.lang),
+            width = LABEL_WIDTH
+        );
 
-        let value = if selected && flow.editing && !field.is_notify_level() {
+        let value = if selected && flow.editing && !field.is_toggle() {
             if field.is_masked() {
                 "*".repeat(state.input.chars().count())
             } else {
@@ -2165,9 +2343,9 @@ fn draw_settings_modal(frame: &mut Frame, state: &UiState) {
 
     lines.push(Line::from(""));
     let hint = if flow.editing {
-        "Enter — применить · Esc — отменить · Ctrl+V — вставить"
+        flow.lang.texts().settings_modal_hint_edit
     } else {
-        "↑/↓, Tab/Shift+Tab — выбор · Enter — изменить · Esc — сохранить и закрыть"
+        flow.lang.texts().settings_modal_hint_select
     };
     lines.push(Line::from(Span::styled(
         hint,
@@ -2198,7 +2376,7 @@ fn draw_help_modal(frame: &mut Frame, state: &mut UiState) {
         .border_style(Style::default().fg(Color::Cyan))
         .title(Line::from(vec![
             Span::styled(
-                " Справка ",
+                state.lang.texts().help_title,
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Cyan)
@@ -2215,7 +2393,7 @@ fn draw_help_modal(frame: &mut Frame, state: &mut UiState) {
     let content_height = inner.height.saturating_sub(footer_height);
     let content_area = Rect::new(inner.x, inner.y, inner.width, content_height);
 
-    let lines = help_lines(inner.width as usize);
+    let lines = help_lines(inner.width as usize, state.lang);
     let max_scroll = (lines.len() as u16).saturating_sub(content_height);
 
     let Some(flow) = state.help.as_mut() else {
@@ -2236,10 +2414,8 @@ fn draw_help_modal(frame: &mut Frame, state: &mut UiState) {
         } else {
             (flow.scroll as u32 * 100 / max_scroll as u32).min(100) as u16
         };
-        let hint = format!(
-            " Up/Down, j/k · PgUp/PgDn — прокрутка   {:>3}% · Esc, q, Enter — закрыть ",
-            percent
-        );
+        let percent = format!("{:>3}", percent);
+        let hint = tr(state.lang.texts().help_footer, &[&percent]);
         let hint = truncate_chars(&hint, inner.width as usize);
         let footer_area = Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1);
         frame.render_widget(
@@ -2257,6 +2433,7 @@ fn draw_recovery_modal(frame: &mut Frame, state: &UiState) {
     let Some(flow) = state.recovery.as_ref() else {
         return;
     };
+    let texts = state.lang.texts();
 
     let area = frame.area();
     let width = 88
@@ -2281,7 +2458,7 @@ fn draw_recovery_modal(frame: &mut Frame, state: &UiState) {
         .border_style(Style::default().fg(Color::Cyan))
         .title(Line::from(vec![
             Span::styled(
-                " Восстановление ",
+                texts.recovery_modal_title,
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Cyan)
@@ -2297,7 +2474,7 @@ fn draw_recovery_modal(frame: &mut Frame, state: &UiState) {
     match flow.stage {
         RecoveryStage::Password => {
             lines.push(Line::from(Span::styled(
-                "Введите текущий мастер-пароль, чтобы открыть фразу восстановления.",
+                texts.recovery_password_prompt,
                 Style::default().fg(Color::Gray),
             )));
             lines.push(Line::from(""));
@@ -2308,7 +2485,7 @@ fn draw_recovery_modal(frame: &mut Frame, state: &UiState) {
         }
         RecoveryStage::View => {
             lines.push(Line::from(Span::styled(
-                "Текущая BIP-39 фраза восстановления:",
+                texts.recovery_phrase_title,
                 Style::default().fg(Color::Gray),
             )));
             lines.push(Line::from(""));
@@ -2322,30 +2499,30 @@ fn draw_recovery_modal(frame: &mut Frame, state: &UiState) {
             }
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                "Никому не показывайте фразу: она полностью заменяет идентичность.",
+                texts.recovery_phrase_warning,
                 Style::default().fg(Color::DarkGray),
             )));
         }
         RecoveryStage::Confirm => {
             lines.push(Line::from(Span::styled(
-                "Перезаписать идентичность?",
+                texts.recovery_confirm_title,
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             )));
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                "Текущий identity.json будет заменён личностью, восстановленной из новой фразы.",
+                texts.recovery_confirm_body,
                 Style::default().fg(Color::Gray),
             )));
             lines.push(Line::from(Span::styled(
-                "Старые ключи перестанут действовать; отменить это можно только старой фразой.",
+                texts.recovery_confirm_body2,
                 Style::default().fg(Color::Gray),
             )));
         }
         RecoveryStage::Input => {
             lines.push(Line::from(Span::styled(
-                "Новая BIP-39 фраза (12/15/18/21/24 слова):",
+                texts.recovery_new_phrase,
                 Style::default().fg(Color::Gray),
             )));
             lines.push(Line::from(""));
@@ -2366,10 +2543,10 @@ fn draw_recovery_modal(frame: &mut Frame, state: &UiState) {
 
     lines.push(Line::from(""));
     let hint = match flow.stage {
-        RecoveryStage::Password => "Enter — подтвердить · Esc — закрыть",
-        RecoveryStage::View => "Tab или R — ввести новую фразу · Esc — закрыть",
-        RecoveryStage::Confirm => "Enter — продолжить · Esc — закрыть",
-        RecoveryStage::Input => "Enter — восстановить · Esc — закрыть",
+        RecoveryStage::Password => texts.recovery_hint_password,
+        RecoveryStage::View => texts.recovery_hint_view,
+        RecoveryStage::Confirm => texts.recovery_hint_confirm,
+        RecoveryStage::Input => texts.recovery_hint_input,
     };
     lines.push(Line::from(Span::styled(
         hint,
@@ -2377,6 +2554,380 @@ fn draw_recovery_modal(frame: &mut Frame, state: &UiState) {
     )));
 
     frame.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), inner);
+}
+
+/// Рисует модальное окно управления контактами (`/contacts`).
+fn draw_contacts_modal(frame: &mut Frame, state: &UiState) {
+    let Some(flow) = state.contacts.as_ref() else {
+        return;
+    };
+    let texts = state.lang.texts();
+
+    let area = frame.area();
+    let width = 80
+        .min(area.width.saturating_sub(2))
+        .max(20)
+        .min(area.width);
+    let height = 26
+        .min(area.height.saturating_sub(2))
+        .max(10)
+        .min(area.height);
+    let rect = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+
+    frame.render_widget(Clear, rect);
+    let title = if flow.stage == ContactsStage::Info {
+        texts.contacts_info_title
+    } else {
+        texts.contacts_modal_title
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Line::from(vec![
+            Span::styled(
+                title,
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" /contacts ", Style::default().fg(Color::DarkGray)),
+        ]))
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    if flow.stage == ContactsStage::Info {
+        draw_contact_info(frame, flow, inner, state.lang);
+        return;
+    }
+
+    let footer_lines: u16 = if inner.height > 6 { 2 } else { 1 };
+    let content_height = inner.height.saturating_sub(footer_lines);
+    let mut header_height: u16 = 0;
+
+    // Строка живого фильтра или встроенного переименования.
+    if flow.stage == ContactsStage::Rename {
+        let prompt = texts.contacts_rename_prompt;
+        let text = format!("{}{}", prompt, state.input);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                truncate_chars(&text, inner.width as usize),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ))),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+
+        let before = state.input[..state.cursor].chars().count();
+        let cursor_x = (inner.x + prompt.chars().count() as u16 + before as u16)
+            .min(inner.right().saturating_sub(1));
+        frame.set_cursor_position(Position::new(cursor_x, inner.y));
+        header_height = 1;
+    } else if flow.filter_active || !flow.filter.is_empty() {
+        let text = format!("{}{}", texts.contacts_filter_prefix, flow.filter);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                truncate_chars(&text, inner.width as usize),
+                Style::default().fg(Color::Yellow),
+            ))),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+        if flow.filter_active {
+            let before = flow.filter.chars().count();
+            let cursor_x = (inner.x
+                + texts.contacts_filter_prefix.chars().count() as u16
+                + before as u16)
+                .min(inner.right().saturating_sub(1));
+            frame.set_cursor_position(Position::new(cursor_x, inner.y));
+        }
+        header_height = 1;
+    }
+
+    let list_height = content_height.saturating_sub(header_height);
+    let list_area = Rect::new(
+        inner.x,
+        inner.y + header_height,
+        inner.width,
+        list_height,
+    );
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if flow.filtered.is_empty() {
+        let message = if flow.rows.is_empty() {
+            texts.contacts_empty.to_string()
+        } else {
+            tr(texts.contacts_no_matches, &[&flow.filter])
+        };
+        lines.push(Line::from(Span::styled(
+            message,
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        let visible = list_height as usize;
+        let offset = if visible > 0 && flow.selected >= visible {
+            flow.selected + 1 - visible
+        } else {
+            0
+        };
+        let end = (offset + visible).min(flow.filtered.len());
+
+        for position in offset..end {
+            let Some(row) = flow
+                .filtered
+                .get(position)
+                .and_then(|index| flow.rows.get(*index))
+            else {
+                continue;
+            };
+            let selected = position == flow.selected;
+            let marker = if selected { "▸ " } else { "  " };
+            let count = tr(texts.contacts_messages, &[&row.messages.to_string()]);
+            let text = format!(
+                "{}{}  {}  {}",
+                marker,
+                row.nickname,
+                short_hash(&row.hash),
+                count
+            );
+            let style = if selected {
+                Style::default().bg(Color::DarkGray).fg(Color::White)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            lines.push(Line::from(Span::styled(
+                truncate_chars(&text, list_area.width as usize),
+                style,
+            )));
+        }
+    }
+
+    frame.render_widget(Paragraph::new(Text::from(lines)), list_area);
+
+    // Подвал: подтверждение/уведомление и подсказка по клавишам.
+    let footer_area = Rect::new(inner.x, inner.bottom().saturating_sub(footer_lines), inner.width, footer_lines);
+    let mut footer: Vec<Line<'static>> = Vec::new();
+
+    if footer_lines == 2 {
+        if flow.stage == ContactsStage::ConfirmDelete {
+            let name = flow
+                .selected_row()
+                .map(|row| row.nickname.as_str())
+                .unwrap_or("?");
+            footer.push(Line::from(Span::styled(
+                truncate_chars(
+                    &tr(texts.contacts_delete_confirm, &[name]),
+                    inner.width as usize,
+                ),
+                Style::default()
+                    .fg(Color::Red)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        } else if let Some(notice) = flow.notice.as_deref() {
+            footer.push(Line::from(Span::styled(
+                truncate_chars(notice, inner.width as usize),
+                Style::default().fg(Color::Yellow),
+            )));
+        } else {
+            footer.push(Line::from(""));
+        }
+    }
+
+    let hint = if flow.stage == ContactsStage::ConfirmDelete {
+        texts.contacts_hint_confirm.to_string()
+    } else if flow.stage == ContactsStage::Rename {
+        texts.contacts_hint_rename.to_string()
+    } else if flow.filter_active {
+        tr(texts.contacts_hint_filter, &[&flow.filter])
+    } else {
+        texts.contacts_hint_list.to_string()
+    };
+    footer.push(Line::from(Span::styled(
+        truncate_chars(&hint, inner.width as usize),
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    frame.render_widget(Paragraph::new(Text::from(footer)), footer_area);
+}
+
+/// Карточка контакта (`i`): полные ключи и статистика.
+fn draw_contact_info(frame: &mut Frame, flow: &ContactsFlow, inner: Rect, lang: Lang) {
+    let Some(row) = flow.selected_row() else {
+        return;
+    };
+    let texts = lang.texts();
+    let width = inner.width.max(1) as usize;
+
+    let missing = texts.contacts_info_ed25519_missing.to_string();
+    let fields: [(&str, String); 5] = [
+        (texts.contacts_info_name, row.nickname.clone()),
+        (texts.contacts_info_hash, row.hash.clone()),
+        (texts.contacts_info_x25519, row.x25519.clone()),
+        (
+            texts.contacts_info_ed25519,
+            row.ed25519.clone().unwrap_or(missing),
+        ),
+        (
+            texts.contacts_info_messages,
+            row.messages.to_string(),
+        ),
+    ];
+
+    let footer_lines: u16 = if inner.height > 4 { 2 } else { 1 };
+    let content_height = inner.height.saturating_sub(footer_lines);
+    let content_area = Rect::new(inner.x, inner.y, inner.width, content_height);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (template, value) in fields {
+        let text = tr(template, &[&value]);
+        let styled = Style::default().fg(Color::Gray);
+        for chunk in wrap_help_text(&text, width) {
+            lines.push(Line::from(Span::styled(chunk, styled)));
+        }
+        lines.push(Line::from(""));
+    }
+
+    frame.render_widget(Paragraph::new(Text::from(lines)), content_area);
+
+    let footer_area = Rect::new(
+        inner.x,
+        inner.bottom().saturating_sub(footer_lines),
+        inner.width,
+        footer_lines,
+    );
+    let mut footer = vec![Line::from("")];
+    footer.push(Line::from(Span::styled(
+        texts.contacts_hint_info,
+        Style::default().fg(Color::DarkGray),
+    )));
+    if footer_lines == 1 {
+        footer.remove(0);
+    }
+    frame.render_widget(Paragraph::new(Text::from(footer)), footer_area);
+}
+
+/// Рисует приветственное окно первого запуска с выбором языка.
+fn draw_welcome_modal(frame: &mut Frame, state: &UiState) {
+    let Some(welcome) = state.welcome.as_ref() else {
+        return;
+    };
+
+    let area = frame.area();
+    let width = 96
+        .min(area.width.saturating_sub(2))
+        .max(24)
+        .min(area.width);
+    let height = 13
+        .min(area.height.saturating_sub(2))
+        .max(10)
+        .min(area.height);
+    let rect = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+
+    frame.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Line::from(vec![
+            Span::styled(
+                " LastChance ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                welcome.selected.welcome_text().title,
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]))
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    let columns = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(inner);
+    let footer_height = 1;
+    let body_height = inner.height.saturating_sub(footer_height);
+    let body = Rect::new(inner.x, inner.y, inner.width, body_height);
+
+    for (index, lang) in [Lang::En, Lang::Ru].iter().enumerate() {
+        let selected = *lang == welcome.selected;
+        let text = lang.welcome_text();
+        let lines = welcome_lines(text, selected, columns[index].width as usize);
+        let style = if selected {
+            Style::default().bg(Color::DarkGray).fg(Color::White)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let column = Rect::new(
+            columns[index].x,
+            body.y,
+            columns[index].width,
+            body.height,
+        );
+        frame.render_widget(
+            Paragraph::new(Text::from(lines))
+                .style(style)
+                .wrap(Wrap { trim: false }),
+            column,
+        );
+    }
+
+    let footer_area = Rect::new(
+        inner.x,
+        inner.bottom().saturating_sub(footer_height),
+        inner.width,
+        footer_height,
+    );
+    let footer_text = format!(
+        " [1] English   [2] {}   ·   {} ",
+        Lang::Ru.native_name(),
+        welcome.selected.welcome_text().footer
+    );
+    let footer_text = truncate_chars(&footer_text, inner.width as usize);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            footer_text,
+            Style::default().fg(Color::Yellow),
+        ))),
+        footer_area,
+    );
+}
+
+/// Строки одной колонки приветственного окна.
+fn welcome_lines(text: &WelcomeText, selected: bool, width: usize) -> Vec<Line<'static>> {
+    let marker = if selected { "▸ " } else { "  " };
+    let title = format!("{}{}", marker, text.title);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            truncate_chars(&title, width),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(truncate_chars(text.subtitle, width)),
+        Line::from(""),
+        Line::from(truncate_chars(text.settings, width)),
+        Line::from(truncate_chars(text.help, width)),
+        Line::from(truncate_chars(text.language, width)),
+    ];
+    // Держим обе колонки одинаковой высоты независимо от длины строк.
+    while lines.len() < 8 {
+        lines.push(Line::from(""));
+    }
+    lines
 }
 
 fn help_modal_rect(area: Rect) -> Rect {
@@ -2397,13 +2948,14 @@ fn help_modal_rect(area: Rect) -> Rect {
 }
 
 /// Собирает содержимое справки в две колонки: команда/алиас и описание.
-fn help_lines(width: usize) -> Vec<Line<'static>> {
+fn help_lines(width: usize, lang: Lang) -> Vec<Line<'static>> {
     const MAX_KEY_WIDTH: usize = 36;
     let key_width = (width * 45 / 100).clamp(8, MAX_KEY_WIDTH);
     let desc_width = width.saturating_sub(key_width + 2).max(1);
+    let texts = lang.texts();
 
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let header = format!("{:<key_width$}", "Команда / алиас");
+    let header = format!("{:<key_width$}", texts.help_table_key);
     lines.push(Line::from(vec![
         Span::styled(
             header,
@@ -2413,14 +2965,14 @@ fn help_lines(width: usize) -> Vec<Line<'static>> {
         ),
         Span::raw("  "),
         Span::styled(
-            "Описание",
+            texts.help_table_desc,
             Style::default()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
 
-    for (index, section) in HELP_SECTIONS.iter().enumerate() {
+    for (index, section) in lang.help_sections().iter().enumerate() {
         if index > 0 {
             lines.push(Line::from(""));
         }
@@ -2517,6 +3069,8 @@ fn handle_app_event(app: &Arc<App>, state: &mut UiState, event: AppEvent) {
             text,
             timestamp,
             sender,
+            is_ephemeral: _,
+            expires_at,
         } => {
             let outgoing = sender.ends_with("(self)");
             let incoming_file = parse_file_notification(&text);
@@ -2543,15 +3097,18 @@ fn handle_app_event(app: &Arc<App>, state: &mut UiState, event: AppEvent) {
                             id,
                             &file_name,
                             outgoing,
+                            state.lang,
                         ),
+                        expires_at,
                     });
-                    state.status = format!("файл #{}: {} — /dl {}", id, file_name, id);
+                    state.status = tr(state.lang.texts().new_file_status, &[&id.to_string(), &file_name, &id.to_string()]);
                 } else {
                     state.feed.push(FeedEntry {
                         kind: FeedKind::Incoming,
                         text: format!("[{}] {}: {}", event_time(timestamp), sender, text),
+                        expires_at,
                     });
-                    state.status = format!("новое сообщение от {}", sender);
+                    state.status = tr(state.lang.texts().new_message_status, &[&sender]);
                 }
                 state.follow = true;
             } else {
@@ -2564,17 +3121,19 @@ fn handle_app_event(app: &Arc<App>, state: &mut UiState, event: AppEvent) {
                     Some((file_name, file_hash)) => {
                         let id =
                             register_file(state, &room_hash, &file_name, &file_hash, timestamp);
-                        format!(" (файл #{}: {})", id, file_name)
+                        tr(state.lang.texts().unread_file_note, &[&id.to_string(), &file_name])
                     }
                     None => String::new(),
                 };
 
-                state.status = format!(
-                    "новое сообщение от {} в «{}» (+{}){}, переключение: Alt+Up/Alt+Down",
-                    sender,
-                    room_label(app, &room_hash),
-                    count,
-                    file_note
+                state.status = tr(
+                    state.lang.texts().unread_message,
+                    &[
+                        &sender,
+                        &room_label(app, &room_hash),
+                        &count.to_string(),
+                        &file_note,
+                    ],
                 );
             }
 
@@ -2582,39 +3141,69 @@ fn handle_app_event(app: &Arc<App>, state: &mut UiState, event: AppEvent) {
                 notify_incoming(app, &sender, &text, notify_unread);
             }
         }
+        AppEvent::TtlChanged {
+            room_hash,
+            seconds,
+            from_peer,
+        } => {
+            if room_hash == state.room {
+                sync_ttl_state(app, state);
+            }
+
+            let texts = state.lang.texts();
+            let message = match (seconds, from_peer) {
+                (Some(value), true) => {
+                    tr(texts.ttl_peer_enabled, &[&value.to_string()])
+                }
+                (None, true) => texts.ttl_peer_disabled.to_string(),
+                (Some(value), false) => {
+                    tr(texts.ttl_self_enabled, &[&value.to_string()])
+                }
+                (None, false) => texts.ttl_self_disabled.to_string(),
+            };
+            push_system(state, &message);
+            state.status = message;
+        }
         AppEvent::ContactImport {
             hash,
             x25519,
+            ed25519,
             nickname,
-            ..
-        } => match app.add_contact(&hash, &x25519, &nickname) {
+        } => match app.add_contact_with_ed25519(
+            &hash,
+            &x25519,
+            ed25519.as_deref(),
+            &nickname,
+        ) {
             Ok(()) => {
                 refresh_chats(app, state);
                 switch_to_room(app, state, &hash);
                 push_system(
                     state,
-                    &format!(
-                        "Контакт из deep link добавлен: {} ({})",
-                        nickname,
-                        short_hash(&hash)
+                    &tr(
+                        state.lang.texts().deep_link_added,
+                        &[&nickname, &short_hash(&hash)],
                     ),
                 );
-                state.status = "контакт добавлен".to_string();
+                state.status = state.lang.texts().contact_added.to_string();
             }
             Err(e) => push_error(
                 state,
-                &format!("Не удалось добавить контакт из deep link: {:#}", e),
+                &tr(
+                    state.lang.texts().deep_link_error,
+                    &[&format!("{:#}", e)],
+                ),
             ),
         },
         AppEvent::ContactImportError { error } => {
-            push_error(state, &format!("Ошибка импорта контакта: {}", error));
+            push_error(state, &tr(state.lang.texts().contact_import_error, &[&error]));
         }
         AppEvent::UploadStarted { file_name } => {
-            push_system(state, &format!("Загрузка файла: {}", file_name));
-            state.status = "загрузка файла...".to_string();
+            push_system(state, &tr(state.lang.texts().upload_started, &[&file_name]));
+            state.status = state.lang.texts().upload_started_status.to_string();
         }
         AppEvent::UploadProgress { status, progress } => {
-            state.status = format!("загрузка {}% — {}", progress, status);
+            state.status = tr(state.lang.texts().upload_progress, &[&progress.to_string(), &status]);
         }
         AppEvent::UploadCompleted {
             file_name,
@@ -2629,37 +3218,41 @@ fn handle_app_event(app: &Arc<App>, state: &mut UiState, event: AppEvent) {
                 &file_hash,
                 chrono::Utc::now().timestamp(),
             );
-            let size = file_size.map(|s| format!(", {} B", s)).unwrap_or_default();
+            let size = file_size
+                .map(|s| tr(state.lang.texts().upload_size, &[&s.to_string()]))
+                .unwrap_or_default();
             let hint = if room.is_empty() {
                 String::new()
             } else {
-                format!("; скачать: /dl {}", id)
+                tr(state.lang.texts().upload_download_hint, &[&id.to_string()])
             };
             push_system(
                 state,
-                &format!(
-                    "Файл [#{}] {} отправлен, hash={}{}{}",
-                    id,
-                    file_name,
-                    short_hash(&file_hash),
-                    size,
-                    hint
+                &tr(
+                    state.lang.texts().upload_done,
+                    &[
+                        &id.to_string(),
+                        &file_name,
+                        &short_hash(&file_hash),
+                        &size,
+                        &hint,
+                    ],
                 ),
             );
-            state.status = format!("файл #{} отправлен", id);
+            state.status = tr(state.lang.texts().upload_done_status, &[&id.to_string()]);
         }
         AppEvent::UploadError { error } => {
-            push_error(state, &format!("Ошибка загрузки файла: {}", error));
+            push_error(state, &tr(state.lang.texts().upload_error, &[&error]));
         }
         AppEvent::DownloadStarted => {
-            state.status = "скачивание файла...".to_string();
+            state.status = state.lang.texts().download_started_status.to_string();
         }
         AppEvent::DownloadCompleted { file_path } => {
-            push_system(state, &format!("Файл сохранён: {}", file_path));
-            state.status = "файл сохранён".to_string();
+            push_system(state, &tr(state.lang.texts().download_completed, &[&file_path]));
+            state.status = state.lang.texts().download_completed_status.to_string();
         }
         AppEvent::DownloadError { error } => {
-            push_error(state, &format!("Ошибка скачивания файла: {}", error));
+            push_error(state, &tr(state.lang.texts().download_failed, &[&error]));
         }
     }
 }
@@ -2683,6 +3276,9 @@ fn notify_incoming(app: &Arc<App>, sender: &str, text: &str, unread: usize) {
 
 /// Разрешена ли вставка из буфера в текущем состоянии интерфейса.
 fn can_paste(state: &UiState) -> bool {
+    if let Some(flow) = state.contacts.as_ref() {
+        return flow.stage == ContactsStage::Rename;
+    }
     if let Some(flow) = state.settings.as_ref() {
         return flow.editing;
     }
@@ -2702,19 +3298,16 @@ fn clear_input(state: &mut UiState) {
 /// Начинает восстановление идентичности: сначала спрашиваем мастер-пароль.
 fn start_recovery(state: &mut UiState) {
     if state.settings.is_some() {
-        push_error(state, "Сначала закройте настройки (Esc — сохранить и выйти)");
+        push_error(state, state.lang.texts().settings_first_close);
     } else if state.passwd.is_some() {
-        push_error(state, "Сначала завершите смену мастер-пароля");
+        push_error(state, state.lang.texts().settings_first_finish_password);
     } else if state.recovery.is_some() {
-        push_error(state, "Восстановление уже открыто");
+        push_error(state, state.lang.texts().recovery_already_open);
     } else {
         clear_input(state);
         state.recovery = Some(RecoveryFlow::password());
-        push_system(
-            state,
-            "Восстановление идентичности.\nВведите текущий мастер-пароль (Esc — отмена).",
-        );
-        state.status = "введите текущий мастер-пароль".to_string();
+        push_system(state, state.lang.texts().recovery_prompt);
+        state.status = state.lang.texts().recovery_enter_password.to_string();
     }
 }
 
@@ -2729,7 +3322,7 @@ fn handle_recovery_key(app: &App, state: &mut UiState, key: KeyEvent) {
     if key.code == KeyCode::Esc {
         state.recovery = None;
         clear_input(state);
-        state.status = "восстановление закрыто".to_string();
+        state.status = state.lang.texts().recovery_closed.to_string();
         return;
     }
 
@@ -2741,14 +3334,16 @@ fn handle_recovery_key(app: &App, state: &mut UiState, key: KeyEvent) {
                 match app.verify_master_password(password.as_str()) {
                     Ok(()) => {
                         state.recovery = Some(RecoveryFlow::view(app.get_seed_phrase()));
-                        state.status =
-                            "пароль подтверждён · Tab/R — новая фраза".to_string();
+                        state.status = state.lang.texts().recovery_password_ok.to_string();
                     }
                     Err(e) => {
                         if let Some(flow) = state.recovery.as_mut() {
-                            flow.error = Some(format!("Неверный мастер-пароль: {:#}", e));
+                            flow.error = Some(tr(
+                                state.lang.texts().recovery_wrong_password,
+                                &[&format!("{:#}", e)],
+                            ));
                         }
-                        state.status = "неверный мастер-пароль".to_string();
+                        state.status = state.lang.texts().recovery_password_bad_status.to_string();
                     }
                 }
             }
@@ -2763,7 +3358,7 @@ fn handle_recovery_key(app: &App, state: &mut UiState, key: KeyEvent) {
                     flow.error = None;
                 }
                 clear_input(state);
-                state.status = "подтвердите перезапись идентичности".to_string();
+                state.status = state.lang.texts().recovery_confirm_request.to_string();
             }
             _ => {}
         },
@@ -2774,7 +3369,7 @@ fn handle_recovery_key(app: &App, state: &mut UiState, key: KeyEvent) {
                     flow.error = None;
                 }
                 clear_input(state);
-                state.status = "введите новую мнемоническую фразу".to_string();
+                state.status = state.lang.texts().recovery_enter_new.to_string();
             }
         }
         RecoveryStage::Input => match key.code {
@@ -2786,19 +3381,19 @@ fn handle_recovery_key(app: &App, state: &mut UiState, key: KeyEvent) {
                         state.recovery = Some(RecoveryFlow::view(app.get_seed_phrase()));
                         push_system(
                             state,
-                            &format!(
-                                "Идентичность восстановлена: {}.\nПерезапустите клиент, \
-                                 чтобы новые ключи вступили в силу.",
-                                short_hash(&hash)
+                            &tr(
+                                state.lang.texts().recovery_restored,
+                                &[&short_hash(&hash)],
                             ),
                         );
-                        state.status = "идентичность восстановлена".to_string();
+                        state.status =
+                            state.lang.texts().recovery_restored_status.to_string();
                     }
                     Err(e) => {
                         if let Some(flow) = state.recovery.as_mut() {
                             flow.error = Some(format!("{:#}", e));
                         }
-                        state.status = "некорректная мнемоническая фраза".to_string();
+                        state.status = state.lang.texts().recovery_invalid_phrase.to_string();
                     }
                 }
             }
@@ -2809,17 +3404,64 @@ fn handle_recovery_key(app: &App, state: &mut UiState, key: KeyEvent) {
     }
 }
 
+/// Обрабатывает клавиши приветственного окна выбора языка.
+fn handle_welcome_key(app: &App, state: &mut UiState, key: KeyEvent) {
+    let Some(welcome) = state.welcome.as_ref() else {
+        return;
+    };
+
+    if key.code == KeyCode::Enter {
+        let selected = welcome.selected;
+        let mut config = app.get_config();
+        config.apply_lang(selected);
+        match app.update_config(config) {
+            Ok(()) => {
+                state.lang = selected;
+                state.welcome = None;
+                let message = tr(selected.texts().welcome_saved, &[selected.native_name()]);
+                state.status = message.clone();
+                push_system(state, &message);
+            }
+            Err(e) => {
+                state.status = tr(
+                    selected.texts().welcome_save_error,
+                    &[&format!("{:#}", e)],
+                );
+            }
+        }
+        return;
+    }
+
+    let selected = {
+        let Some(welcome) = state.welcome.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Left => welcome.selected = Lang::En,
+            KeyCode::Right => welcome.selected = Lang::Ru,
+            KeyCode::Char('1') => welcome.selected = Lang::En,
+            KeyCode::Char('2') => welcome.selected = Lang::Ru,
+            KeyCode::Tab | KeyCode::BackTab => welcome.toggle(),
+            _ => return,
+        }
+        welcome.selected
+    };
+
+    // Подсказка в статус-баре сразу отражает выбранную подсветку.
+    state.status = selected.texts().welcome_status.to_string();
+}
+
 /// Открывает модальное окно справки.
 fn open_help(state: &mut UiState) {
     state.help = Some(HelpFlow::new());
-    state.status = "справка · F1/Esc — закрыть, Up/Down — прокрутка".to_string();
+    state.status = state.lang.texts().help_status_open.to_string();
 }
 
 /// Переключает модальное окно справки (F1).
 fn toggle_help(state: &mut UiState) {
     if state.help.is_some() {
         state.help = None;
-        state.status = "справка закрыта".to_string();
+        state.status = state.lang.texts().help_status_closed.to_string();
     } else {
         open_help(state);
     }
@@ -2830,7 +3472,7 @@ fn handle_help_key(state: &mut UiState, key: KeyEvent) {
     match key.code {
         KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
             state.help = None;
-            state.status = "справка закрыта".to_string();
+            state.status = state.lang.texts().help_status_closed.to_string();
             return;
         }
         _ => {}
@@ -2859,9 +3501,462 @@ fn handle_help_key(state: &mut UiState, key: KeyEvent) {
     }
 }
 
+/// Загружает контакты для модального окна вместе с числом сообщений.
+fn load_contact_rows(app: &App) -> Result<Vec<ContactRow>> {
+    let contacts = app.get_contacts()?;
+    let mut rows = Vec::with_capacity(contacts.len());
+
+    for contact in contacts {
+        if contact.hash == app.identity.hash {
+            continue;
+        }
+
+        let messages = app
+            .count_contact_messages(&contact.hash)
+            .unwrap_or(0);
+
+        rows.push(ContactRow {
+            x25519: hex::encode(&contact.public_key),
+            ed25519: contact.ed25519,
+            hash: contact.hash,
+            nickname: contact.nickname,
+            messages,
+        });
+    }
+
+    Ok(rows)
+}
+
+/// Открывает модальное окно `/contacts`.
+fn open_contacts(app: &App, state: &mut UiState) {
+    clear_input(state);
+
+    match load_contact_rows(app) {
+        Ok(rows) => {
+            // Пустой список отрисовывается подсказкой в самом окне.
+            state.contacts = Some(ContactsFlow::new(rows));
+        }
+        Err(e) => push_error(
+            state,
+            &tr(
+                state.lang.texts().contacts_error,
+                &[&format!("{:#}", e)],
+            ),
+        ),
+    }
+}
+
+/// Закрывает модальное окно контактов.
+fn close_contacts(state: &mut UiState) {
+    state.contacts = None;
+    clear_input(state);
+    state.status = state.lang.texts().contacts_closed.to_string();
+}
+
+/// Собирает ссылку-приглашение для выбранного контакта.
+fn contact_link(row: &ContactRow) -> String {
+    use url::form_urlencoded;
+
+    let mut params = vec![
+        ("hash", row.hash.as_str()),
+        ("x25519", row.x25519.as_str()),
+        ("nickname", row.nickname.as_str()),
+    ];
+    if let Some(ed25519) = row.ed25519.as_deref() {
+        params.push(("ed25519", ed25519));
+    }
+
+    let encoded: String = form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(params)
+        .finish();
+
+    format!("lastchance://contact?{}", encoded)
+}
+
+/// Возвращает актуальный список контактов в открытое окно, сохраняя фильтр.
+fn reload_contacts_modal(app: &App, state: &mut UiState) {
+    let Some(flow) = state.contacts.as_mut() else {
+        return;
+    };
+    let selected_hash = flow.selected_row().map(|row| row.hash.clone());
+    let filter = flow.filter.clone();
+    let filter_active = flow.filter_active;
+    let stage = flow.stage;
+
+    match load_contact_rows(app) {
+        Ok(rows) => {
+            let Some(flow) = state.contacts.as_mut() else {
+                return;
+            };
+            flow.rows = rows;
+            flow.filter = filter;
+            flow.filter_active = filter_active;
+            flow.stage = stage;
+            flow.apply_filter();
+
+            if let Some(hash) = selected_hash {
+                if let Some(position) = flow
+                    .filtered
+                    .iter()
+                    .position(|index| flow.rows[*index].hash == hash)
+                {
+                    flow.selected = position;
+                }
+            }
+        }
+        Err(e) => {
+            let message = format!("{:#}", e);
+            let flow = state.contacts.as_mut();
+            if let Some(flow) = flow {
+                flow.notice = Some(tr(state.lang.texts().contacts_error, &[&message]));
+            }
+        }
+    }
+}
+
+/// Действия списка, которым нужен доступ к `App`/`UiState` вне заимствования.
+enum ContactsAction {
+    None,
+    Close,
+    Open(ContactRow),
+    Rename(ContactRow),
+    Info,
+    Copy(ContactRow),
+    ConfirmDelete,
+}
+
+fn handle_contacts_list_key(app: &App, state: &mut UiState, key: KeyEvent, ctrl: bool) {
+    let action = match key.code {
+        KeyCode::Esc => {
+            let has_filter = state
+                .contacts
+                .as_ref()
+                .map(|flow| !flow.filter.is_empty())
+                .unwrap_or(false);
+            if has_filter {
+                if let Some(flow) = state.contacts.as_mut() {
+                    flow.filter.clear();
+                    flow.filter_active = false;
+                    flow.selected = 0;
+                    flow.apply_filter();
+                }
+                ContactsAction::None
+            } else {
+                ContactsAction::Close
+            }
+        }
+        KeyCode::Char('q') => ContactsAction::Close,
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Some(flow) = state.contacts.as_mut() {
+                flow.move_selection(-1);
+            }
+            ContactsAction::None
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Some(flow) = state.contacts.as_mut() {
+                flow.move_selection(1);
+            }
+            ContactsAction::None
+        }
+        KeyCode::Home => {
+            if let Some(flow) = state.contacts.as_mut() {
+                flow.selected = 0;
+            }
+            ContactsAction::None
+        }
+        KeyCode::End => {
+            if let Some(flow) = state.contacts.as_mut() {
+                flow.selected = flow.filtered.len().saturating_sub(1);
+            }
+            ContactsAction::None
+        }
+        KeyCode::Char('/') => {
+            if let Some(flow) = state.contacts.as_mut() {
+                flow.filter.clear();
+                flow.filter_active = true;
+                flow.selected = 0;
+                flow.apply_filter();
+            }
+            ContactsAction::None
+        }
+        KeyCode::Enter => state
+            .contacts
+            .as_ref()
+            .and_then(ContactsFlow::selected_row)
+            .cloned()
+            .map(ContactsAction::Open)
+            .unwrap_or(ContactsAction::None),
+        KeyCode::Char('r') => state
+            .contacts
+            .as_ref()
+            .and_then(ContactsFlow::selected_row)
+            .cloned()
+            .map(ContactsAction::Rename)
+            .unwrap_or(ContactsAction::None),
+        KeyCode::Char('i') => ContactsAction::Info,
+        KeyCode::Char('c') if !ctrl => state
+            .contacts
+            .as_ref()
+            .and_then(ContactsFlow::selected_row)
+            .cloned()
+            .map(ContactsAction::Copy)
+            .unwrap_or(ContactsAction::None),
+        KeyCode::Char('d') if !ctrl => ContactsAction::ConfirmDelete,
+        _ => ContactsAction::None,
+    };
+
+    match action {
+        ContactsAction::None => {}
+        ContactsAction::Close => close_contacts(state),
+        ContactsAction::Open(row) => {
+            switch_to_room(app, state, &row.hash);
+            close_contacts(state);
+            state.status =
+                tr(state.lang.texts().status_chat, &[&state.room_label]);
+        }
+        ContactsAction::Rename(row) => {
+            state.input = row.nickname.clone();
+            state.cursor = state.input.len();
+            state.history_index = None;
+            state.history_draft.clear();
+            if let Some(flow) = state.contacts.as_mut() {
+                flow.stage = ContactsStage::Rename;
+                flow.notice = None;
+            }
+        }
+        ContactsAction::Info => {
+            if let Some(flow) = state.contacts.as_mut() {
+                flow.stage = ContactsStage::Info;
+                flow.notice = None;
+            }
+        }
+        ContactsAction::Copy(row) => {
+            let link = contact_link(&row);
+            match copy_to_clipboard(state, &link) {
+                Ok(()) => {
+                    if let Some(flow) = state.contacts.as_mut() {
+                        flow.notice =
+                            Some(state.lang.texts().contacts_copied.to_string());
+                    }
+                }
+                Err(e) => {
+                    if let Some(flow) = state.contacts.as_mut() {
+                        flow.notice = Some(tr(
+                            state.lang.texts().contacts_copy_error,
+                            &[&format!("{:#}", e)],
+                        ));
+                    }
+                }
+            }
+        }
+        ContactsAction::ConfirmDelete => {
+            if let Some(flow) = state.contacts.as_mut() {
+                flow.stage = ContactsStage::ConfirmDelete;
+                flow.notice = None;
+            }
+        }
+    }
+}
+
+/// Ввод в строке живого фильтра.
+fn handle_contacts_filter_key(state: &mut UiState, key: KeyEvent, ctrl: bool, alt: bool) {
+    let Some(flow) = state.contacts.as_mut() else {
+        return;
+    };
+
+    match key.code {
+        KeyCode::Esc => {
+            flow.filter.clear();
+            flow.filter_active = false;
+            flow.apply_filter();
+        }
+        KeyCode::Enter => {
+            flow.filter_active = false;
+        }
+        KeyCode::Up => flow.move_selection(-1),
+        KeyCode::Down => flow.move_selection(1),
+        KeyCode::Backspace => {
+            flow.filter.pop();
+            flow.selected = 0;
+            flow.apply_filter();
+        }
+        KeyCode::Char(c) if !ctrl && !alt => {
+            flow.filter.push(c);
+            flow.selected = 0;
+            flow.apply_filter();
+        }
+        _ => {}
+    }
+}
+
+/// Ввод нового имени контакта (Enter — сохранить, Esc — отмена).
+fn handle_contacts_rename_key(app: &App, state: &mut UiState, key: KeyEvent, ctrl: bool, alt: bool) {
+    let hash = match state.contacts.as_ref().and_then(ContactsFlow::selected_row) {
+        Some(row) => row.hash.clone(),
+        None => {
+            if let Some(flow) = state.contacts.as_mut() {
+                flow.stage = ContactsStage::List;
+            }
+            return;
+        }
+    };
+
+    match key.code {
+        KeyCode::Esc => {
+            clear_input(state);
+            if let Some(flow) = state.contacts.as_mut() {
+                flow.stage = ContactsStage::List;
+                flow.notice = None;
+            }
+        }
+        KeyCode::Enter => {
+            let name = state.input.trim().to_string();
+            if name.is_empty() {
+                if let Some(flow) = state.contacts.as_mut() {
+                    flow.notice =
+                        Some(state.lang.texts().contacts_rename_empty.to_string());
+                }
+                return;
+            }
+
+            match app.update_contact_nickname(&hash, &name) {
+                Ok(()) => {
+                    clear_input(state);
+                    if let Some(flow) = state.contacts.as_mut() {
+                        flow.stage = ContactsStage::List;
+                        flow.rename_row(&hash, &name);
+                        flow.notice =
+                            Some(tr(state.lang.texts().contacts_renamed, &[&name]));
+                    }
+                    if state.room == hash {
+                        state.room_label = name.clone();
+                    }
+                    refresh_chats(app, state);
+                    state.status = state.lang.texts().renamed_status.to_string();
+                }
+                Err(e) => {
+                    if let Some(flow) = state.contacts.as_mut() {
+                        flow.notice = Some(tr(
+                            state.lang.texts().contacts_rename_error,
+                            &[&format!("{:#}", e)],
+                        ));
+                    }
+                }
+            }
+        }
+        _ => {
+            apply_line_edit_key(state, key, ctrl, alt);
+        }
+    }
+}
+
+/// Удаляет выбранный контакт вместе с историей и обновляет TUI.
+fn delete_selected_contact(app: &App, state: &mut UiState) {
+    let Some(row) = state
+        .contacts
+        .as_ref()
+        .and_then(ContactsFlow::selected_row)
+        .cloned()
+    else {
+        if let Some(flow) = state.contacts.as_mut() {
+            flow.stage = ContactsStage::List;
+        }
+        return;
+    };
+
+    match app.delete_contact(&row.hash) {
+        Ok(()) => {
+            let deleted_current = state.room == row.hash;
+            if deleted_current {
+                state.room.clear();
+                state.room_label.clear();
+                state.feed.clear();
+                state.scroll = 0;
+                state.follow = true;
+            }
+
+            state.chats.retain(|chat| chat.hash != row.hash);
+            state.unread.remove(&row.hash);
+
+            reload_contacts_modal(app, state);
+
+            // Если удалили открытый чат — переключаемся на следующий контакт.
+            if deleted_current {
+                let next = state
+                    .contacts
+                    .as_ref()
+                    .and_then(ContactsFlow::selected_row)
+                    .map(|row| row.hash.clone());
+                if let Some(next) = next {
+                    switch_to_room(app, state, &next);
+                }
+            }
+            refresh_chats(app, state);
+
+            if let Some(flow) = state.contacts.as_mut() {
+                flow.stage = ContactsStage::List;
+                flow.notice = Some(tr(
+                    state.lang.texts().contacts_deleted,
+                    &[&row.nickname],
+                ));
+            }
+            state.status = state.lang.texts().contacts_deleted_status.to_string();
+        }
+        Err(e) => {
+            if let Some(flow) = state.contacts.as_mut() {
+                flow.stage = ContactsStage::List;
+                flow.notice = Some(tr(
+                    state.lang.texts().contacts_delete_error,
+                    &[&format!("{:#}", e)],
+                ));
+            }
+        }
+    }
+}
+
+/// Обрабатывает клавиши внутри модального окна контактов.
+fn handle_contacts_key(app: &App, state: &mut UiState, key: KeyEvent) {
+    let Some(stage) = state.contacts.as_ref().map(|flow| flow.stage) else {
+        return;
+    };
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+    match stage {
+        ContactsStage::Rename => handle_contacts_rename_key(app, state, key, ctrl, alt),
+        ContactsStage::Info => {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('i')) {
+                if let Some(flow) = state.contacts.as_mut() {
+                    flow.stage = ContactsStage::List;
+                }
+            }
+        }
+        ContactsStage::ConfirmDelete => match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => delete_selected_contact(app, state),
+            _ => {
+                if let Some(flow) = state.contacts.as_mut() {
+                    flow.stage = ContactsStage::List;
+                    flow.notice = None;
+                }
+            }
+        },
+        ContactsStage::List => {
+            let filter_active = state
+                .contacts
+                .as_ref()
+                .map(|flow| flow.filter_active)
+                .unwrap_or(false);
+            if filter_active {
+                handle_contacts_filter_key(state, key, ctrl, alt);
+            } else {
+                handle_contacts_list_key(app, state, key, ctrl);
+            }
+        }
+    }
+}
+
 /// Прокрутка справки колесом мыши.
-fn scroll_help(state: &mut UiState, amount: u16, up: bool) {
-    let Some(flow) = state.help.as_mut() else {
+fn scroll_help(state: &mut UiState, amount: u16, up: bool) {    let Some(flow) = state.help.as_mut() else {
         return;
     };
     flow.scroll = if up {
@@ -2911,7 +4006,7 @@ async fn handle_terminal_event(
                     state.cursor = 0;
                     state.history_index = None;
                     state.history_draft.clear();
-                    state.status = "ввод пароля сброшен".to_string();
+                    state.status = state.lang.texts().clipboard_password_reset.to_string();
                     return Ok(false);
                 }
 
@@ -2923,7 +4018,7 @@ async fn handle_terminal_event(
                     .map(|flow| flow.editing && flow.field().is_masked())
                     .unwrap_or(false);
                 if masked_settings {
-                    state.status = "секретное поле не копируется в буфер".to_string();
+                    state.status = state.lang.texts().clipboard_secret_not_copied.to_string();
                     return Ok(false);
                 }
 
@@ -2935,24 +4030,36 @@ async fn handle_terminal_event(
                         state.history_index = None;
                         state.history_draft.clear();
                         state.status =
-                            "ввод скопирован; Ctrl+C на пустой строке — выход".to_string();
+                            state.lang.texts().clipboard_input_copied.to_string();
                     }
                     Err(e) => {
-                        state.status = format!("не удалось скопировать ввод: {:#}", e);
+                        state.status = tr(
+                            state.lang.texts().clipboard_unavailable,
+                            &[&format!("{:#}", e)],
+                        );
                     }
                 }
                 return Ok(false);
             }
 
+            // Приветственное окно первого запуска перехватывает навигацию.
+            if state.welcome.is_some() {
+                handle_welcome_key(app, state, key);
+                return Ok(false);
+            }
+
             // Ctrl+S — быстрый вызов модального окна настроек (/set).
             if ctrl && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S')) {
+                if state.contacts.is_some() {
+                    return Ok(false);
+                }
                 if state.help.is_some() {
                     state.help = None;
                 }
                 if state.passwd.is_some() {
-                    state.status = "сначала завершите смену мастер-пароля".to_string();
+                    state.status = state.lang.texts().settings_first_finish_password.to_string();
                 } else if state.recovery.is_some() {
-                    state.status = "сначала закройте восстановление (Esc)".to_string();
+                    state.status = state.lang.texts().settings_first_finish_recovery.to_string();
                 } else if state.settings.is_none() {
                     start_settings(app, state);
                 }
@@ -2962,8 +4069,11 @@ async fn handle_terminal_event(
             // F1 открывает/закрывает справку. Одиночный `?` не перехватываем:
             // он должен попадать в поле ввода как обычный текст.
             if matches!(key.code, KeyCode::F(1)) {
+                if state.contacts.is_some() {
+                    return Ok(false);
+                }
                 if state.recovery.is_some() {
-                    state.status = "сначала закройте восстановление (Esc)".to_string();
+                    state.status = state.lang.texts().settings_first_finish_recovery.to_string();
                 } else {
                     toggle_help(state);
                 }
@@ -2992,6 +4102,12 @@ async fn handle_terminal_event(
             // Модальное окно настроек перехватывает навигацию и ввод.
             if state.settings.is_some() {
                 handle_settings_key(app, state, key);
+                return Ok(false);
+            }
+
+            // Менеджер контактов перехватывает навигацию и действия.
+            if state.contacts.is_some() {
+                handle_contacts_key(app, state, key);
                 return Ok(false);
             }
 
@@ -3054,8 +4170,8 @@ async fn handle_terminal_event(
                         state.cursor = 0;
                         state.history_index = None;
                         state.history_draft.clear();
-                        push_system(state, "Смена мастер-пароля отменена");
-                        state.status = "смена пароля отменена".to_string();
+                        push_system(state, state.lang.texts().passwd_cancelled);
+                        state.status = state.lang.texts().passwd_cancelled_status.to_string();
                         return Ok(false);
                     }
 
@@ -3114,7 +4230,7 @@ fn submit_password(app: &App, state: &mut UiState, input: Zeroizing<String>) {
     match flow.stage {
         PasswdStage::Current => {
             if input.is_empty() {
-                push_error(state, "Пароль не может быть пустым");
+                push_error(state, state.lang.texts().passwd_empty);
                 state.passwd = Some(flow);
                 return;
             }
@@ -3124,14 +4240,14 @@ fn submit_password(app: &App, state: &mut UiState, input: Zeroizing<String>) {
                     flow.old = input;
                     flow.stage = PasswdStage::New;
                     state.passwd = Some(flow);
-                    push_system(
-                        state,
-                        "Текущий пароль подтверждён. Введите новый мастер-пароль.",
-                    );
-                    state.status = "новый мастер-пароль".to_string();
+                    push_system(state, state.lang.texts().passwd_confirmed);
+                    state.status = state.lang.texts().passwd_new_status.to_string();
                 }
                 Err(e) => {
-                    push_error(state, &format!("Неверный мастер-пароль: {:#}", e));
+                    push_error(
+                        state,
+                        &tr(state.lang.texts().passwd_wrong, &[&format!("{:#}", e)]),
+                    );
                 }
             }
         }
@@ -3139,9 +4255,9 @@ fn submit_password(app: &App, state: &mut UiState, input: Zeroizing<String>) {
             if input.chars().count() < vault::MIN_PASSWORD_LEN {
                 push_error(
                     state,
-                    &format!(
-                        "Пароль должен быть не короче {} символов",
-                        vault::MIN_PASSWORD_LEN
+                    &tr(
+                        state.lang.texts().passwd_min,
+                        &[&vault::MIN_PASSWORD_LEN.to_string()],
                     ),
                 );
                 state.passwd = Some(flow);
@@ -3151,12 +4267,12 @@ fn submit_password(app: &App, state: &mut UiState, input: Zeroizing<String>) {
             flow.new = input;
             flow.stage = PasswdStage::Confirm;
             state.passwd = Some(flow);
-            push_system(state, "Повторите новый мастер-пароль.");
-            state.status = "повторите новый пароль".to_string();
+            push_system(state, state.lang.texts().passwd_repeat);
+            state.status = state.lang.texts().passwd_repeat_status.to_string();
         }
         PasswdStage::Confirm => {
             if input.as_str() != flow.new.as_str() {
-                push_error(state, "Пароли не совпадают — введите новый пароль заново");
+                push_error(state, state.lang.texts().passwd_mismatch);
                 flow.new = Zeroizing::new(String::new());
                 flow.stage = PasswdStage::New;
                 state.passwd = Some(flow);
@@ -3165,14 +4281,14 @@ fn submit_password(app: &App, state: &mut UiState, input: Zeroizing<String>) {
 
             match app.change_master_password(flow.old.as_str(), flow.new.as_str()) {
                 Ok(()) => {
-                    push_system(
-                        state,
-                        "Мастер-пароль изменён. Файлы профиля и база перешифрованы.",
-                    );
-                    state.status = "мастер-пароль изменён".to_string();
+                    push_system(state, state.lang.texts().passwd_changed);
+                    state.status = state.lang.texts().passwd_changed_status.to_string();
                 }
                 Err(e) => {
-                    push_error(state, &format!("Не удалось сменить мастер-пароль: {:#}", e))
+                    push_error(
+                        state,
+                        &tr(state.lang.texts().passwd_change_error, &[&format!("{:#}", e)]),
+                    )
                 }
             }
         }
@@ -3182,7 +4298,7 @@ fn submit_password(app: &App, state: &mut UiState, input: Zeroizing<String>) {
 /// Открывает модальное меню настроек `/set`.
 fn start_settings(app: &App, state: &mut UiState) {
     if state.passwd.is_some() {
-        push_error(state, "Сначала завершите смену мастер-пароля");
+        push_error(state, state.lang.texts().settings_first_finish_password);
         return;
     }
 
@@ -3193,7 +4309,7 @@ fn start_settings(app: &App, state: &mut UiState) {
     state.history_draft.clear();
     state.dl_cycle = None;
     state.sf_cycle = None;
-    state.status = "настройки открыты".to_string();
+    state.status = state.lang.texts().settings_open.to_string();
 }
 
 /// Обрабатывает клавиши в модальном окне `/set`.
@@ -3214,7 +4330,13 @@ fn handle_settings_key(app: &App, state: &mut UiState, key: KeyEvent) {
                     flow.editing = false;
                 }
                 state.cursor = 0;
-                state.status = format!("настройки: {} обновлено", field.label());
+                state.status = {
+                    let flow_lang = state.settings.as_ref().map(|f| f.lang).unwrap_or(state.lang);
+                    tr(
+                        flow_lang.texts().settings_updated,
+                        &[field.label(flow_lang)],
+                    )
+                };
             }
             KeyCode::Esc => {
                 if let Some(flow) = state.settings.as_mut() {
@@ -3222,7 +4344,12 @@ fn handle_settings_key(app: &App, state: &mut UiState, key: KeyEvent) {
                 }
                 state.input.clear();
                 state.cursor = 0;
-                state.status = "редактирование отменено".to_string();
+                state.status = state
+                    .settings
+                    .as_ref()
+                    .map(|flow| flow.lang.texts().settings_edit_cancelled)
+                    .unwrap_or(state.lang.texts().settings_edit_cancelled)
+                    .to_string();
             }
             _ => {
                 apply_line_edit_key(state, key, ctrl, alt);
@@ -3249,30 +4376,40 @@ fn handle_settings_key(app: &App, state: &mut UiState, key: KeyEvent) {
             }
         }
         KeyCode::Left => {
-            if field.is_notify_level() {
-                if let Some(flow) = state.settings.as_mut() {
-                    flow.cycle_notify(-1);
+            if let Some(flow) = state.settings.as_mut() {
+                match field {
+                    SettingField::NotifyLevel => flow.cycle_notify(-1),
+                    SettingField::Language => flow.cycle_lang(),
+                    _ => {}
                 }
             }
         }
         KeyCode::Right => {
-            if field.is_notify_level() {
-                if let Some(flow) = state.settings.as_mut() {
-                    flow.cycle_notify(1);
+            if let Some(flow) = state.settings.as_mut() {
+                match field {
+                    SettingField::NotifyLevel => flow.cycle_notify(1),
+                    SettingField::Language => flow.cycle_lang(),
+                    _ => {}
                 }
             }
         }
         KeyCode::Char(' ') => {
-            if field.is_notify_level() {
-                if let Some(flow) = state.settings.as_mut() {
-                    flow.cycle_notify(1);
+            if let Some(flow) = state.settings.as_mut() {
+                match field {
+                    SettingField::NotifyLevel => flow.cycle_notify(1),
+                    SettingField::Language => flow.cycle_lang(),
+                    _ => {}
                 }
             }
         }
         KeyCode::Enter => {
-            if field.is_notify_level() {
+            if field.is_toggle() {
                 if let Some(flow) = state.settings.as_mut() {
-                    flow.cycle_notify(1);
+                    match field {
+                        SettingField::NotifyLevel => flow.cycle_notify(1),
+                        SettingField::Language => flow.cycle_lang(),
+                        _ => {}
+                    }
                 }
                 return;
             }
@@ -3301,30 +4438,26 @@ fn close_settings(app: &App, state: &mut UiState) {
     state.history_index = None;
     state.history_draft.clear();
 
+    let new_lang = flow.lang;
     let config = flow.to_config();
-    let proxy_note = config
-        .proxy_url
-        .as_deref()
-        .map(|url| format!(" Прокси: {}.", url))
-        .unwrap_or_else(|| " Прокси: прямое подключение.".to_string());
+    let texts = new_lang.texts();
+    let saved_message = match config.proxy_url.as_deref() {
+        Some(url) => tr(texts.settings_saved_proxy, &[url]),
+        None => texts.settings_saved.to_string(),
+    };
 
     match app.update_config(config) {
         Ok(()) => {
-            push_system(
-                state,
-                &format!(
-                    "Настройки сохранены в зашифрованный конфиг и применены.{}",
-                    proxy_note
-                ),
-            );
-            state.status = "настройки применены".to_string();
+            state.lang = new_lang;
+            push_system(state, &saved_message);
+            state.status = texts.settings_applied.to_string();
         }
         Err(e) => {
             push_error(
                 state,
-                &format!("Не удалось сохранить настройки: {:#}", e),
+                &tr(texts.settings_save_error, &[&format!("{:#}", e)]),
             );
-            state.status = "ошибка настроек".to_string();
+            state.status = texts.settings_error.to_string();
             state.settings = Some(flow);
         }
     }
@@ -3332,27 +4465,32 @@ fn close_settings(app: &App, state: &mut UiState) {
 
 async fn send_plain_message(app: &Arc<App>, state: &mut UiState, text: &str) {
     if state.room.is_empty() {
-        push_error(
-            state,
-            "Нет активной комнаты. Добавьте контакт через /join <link> или /room <hash>.",
-        );
+        push_error(state, state.lang.texts().no_active_room);
         return;
     }
 
     match app.send_message(&state.room, text).await {
         Ok(()) => {
+            let expires_at = app
+                .get_room_ttl(&state.room)
+                .and_then(|ttl| ttl.seconds)
+                .map(|seconds| now_unix().saturating_add(seconds));
             state.feed.push(FeedEntry {
                 kind: FeedKind::Outgoing,
                 text: format!("[{}] {}", now_time(), text),
+                expires_at,
             });
             state.follow = true;
-            state.status = "сообщение отправлено".to_string();
+            state.status = state.lang.texts().message_sent.to_string();
         }
-        Err(e) => push_error(state, &format!("Ошибка отправки: {:#}", e)),
+        Err(e) => push_error(
+            state,
+            &tr(state.lang.texts().send_error, &[&format!("{:#}", e)]),
+        ),
     }
 }
 
-fn validated_invite_link(app: &App) -> Result<String> {
+fn validated_invite_link(app: &App, lang: Lang) -> Result<String> {
     let link = app.get_my_contact_link();
     let ed25519 = link
         .split("ed25519=")
@@ -3360,12 +4498,19 @@ fn validated_invite_link(app: &App) -> Result<String> {
         .and_then(|rest| rest.split('&').next())
         .unwrap_or_default();
 
-    let bytes = hex::decode(ed25519)
-        .map_err(|e| anyhow!("некорректный ed25519 в ссылке: {}", e))?;
+    let bytes = hex::decode(ed25519).map_err(|e| {
+        anyhow!(
+            "{}",
+            tr(lang.texts().invalid_ed25519, &[&e.to_string()])
+        )
+    })?;
     if bytes.len() != 32 {
         return Err(anyhow!(
-            "ed25519 в ссылке обрезан: {} hex-символов вместо 64",
-            ed25519.len()
+            "{}",
+            tr(
+                lang.texts().truncated_ed25519,
+                &[&ed25519.len().to_string()]
+            )
         ));
     }
 
@@ -3420,10 +4565,13 @@ fn paste_from_clipboard(state: &mut UiState) {
     match result {
         Ok(text) => {
             insert_text(state, &text);
-            state.status = "вставлено из буфера обмена".to_string();
+            state.status = state.lang.texts().clipboard_pasted.to_string();
         }
         Err(e) => {
-            state.status = format!("буфер обмена недоступен: {}", e);
+            state.status = tr(
+                state.lang.texts().clipboard_unavailable,
+                &[&e.to_string()],
+            );
         }
     }
 }
@@ -3454,7 +4602,7 @@ fn write_clipboard(clipboard: &mut arboard::Clipboard, text: &str) -> Result<()>
 fn copy_to_clipboard(state: &mut UiState, text: &str) -> Result<()> {
     let result = match state.clipboard.as_mut() {
         Some(clipboard) => write_clipboard(clipboard, text),
-        None => Err(anyhow!("буфер обмена недоступен")),
+        None => Err(anyhow!("{}", state.lang.texts().clipboard_unavailable_short)),
     };
 
     // Даже при ошибке arboard мог успеть вывести диагностику в stderr.
@@ -3477,8 +4625,14 @@ fn invite_file_name(nickname: &str) -> String {
 /// - `None` → `./<nickname>_lastchance.invite`;
 /// - существующая папка или путь с завершающим `/` → `<dir>/<nickname>_lastchance.invite`;
 /// - иначе → указанный путь к файлу.
-fn save_invite_file(app: &App, target: Option<&str>, link: &str) -> Result<PathBuf> {
+fn save_invite_file(
+    app: &App,
+    target: Option<&str>,
+    link: &str,
+    lang: Lang,
+) -> Result<PathBuf> {
     let file_name = invite_file_name(&app.get_nickname());
+    let texts = lang.texts();
 
     let path = match target {
         None => PathBuf::from(file_name),
@@ -3489,7 +4643,13 @@ fn save_invite_file(app: &App, target: Option<&str>, link: &str) -> Result<PathB
 
             if dir_hint {
                 std::fs::create_dir_all(&candidate).map_err(|e| {
-                    anyhow!("не удалось создать папку {}: {}", candidate.display(), e)
+                    anyhow!(
+                        "{}",
+                        tr(
+                            texts.create_folder_failed,
+                            &[&candidate.display().to_string(), &e.to_string()]
+                        )
+                    )
                 })?;
                 candidate.join(file_name)
             } else {
@@ -3501,13 +4661,26 @@ fn save_invite_file(app: &App, target: Option<&str>, link: &str) -> Result<PathB
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).map_err(|e| {
-                anyhow!("не удалось создать папку {}: {}", parent.display(), e)
+                anyhow!(
+                    "{}",
+                    tr(
+                        texts.create_folder_failed,
+                        &[&parent.display().to_string(), &e.to_string()]
+                    )
+                )
             })?;
         }
     }
 
-    std::fs::write(&path, link)
-        .map_err(|e| anyhow!("не удалось записать {}: {}", path.display(), e))?;
+    std::fs::write(&path, link).map_err(|e| {
+        anyhow!(
+            "{}",
+            tr(
+                texts.write_file_failed,
+                &[&path.display().to_string(), &e.to_string()]
+            )
+        )
+    })?;
 
     let full = std::fs::canonicalize(&path).or_else(|_| {
         if path.is_absolute() {
@@ -3526,16 +4699,17 @@ fn apply_join(
     state: &mut UiState,
     hash: &str,
     x25519: &str,
+    ed25519: Option<&str>,
     nickname: &str,
 ) -> Result<()> {
-    app.add_contact(hash, x25519, nickname)?;
+    app.add_contact_with_ed25519(hash, x25519, ed25519, nickname)?;
     refresh_chats(app, state);
     switch_to_room(app, state, hash);
     push_system(
         state,
-        &format!("Контакт добавлен, активная комната: {}", state.room_label),
+        &tr(state.lang.texts().contact_added_room, &[&state.room_label]),
     );
-    state.status = "контакт добавлен".to_string();
+    state.status = state.lang.texts().contact_added.to_string();
     Ok(())
 }
 
@@ -3553,66 +4727,65 @@ async fn handle_command(
 
         "/profile" => match serde_json::to_string_pretty(&app.get_profile()) {
             Ok(text) => push_system(state, &text),
-            Err(e) => push_error(state, &format!("Ошибка сериализации профиля: {}", e)),
+            Err(e) => push_error(
+                state,
+                &tr(state.lang.texts().profile_serialize_error, &[&e.to_string()]),
+            ),
         },
 
         "/recovery" => start_recovery(state),
 
-        "/invite" => match validated_invite_link(app) {
+        "/invite" => match validated_invite_link(app, state.lang) {
             Ok(link) => {
                 match copy_to_clipboard(state, &link) {
                     Ok(()) => {
-                        push_system(state, "Ссылка приглашения скопирована в буфер обмена")
+                        push_system(state, state.lang.texts().invite_copied)
                     }
                     Err(e) => push_system(
                         state,
-                        &format!(
-                            "Предупреждение: буфер обмена недоступен ({:#})",
-                            e
+                        &tr(
+                            state.lang.texts().invite_clipboard_warning,
+                            &[&format!("{:#}", e)],
                         ),
                     ),
                 }
 
                 let save_requested = parts.get(1).copied() == Some("-f");
                 if save_requested {
-                    match save_invite_file(app, parts.get(2).copied(), &link) {
+                    match save_invite_file(app, parts.get(2).copied(), &link, state.lang) {
                         Ok(path) => {
                             push_system(
                                 state,
-                                &format!("Инвайт сохранён: {}", path.display()),
+                                &tr(
+                                    state.lang.texts().invite_saved,
+                                    &[&path.display().to_string()],
+                                ),
                             );
-                            state.status = "инвайт сохранён в файл".to_string();
+                            state.status =
+                                state.lang.texts().invite_saved_status.to_string();
                         }
                         Err(e) => push_error(
                             state,
-                            &format!("Ошибка сохранения инвайта: {:#}", e),
+                            &tr(
+                                state.lang.texts().invite_save_error,
+                                &[&format!("{:#}", e)],
+                            ),
                         ),
                     }
                 } else {
-                    push_system(state, &format!("Ссылка-приглашение:\n{}", link));
-                    state.status = "invite готов".to_string();
+                    push_system(state, &tr(state.lang.texts().invite_link, &[&link]));
+                    state.status = state.lang.texts().invite_ready.to_string();
                 }
             }
-            Err(e) => push_error(state, &format!("Ошибка /invite: {:#}", e)),
+            Err(e) => push_error(
+                state,
+                &tr(state.lang.texts().invite_error, &[&format!("{:#}", e)]),
+            ),
         },
 
         "/export" => push_system(state, &app.get_my_contact_json()),
 
-        "/contacts" => match app.get_contacts() {
-            Ok(contacts) => {
-                if contacts.is_empty() {
-                    push_system(state, "Контактов нет. Добавьте через /join <link>");
-                } else {
-                    let text = contacts
-                        .iter()
-                        .map(|c| format!("{}  {}", short_hash(&c.hash), c.nickname))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    push_system(state, &text);
-                }
-            }
-            Err(e) => push_error(state, &format!("Ошибка получения контактов: {:#}", e)),
-        },
+        "/contacts" => open_contacts(app, state),
 
         "/join" => {
             let rest: Vec<&str> = parts[1..].to_vec();
@@ -3620,29 +4793,48 @@ async fn handle_command(
             let result = if rest.first().copied() == Some("-f") {
                 match rest.get(1) {
                     Some(path) => std::fs::read_to_string(path)
-                        .map_err(|e| anyhow!("не удалось прочитать файл {}: {}", path, e))
+                        .map_err(|e| anyhow!("{}", tr(state.lang.texts().join_file_error, &[path, &e.to_string()])))
                         .and_then(|content| {
                             let link = content.trim();
-                            parse_contact_link(link).and_then(|(hash, key, nickname)| {
-                                apply_join(app, state, &hash, &key, &nickname)
-                            })
+                            parse_contact_link(link, state.lang).and_then(
+                                |(hash, key, ed25519, nickname)| {
+                                    apply_join(
+                                        app,
+                                        state,
+                                        &hash,
+                                        &key,
+                                        ed25519.as_deref(),
+                                        &nickname,
+                                    )
+                                },
+                            )
                         }),
-                    None => Err(anyhow!("Использование: /join -f <path>")),
+                    None => Err(anyhow!("{}", state.lang.texts().join_usage_file)),
                 }
             } else if rest.len() == 1 {
-                parse_contact_link(rest[0]).and_then(|(hash, key, nickname)| {
-                    apply_join(app, state, &hash, &key, &nickname)
-                })
+                parse_contact_link(rest[0], state.lang).and_then(
+                    |(hash, key, ed25519, nickname)| {
+                        apply_join(
+                            app,
+                            state,
+                            &hash,
+                            &key,
+                            ed25519.as_deref(),
+                            &nickname,
+                        )
+                    },
+                )
             } else if rest.len() >= 3 && !rest[0].starts_with("lastchance://") {
-                apply_join(app, state, rest[0], rest[1], rest[2])
+                apply_join(app, state, rest[0], rest[1], None, rest[2])
             } else {
-                Err(anyhow!(
-                    "/join <link>, /join -f <path> или /join <hash> <x25519> <nickname>"
-                ))
+                Err(anyhow!("{}", state.lang.texts().join_usage))
             };
 
             if let Err(e) = result {
-                push_error(state, &format!("Ошибка /join: {:#}", e));
+                push_error(
+                    state,
+                    &tr(state.lang.texts().join_error, &[&format!("{:#}", e)]),
+                );
             }
         }
 
@@ -3652,22 +4844,20 @@ async fn handle_command(
                 switch_to_room(app, state, &hash);
                 push_system(
                     state,
-                    &format!(
-                        "Активная комната: {} ({})",
-                        state.room_label,
-                        short_hash(&state.room)
+                    &tr(
+                        state.lang.texts().room_active,
+                        &[&state.room_label, &short_hash(&state.room)],
                     ),
                 );
-                state.status = "комната переключена".to_string();
+                state.status = state.lang.texts().room_switched.to_string();
             } else if state.room.is_empty() {
-                push_system(state, "Активной комнаты нет. Добавьте контакт через /join <link>");
+                push_system(state, state.lang.texts().room_none);
             } else {
                 push_system(
                     state,
-                    &format!(
-                        "Активная комната: {} ({})",
-                        state.room_label,
-                        state.room
+                    &tr(
+                        state.lang.texts().room_active,
+                        &[&state.room_label, &state.room],
                     ),
                 );
             }
@@ -3675,7 +4865,7 @@ async fn handle_command(
 
         "/messages" => {
             if state.room.is_empty() {
-                push_error(state, "Нет активной комнаты. /join <link>");
+                push_error(state, state.lang.texts().no_active_room_short);
                 return Ok(false);
             }
 
@@ -3692,7 +4882,7 @@ async fn handle_command(
             match app.get_messages(&room, limit) {
                 Ok(messages) => {
                     if messages.is_empty() {
-                        push_system(state, "Сообщений в этой комнате нет");
+                        push_system(state, state.lang.texts().messages_empty);
                     } else {
                         for m in messages {
                             let outgoing = m.direction != "in";
@@ -3713,7 +4903,7 @@ async fn handle_command(
                                     } else {
                                         room_title.as_str()
                                     };
-                                    file_feed_line(&time, sender, id, &file_name, outgoing)
+                                    file_feed_line(&time, sender, id, &file_name, outgoing, state.lang)
                                 }
                                 None => format!("[{}] {} {}", time, dir, m.text),
                             };
@@ -3723,7 +4913,124 @@ async fn handle_command(
                 }
                 Err(e) => push_error(
                     state,
-                    &format!("Ошибка загрузки сообщений: {:#}", e),
+                    &tr(
+                        state.lang.texts().messages_error,
+                        &[&format!("{:#}", e)],
+                    ),
+                ),
+            }
+        }
+
+        "/ttl" => {
+            if state.room.is_empty() {
+                push_error(state, state.lang.texts().no_active_room_short);
+                return Ok(false);
+            }
+
+            let Some(raw) = parts.get(1).copied() else {
+                let text = match (state.ttl_seconds, state.ttl_synced) {
+                    (Some(seconds), true) => {
+                        tr(state.lang.texts().ttl_status_synced, &[&seconds.to_string()])
+                    }
+                    (Some(seconds), false) => {
+                        tr(state.lang.texts().ttl_status_on, &[&seconds.to_string()])
+                    }
+                    (None, _) => state.lang.texts().ttl_status_off.to_string(),
+                };
+                push_system(state, &text);
+                state.status = text;
+                return Ok(false);
+            };
+
+            let seconds = match parse_ttl_duration(raw) {
+                Ok(seconds) => seconds,
+                Err(e) => {
+                    push_error(
+                        state,
+                        &tr(
+                            state.lang.texts().ttl_invalid,
+                            &[&format!("{:#}", e)],
+                        ),
+                    );
+                    return Ok(false);
+                }
+            };
+
+            match app.set_room_ttl(&state.room, seconds) {
+                Ok(()) => {
+                    sync_ttl_state(app, state);
+                    let text = match seconds {
+                        Some(value) => tr(
+                            state.lang.texts().ttl_enabled_local,
+                            &[&value.to_string()],
+                        ),
+                        None => state.lang.texts().ttl_disabled_local.to_string(),
+                    };
+                    push_system(state, &text);
+                    state.status = text;
+                }
+                Err(e) => push_error(
+                    state,
+                    &tr(
+                        state.lang.texts().ttl_apply_error,
+                        &[&format!("{:#}", e)],
+                    ),
+                ),
+            }
+        }
+
+        "/ttl-syn" => {
+            if state.room.is_empty() {
+                push_error(state, state.lang.texts().no_active_room_short);
+                return Ok(false);
+            }
+
+            let Some(raw) = parts.get(1).copied() else {
+                let text = match state.ttl_seconds {
+                    Some(seconds) if state.ttl_synced => tr(
+                        state.lang.texts().ttl_status_synced,
+                        &[&seconds.to_string()],
+                    ),
+                    _ => state.lang.texts().ttl_status_off.to_string(),
+                };
+                push_system(state, &text);
+                state.status = text;
+                return Ok(false);
+            };
+
+            let seconds = match parse_ttl_duration(raw) {
+                Ok(seconds) => seconds,
+                Err(e) => {
+                    push_error(
+                        state,
+                        &tr(
+                            state.lang.texts().ttl_invalid,
+                            &[&format!("{:#}", e)],
+                        ),
+                    );
+                    return Ok(false);
+                }
+            };
+
+            match app.set_synced_ttl(&state.room, seconds).await {
+                Ok(()) => {
+                    sync_ttl_state(app, state);
+                    let text = match seconds {
+                        Some(value) => tr(
+                            state.lang.texts().ttl_enabled_synced,
+                            &[&value.to_string()],
+                        ),
+                        None => state.lang.texts().ttl_disabled_synced.to_string(),
+                    };
+                    push_system(state, &text);
+                    state.status = text;
+                }
+                Err(e) => push_error(
+                    state,
+                    &tr(
+                        state.lang.texts().ttl_apply_error,
+                        &[&format!("{:#}", e)],
+                    ),
                 ),
             }
         }
@@ -3738,17 +5045,17 @@ async fn handle_command(
                 } else if path.is_none() {
                     path = Some(*arg);
                 } else {
-                    push_error(state, "Использование: /sendfile [--force] <path>");
+                    push_error(state, state.lang.texts().sendfile_usage);
                     return Ok(false);
                 }
             }
 
             let Some(path) = path else {
-                push_error(state, "Использование: /sendfile [--force] <path>");
+                push_error(state, state.lang.texts().sendfile_usage);
                 return Ok(false);
             };
             if state.room.is_empty() {
-                push_error(state, "Нет активной комнаты. /join <link>");
+                push_error(state, state.lang.texts().no_active_room_short);
                 return Ok(false);
             }
 
@@ -3757,24 +5064,24 @@ async fn handle_command(
             let path = path.to_string();
             let tx = ui_tx.clone();
             if force {
-                push_system(
-                    state,
-                    "⚠ --force: отправка из системной директории разрешена вручную",
-                );
-                state.status = format!("отправка файла (--force): {}...", path);
+                push_system(state, state.lang.texts().sendfile_force);
+                state.status = tr(state.lang.texts().sendfile_sending_force, &[&path]);
             } else {
-                state.status = format!("отправка файла: {}...", path);
+                state.status = tr(state.lang.texts().sendfile_sending, &[&path]);
             }
+            let lang = state.lang;
 
             tokio::spawn(async move {
                 match app_ref.send_file_native(&room, &path, force).await {
                     Ok(()) => {
-                        let _ = tx.send(UiNotice::Status("файл отправлен".to_string()));
+                        let _ = tx.send(UiNotice::Status(
+                            lang.texts().sendfile_sent.to_string(),
+                        ));
                     }
                     Err(e) => {
-                        let _ = tx.send(UiNotice::Error(format!(
-                            "Ошибка отправки файла: {:#}",
-                            e
+                        let _ = tx.send(UiNotice::Error(tr(
+                            lang.texts().sendfile_error,
+                            &[&format!("{:#}", e)],
                         )));
                     }
                 }
@@ -3783,7 +5090,7 @@ async fn handle_command(
 
         "/download" => {
             if state.room.is_empty() {
-                push_error(state, "Нет активной комнаты. /join <link>");
+                push_error(state, state.lang.texts().no_active_room_short);
                 return Ok(false);
             }
 
@@ -3803,20 +5110,17 @@ async fn handle_command(
 
             let Some(file) = file else {
                 let message = match target {
-                    Some(token) => format!(
-                        "Файл «{}» не найден. Tab после /dl — список файлов комнаты",
-                        token
-                    ),
-                    None => "В этой комнате пока нет файлов".to_string(),
+                    Some(token) => tr(state.lang.texts().download_not_found, &[token]),
+                    None => state.lang.texts().download_no_files.to_string(),
                 };
                 push_error(state, &message);
                 return Ok(false);
             };
 
-            let path = match resolve_save_path(explicit_path, &file.file_name) {
+            let path = match resolve_save_path(explicit_path, &file.file_name, state.lang) {
                 Ok(path) => path,
                 Err(e) => {
-                    push_error(state, &format!("Не удалось выбрать путь: {:#}", e));
+                    push_error(state, &tr(state.lang.texts().download_path_error, &[&format!("{:#}", e)]));
                     return Ok(false);
                 }
             };
@@ -3827,7 +5131,8 @@ async fn handle_command(
             let file_hash = file.file_hash.clone();
             let target_display = format!("#{} {}", file.id, file.file_name);
             let tx = ui_tx.clone();
-            state.status = format!("скачивание {}...", target_display);
+            state.status = tr(state.lang.texts().download_saving, &[&target_display]);
+            let lang = state.lang;
 
             tokio::spawn(async move {
                 match app_ref
@@ -3835,15 +5140,15 @@ async fn handle_command(
                     .await
                 {
                     Ok(()) => {
-                        let _ = tx.send(UiNotice::Status(format!(
-                            "файл {} сохранён в {}",
-                            target_display, path_display
+                        let _ = tx.send(UiNotice::Status(tr(
+                            lang.texts().download_saved,
+                            &[&target_display, &path_display],
                         )));
                     }
                     Err(e) => {
-                        let _ = tx.send(UiNotice::Error(format!(
-                            "Ошибка скачивания {}: {:#}",
-                            target_display, e
+                        let _ = tx.send(UiNotice::Error(tr(
+                            lang.texts().download_error,
+                            &[&target_display, &format!("{:#}", e)],
                         )));
                     }
                 }
@@ -3852,41 +5157,47 @@ async fn handle_command(
 
         "/nick" => {
             let Some(name) = parts.get(1) else {
-                push_error(state, "Использование: /nick <name>");
+                push_error(state, state.lang.texts().nick_usage);
                 return Ok(false);
             };
             match app.update_nickname(name) {
                 Ok(()) => {
                     state.nickname = app.get_nickname();
-                    push_system(state, &format!("Ник изменён: {}", state.nickname));
-                    state.status = "ник изменён".to_string();
+                    push_system(state, &tr(state.lang.texts().nick_changed, &[&state.nickname]));
+                    state.status = state.lang.texts().nick_changed_status.to_string();
                 }
-                Err(e) => push_error(state, &format!("Ошибка смены ника: {:#}", e)),
+                Err(e) => push_error(
+                    state,
+                    &tr(state.lang.texts().nick_error, &[&format!("{:#}", e)]),
+                ),
             }
         }
 
         "/rename" => {
             if parts.len() < 3 {
-                push_error(state, "Использование: /rename <hash> <name>");
+                push_error(state, state.lang.texts().rename_usage);
                 return Ok(false);
             }
             match app.update_contact_nickname(parts[1], parts[2]) {
                 Ok(()) => {
                     refresh_chats(app, state);
                     state.room_label = room_label(app, &state.room);
-                    push_system(state, "Контакт переименован");
-                    state.status = "контакт переименован".to_string();
+                    push_system(state, state.lang.texts().renamed);
+                    state.status = state.lang.texts().renamed_status.to_string();
                 }
-                Err(e) => push_error(state, &format!("Ошибка переименования: {:#}", e)),
+                Err(e) => push_error(
+                    state,
+                    &tr(state.lang.texts().rename_error, &[&format!("{:#}", e)]),
+                ),
             }
         }
 
         "/sidebar" => {
             state.sidebar_visible = !state.sidebar_visible;
             let text = if state.sidebar_visible {
-                "Боковая панель включена"
+                state.lang.texts().sidebar_on
             } else {
-                "Боковая панель скрыта"
+                state.lang.texts().sidebar_off
             };
             push_system(state, text);
             state.status = text.to_lowercase();
@@ -3899,9 +5210,9 @@ async fn handle_command(
                     let level = app.get_config().notify_level;
                     push_system(
                         state,
-                        &format!(
-                            "Notify Level: {}\nИспользование: /set notify <0|1|2|3>",
-                            notify_level_label(level)
+                        &tr(
+                            state.lang.texts().set_notify_usage,
+                            &[notify_level_label(state.lang, level)],
                         ),
                     );
                     return Ok(false);
@@ -3910,7 +5221,7 @@ async fn handle_command(
                 let level = match raw.parse::<u8>() {
                     Ok(level) if level <= 3 => level,
                     _ => {
-                        push_error(state, "Использование: /set notify <0|1|2|3>");
+                        push_error(state, state.lang.texts().set_notify_usage);
                         return Ok(false);
                     }
                 };
@@ -3921,20 +5232,28 @@ async fn handle_command(
                     Ok(()) => {
                         push_system(
                             state,
-                            &format!("Notify Level: {}", notify_level_label(level)),
+                            &tr(
+                                state.lang.texts().set_notify_updated,
+                                &[notify_level_label(state.lang, level)],
+                            ),
                         );
-                        state.status = "режим уведомлений обновлён".to_string();
+                        state.status =
+                            state.lang.texts().set_notify_status.to_string();
                     }
                     Err(e) => push_error(
                         state,
-                        &format!("Не удалось сохранить настройки: {:#}", e),
+                        &tr(
+                            state.lang.texts().settings_save_error,
+                            &[&format!("{:#}", e)],
+                        ),
                     ),
                 }
             }
             Some("test") => {
                 let app_ref = app.clone();
                 let tx = ui_tx.clone();
-                state.status = "отправка тестового уведомления...".to_string();
+                state.status = state.lang.texts().set_test_sending.to_string();
+                let lang = state.lang;
 
                 tokio::spawn(async move {
                     let result =
@@ -3943,47 +5262,74 @@ async fn handle_command(
 
                     let notice = match result {
                         Ok(Ok(())) => UiNotice::Status(
-                            "тестовое уведомление отправлено".to_string(),
+                            lang.texts().set_test_sent.to_string(),
                         ),
-                        Ok(Err(e)) => {
-                            UiNotice::Error(format!("Ошибка уведомления: {:#}", e))
-                        }
-                        Err(e) => {
-                            UiNotice::Error(format!("Ошибка уведомления: {}", e))
-                        }
+                        Ok(Err(e)) => UiNotice::Error(tr(
+                            lang.texts().set_test_error,
+                            &[&format!("{:#}", e)],
+                        )),
+                        Err(e) => UiNotice::Error(tr(
+                            lang.texts().set_test_error_join,
+                            &[&e.to_string()],
+                        )),
                     };
                     let _ = tx.send(notice);
                 });
             }
-            Some(_) => push_error(
-                state,
-                "Использование: /set, /set notify <0|1|2|3> или /set test",
-            ),
+            Some(_) => push_error(state, state.lang.texts().set_usage),
         },
+
+        "/lang" => {
+            let selected = match parts.get(1).copied() {
+                None => match state.lang {
+                    Lang::En => Lang::Ru,
+                    Lang::Ru => Lang::En,
+                },
+                Some(raw) => match Lang::parse(raw) {
+                    Some(lang) => lang,
+                    None => {
+                        push_error(state, &tr(state.lang.texts().lang_invalid, &[raw]));
+                        return Ok(false);
+                    }
+                },
+            };
+
+            let mut config = app.get_config();
+            config.apply_lang(selected);
+            match app.update_config(config) {
+                Ok(()) => {
+                    state.lang = selected;
+                    let message = tr(selected.texts().lang_changed, &[selected.native_name()]);
+                    push_system(state, &message);
+                    state.status = tr(selected.texts().lang_status, &[selected.code()]);
+                }
+                Err(e) => push_error(
+                    state,
+                    &tr(
+                        state.lang.texts().lang_saved_error,
+                        &[&format!("{:#}", e)],
+                    ),
+                ),
+            }
+        }
 
         "/passwd" => {
             if state.settings.is_some() {
-                push_error(state, "Сначала закройте настройки (Esc — сохранить и выйти)");
+                push_error(state, state.lang.texts().settings_first_close);
             } else if state.passwd.is_some() {
-                push_error(state, "Смена мастер-пароля уже начата");
+                push_error(state, state.lang.texts().passwd_already_started);
             } else {
                 state.passwd = Some(PasswdFlow::new());
                 state.input.clear();
                 state.cursor = 0;
-                push_system(
-                    state,
-                    "Смена мастер-пароля.\nВведите текущий пароль (Esc — отмена).",
-                );
-                state.status = "введите текущий мастер-пароль".to_string();
+                push_system(state, state.lang.texts().passwd_start);
+                state.status = state.lang.texts().passwd_enter_current.to_string();
             }
         }
 
         "/quit" | "/exit" => return Ok(true),
 
-        _ => push_error(
-            state,
-            "Неизвестная команда. Введите /help для списка команд.",
-        ),
+        _ => push_error(state, state.lang.texts().unknown_command),
     }
 
     Ok(false)
@@ -3995,17 +5341,39 @@ async fn handle_command(
 
 /// Печатает справку по аргументам командной строки.
 fn print_cli_help(program: &str) {
-    println!("LastChance — защищённый мессенджер с TUI.");
+    println!("LastChance — защищённый мессенджер.");
     println!();
-    println!("Использование: {} [--data-dir <path>] [--recovery]", program);
+    println!("Использование:");
+    println!("  {} [--profile-dir <path>] [--recovery]", program);
+    println!(
+        "  {} --to <contact> --send <text|-> [--file <path>] [--profile-dir <path>]",
+        program
+    );
     println!();
-    println!("Аргументы:");
-    println!("  --data-dir <path>  Каталог профиля (по умолчанию системный или LASTCHANCE_DIR)");
-    println!("  --recovery         Восстановить идентичность из BIP-39 фразы");
-    println!("                     Внимание: перезаписывает текущий identity.json!");
-    println!("  -h, --help         Показать эту справку");
+    println!("Профиль:");
+    println!("  --profile-dir <path>  Каталог профиля (боты и отдельные аккаунты).");
+    println!("                        Приоритет: --profile-dir > LASTCHANCE_DIR >");
+    println!("                        ~/.config/lastchance");
+    println!("  --data-dir <path>     Устаревший синоним --profile-dir");
+    println!("  --recovery            Восстановить идентичность из BIP-39 фразы");
+    println!("                        Внимание: перезаписывает текущий identity.json!");
     println!();
-    println!("Без аргументов запускается обычный клиент: мастер-пароль, затем TUI.");
+    println!("Headless-отправка (без TUI):");
+    println!("  --to <contact>        Имя контакта из локальной базы, identity_hash");
+    println!("                        или ссылка lastchance://contact?...");
+    println!("  --send <text|->       Текст сообщения; \"-\" читает текст из stdin");
+    println!("  --file <path>         Отправить зашифрованный файл");
+    println!("                        (можно вместе с --send)");
+    println!();
+    println!("Переменные окружения:");
+    println!("  LASTCHANCE_DIR        Каталог профиля, если не задан --profile-dir");
+    println!("  LASTCHANCE_PASS       Мастер-пароль для headless-режима;");
+    println!("                        без него пароль запрашивается скрыто в TTY");
+    println!();
+    println!("  -h, --help            Показать эту справку");
+    println!();
+    println!("Без аргументов запускается TUI-клиент. Headless-режим не включает");
+    println!("crossterm/ratatui и завершается с кодом 0 при успехе, 1 при ошибке.");
 }
 
 /// Читает строку с эхом (для мнемонической фразы и подтверждений).
@@ -4060,7 +5428,10 @@ fn prompt_new_master_password() -> Result<Zeroizing<String>> {
 fn rekey_profile(base_dir: &str, old_vault: &Vault, new_password: &str) -> Result<Vault> {
     let old_key = old_vault.key()?;
     let (new_salt, new_key) = vault::derive_new(new_password)?;
-    let db_exists = std::path::Path::new(base_dir).join(DB_FILE_NAME).exists();
+    let db_exists = std::path::Path::new(base_dir).join(VAULT_FILE_NAME).exists()
+        || std::path::Path::new(base_dir)
+            .join(LEGACY_DB_FILE_NAME)
+            .exists();
 
     let rewrite = |from: &vault::MasterKey, to: &vault::MasterKey| -> Result<()> {
         Config::reencrypt(base_dir, from, to)?;
@@ -4137,30 +5508,145 @@ fn run_recovery(base_dir: &str) -> Result<Vault> {
     Ok(vault)
 }
 
-/// Разбирает `--data-dir <path>` (и `--data-dir=<path>`) из argv.
-fn parse_data_dir(args: &[String]) -> Result<Option<String>> {
-    let mut iter = args.iter().skip(1);
-    while let Some(arg) = iter.next() {
-        if arg == "--data-dir" {
-            return match iter.next() {
-                Some(path) if !path.trim().is_empty() => Ok(Some(path.clone())),
-                _ => Err(anyhow!("--data-dir: не указан непустой путь")),
-            };
-        }
-        if let Some(path) = arg.strip_prefix("--data-dir=") {
-            if path.trim().is_empty() {
-                return Err(anyhow!("--data-dir: не указан непустой путь"));
-            }
-            return Ok(Some(path.to_string()));
-        }
+/// Читает мастер-пароль для headless-режима.
+///
+/// Приоритет: `LASTCHANCE_PASS`, затем скрытый ввод, если stdin — TTY.
+/// Без TTY возвращаем чистую ошибку (main завершится с кодом 1).
+fn read_headless_password() -> Result<Zeroizing<String>> {
+    use std::io::IsTerminal;
+
+    if let Some(raw) = std::env::var_os("LASTCHANCE_PASS") {
+        let password = raw
+            .into_string()
+            .map_err(|_| anyhow!("LASTCHANCE_PASS is not valid UTF-8"))?;
+        return Ok(Zeroizing::new(password));
     }
-    Ok(None)
+
+    if !io::stdin().is_terminal() {
+        return Err(anyhow!(
+            "LASTCHANCE_PASS is not set and stdin is not an interactive TTY"
+        ));
+    }
+
+    read_password("Мастер-пароль: ")
 }
 
-fn parse_contact_link(raw: &str) -> Result<(String, String, String)> {
+/// Находит получателя по имени, identity_hash или ссылке `lastchance://`.
+///
+/// Ссылка с неизвестным контактом импортируется в локальную базу: без
+/// публичного ключа отправить зашифрованный пакет невозможно.
+fn resolve_headless_recipient(app: &App, raw: &str) -> Result<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err(anyhow!("--to: empty recipient"));
+    }
+
+    if raw.starts_with("lastchance://") {
+        let lang = app.get_config().lang;
+        let (hash, x25519, ed25519, nickname) = parse_contact_link(raw, lang)?;
+        let known = app
+            .get_contacts()?
+            .iter()
+            .any(|contact| contact.hash == hash);
+        if !known {
+            app.add_contact_with_ed25519(
+                &hash,
+                &x25519,
+                ed25519.as_deref(),
+                &nickname,
+            )?;
+        }
+        return Ok(hash);
+    }
+
+    if raw == app.identity.hash {
+        return Ok(raw.to_string());
+    }
+
+    let contacts = app.get_contacts()?;
+    if contacts.iter().any(|contact| contact.hash == raw) {
+        return Ok(raw.to_string());
+    }
+
+    let needle = raw.to_lowercase();
+    let matches: Vec<&str> = contacts
+        .iter()
+        .filter(|contact| contact.nickname.to_lowercase() == needle)
+        .map(|contact| contact.hash.as_str())
+        .collect();
+
+    match matches.as_slice() {
+        [] => Err(anyhow!("contact not found: {}", raw)),
+        [hash] => Ok((*hash).to_string()),
+        _ => Err(anyhow!(
+            "ambiguous contact name '{}': {} matches; use the identity hash",
+            raw,
+            matches.len()
+        )),
+    }
+}
+
+/// Отправляет сообщение и/или файл без запуска ratatui/crossterm.
+async fn run_headless(args: &HeadlessArgs, base_dir: &str) -> Result<()> {
+    let to = args
+        .to
+        .as_deref()
+        .ok_or_else(|| anyhow!("--to: missing recipient"))?;
+
+    if !Vault::is_initialized(base_dir)? {
+        return Err(anyhow!(
+            "profile is not initialized: {} (launch the TUI once to create it)",
+            base_dir
+        ));
+    }
+
+    let password = read_headless_password()?;
+    let vault = Vault::unlock(base_dir, password.as_str())?;
+    drop(password);
+
+    let (config, _needs_language_choice) =
+        Config::load_with_language_flag(base_dir, &vault)?;
+    let (event_tx, _event_rx) = mpsc::unbounded_channel::<AppEvent>();
+    let app = App::new(config, base_dir.to_string(), vault, event_tx)?;
+
+    let recipient = resolve_headless_recipient(&app, to)?;
+
+    let text = match args.send.as_deref() {
+        Some("-") => {
+            let mut input = String::new();
+            io::stdin()
+                .read_to_string(&mut input)
+                .map_err(|e| anyhow!("cannot read message from stdin: {}", e))?;
+            let text = input
+                .trim_end_matches(['\r', '\n'])
+                .to_string();
+            if text.is_empty() {
+                return Err(anyhow!("stdin is empty: nothing to send"));
+            }
+            Some(text)
+        }
+        Some(text) => Some(text.to_string()),
+        None => None,
+    };
+
+    if let Some(text) = text.as_deref() {
+        app.send_message(&recipient, text).await?;
+    }
+
+    if let Some(path) = args.file.as_deref() {
+        app.send_file_native(&recipient, path, false).await?;
+    }
+
+    Ok(())
+}
+
+fn parse_contact_link(
+    raw: &str,
+    lang: Lang,
+) -> Result<(String, String, Option<String>, String)> {
     let params_str = raw
         .strip_prefix("lastchance://contact?")
-        .ok_or_else(|| anyhow!("это не ссылка lastchance://contact?..."))?;
+        .ok_or_else(|| anyhow!("{}", lang.texts().not_contact_link))?;
 
     let params: std::collections::HashMap<String, String> =
         url::form_urlencoded::parse(params_str.as_bytes())
@@ -4169,13 +5655,18 @@ fn parse_contact_link(raw: &str) -> Result<(String, String, String)> {
 
     let hash = params.get("hash").cloned().unwrap_or_default();
     let x25519 = params.get("x25519").cloned().unwrap_or_default();
+    let ed25519 = params
+        .get("ed25519")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     let nickname = params.get("nickname").cloned().unwrap_or_default();
 
     if hash.is_empty() || x25519.is_empty() || nickname.is_empty() {
-        return Err(anyhow!("в ссылке не хватает обязательных параметров"));
+        return Err(anyhow!("{}", lang.texts().missing_link_params));
     }
 
-    Ok((hash, x25519, nickname))
+    Ok((hash, x25519, ed25519, nickname))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4188,6 +5679,9 @@ async fn run_loop(
     ui_events: &mut mpsc::UnboundedReceiver<UiNotice>,
     term_events: &mut EventStream,
 ) -> Result<()> {
+    let mut ttl_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    ttl_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
         if state.needs_clear {
             state.needs_clear = false;
@@ -4205,7 +5699,10 @@ async fn run_loop(
                         }
                     }
                     Some(Err(e)) => {
-                        state.status = format!("ошибка терминала: {}", e);
+                        state.status = tr(
+                            state.lang.texts().terminal_error,
+                            &[&e.to_string()],
+                        );
                     }
                     None => return Ok(()),
                 }
@@ -4219,6 +5716,9 @@ async fn run_loop(
                 if let Some(notice) = maybe_ui {
                     apply_notice(state, notice);
                 }
+            }
+            _ = ttl_tick.tick() => {
+                tick_ttl(app, state);
             }
         }
     }
@@ -4338,15 +5838,27 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let data_dir = parse_data_dir(&args)?;
-    let base_dir = get_base_dir_with_override(data_dir.as_deref())?;
+    let profile_dir = parse_profile_dir(&args)?;
+    let headless = parse_headless_args(&args)?;
+    let base_dir = get_base_dir_with_override(profile_dir.as_deref())?;
     let recovery = args.iter().skip(1).any(|arg| arg == "--recovery");
+
+    if headless.is_active() {
+        if recovery {
+            return Err(anyhow!(
+                "--recovery cannot be combined with --send/--file"
+            ));
+        }
+        return run_headless(&headless, &base_dir).await;
+    }
+
     let vault = if recovery {
         run_recovery(&base_dir)?
     } else {
         unlock_vault(&base_dir)?
     };
-    let config = Config::load(&base_dir, &vault)?;
+    let (config, needs_language_choice) =
+        Config::load_with_language_flag(&base_dir, &vault)?;
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<AppEvent>();
     let app = Arc::new(App::new(config, base_dir, vault, event_tx)?);
 
@@ -4369,6 +5881,11 @@ async fn main() -> Result<()> {
 
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiNotice>();
     let mut state = UiState::new(&app);
+    if needs_language_choice {
+        let lang = state.lang;
+        state.welcome = Some(WelcomeFlow::new(lang));
+        state.status = lang.texts().welcome_status.to_string();
+    }
     let mut tui = Tui::new()?;
     let mut term_events = EventStream::new();
 
@@ -4570,5 +6087,18 @@ mod tests {
         assert_eq!(sanitize_pasted_text("a\tb"), "a b");
         assert_eq!(sanitize_pasted_text("a\u{7}b"), "ab");
         assert_eq!(sanitize_pasted_text("🙂\nтест"), "🙂 тест");
+    }
+
+    #[test]
+    fn parses_ttl_durations() {
+        assert_eq!(parse_ttl_duration("30").unwrap(), Some(30));
+        assert_eq!(parse_ttl_duration("45s").unwrap(), Some(45));
+        assert_eq!(parse_ttl_duration("5m").unwrap(), Some(300));
+        assert_eq!(parse_ttl_duration("2h").unwrap(), Some(7200));
+        assert_eq!(parse_ttl_duration("off").unwrap(), None);
+        assert!(parse_ttl_duration("0").is_err());
+        assert!(parse_ttl_duration("abc").is_err());
+        assert!(parse_ttl_duration("").is_err());
+        assert_eq!(ttl_countdown(90, 66), "00:24");
     }
 }

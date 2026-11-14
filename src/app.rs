@@ -9,6 +9,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::crypto;
+use crate::i18n::{tr, Lang};
 use crate::identity::{Identity, IdentityManager};
 use crate::network::{Config, Listener, Sender};
 use crate::storage::{Contact, Message, SafeFSOps, Storage};
@@ -25,6 +26,16 @@ pub enum AppEvent {
         text: String,
         timestamp: i64,
         sender: String,
+        /// Сообщение существует только в RAM.
+        is_ephemeral: bool,
+        /// Unix timestamp, когда сообщение исчезнет.
+        expires_at: Option<u64>,
+    },
+    /// Собеседник изменил синхронизированный RAM-TTL.
+    TtlChanged {
+        room_hash: String,
+        seconds: Option<u64>,
+        from_peer: bool,
     },
     ContactImport {
         hash: String,
@@ -63,6 +74,14 @@ pub enum AppEvent {
 // MAIN APP STRUCTURE
 // ============================================================
 
+/// Сессионный TTL комнаты. Хранится только в оперативной памяти и
+/// намеренно не попадает в `vault.dat`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoomTtl {
+    pub seconds: Option<u64>,
+    pub synced: bool,
+}
+
 pub struct App {
     config: RwLock<Config>,
     base_dir: String,
@@ -86,7 +105,15 @@ pub struct App {
 
     vault: Vault,
 
+    /// RAM-only TTL по hash комнаты. Не сериализуется и не сохраняется.
+    room_ttls: Arc<Mutex<HashMap<String, RoomTtl>>>,
+
     event_sender: mpsc::UnboundedSender<AppEvent>,
+}
+
+/// Текущее Unix-время в секундах, безопасно приведённое к `u64`.
+fn now_timestamp() -> u64 {
+    chrono::Utc::now().timestamp().max(0) as u64
 }
 
 /// Разворачивает `~` и `~/...` в домашнюю директорию пользователя.
@@ -131,48 +158,66 @@ fn is_protected_system_path(path: &Path) -> bool {
 ///
 /// Поддерживает абсолютные пути и `~/`. Возвращает канонизированный путь,
 /// проверяет, что это обычный файл, и (без `force`) блокирует системные папки.
-fn resolve_upload_path(raw: &str, force: bool) -> Result<PathBuf> {
+fn resolve_upload_path(raw: &str, force: bool, lang: Lang) -> Result<PathBuf> {
+    let texts = lang.texts();
     let expanded = expand_tilde(raw);
     let path = if expanded.is_absolute() {
         expanded
     } else {
         std::env::current_dir()
-            .map_err(|e| anyhow!("не удалось определить текущую директорию: {}", e))?
+            .map_err(|e| anyhow!("{}", tr(texts.cwd_failed, &[&e.to_string()])))?
             .join(expanded)
     };
 
     let metadata = match std::fs::metadata(&path) {
         Ok(metadata) => metadata,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(anyhow!("файл не найден: {}", path.display()));
+            return Err(anyhow!(
+                "{}",
+                tr(texts.file_not_found, &[&path.display().to_string()])
+            ));
         }
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            return Err(anyhow!("нет прав на чтение: {}", path.display()));
+            return Err(anyhow!(
+                "{}",
+                tr(texts.permission_denied, &[&path.display().to_string()])
+            ));
         }
         Err(e) => {
             return Err(anyhow!(
-                "не удалось получить информацию о {}: {}",
-                path.display(),
-                e
+                "{}",
+                tr(
+                    texts.stat_failed,
+                    &[&path.display().to_string(), &e.to_string()]
+                )
             ));
         }
     };
 
     if !metadata.is_file() {
         return Err(anyhow!(
-            "это не обычный файл (возможно, директория): {}",
-            path.display()
+            "{}",
+            tr(texts.not_regular_file, &[&path.display().to_string()])
         ));
     }
 
-    let canonical = std::fs::canonicalize(&path)
-        .map_err(|e| anyhow!("не удалось разрешить путь {}: {}", path.display(), e))?;
+    let canonical = std::fs::canonicalize(&path).map_err(|e| {
+        anyhow!(
+            "{}",
+            tr(
+                texts.resolve_path_failed,
+                &[&path.display().to_string(), &e.to_string()]
+            )
+        )
+    })?;
 
     if !force && is_protected_system_path(&canonical) {
         return Err(anyhow!(
-            "отправка из системной директории запрещена: {} (используйте /sf --force {})",
-            canonical.display(),
-            raw
+            "{}",
+            tr(
+                texts.system_path_forbidden,
+                &[&canonical.display().to_string(), raw]
+            )
         ));
     }
 
@@ -277,6 +322,7 @@ impl App {
             current_room_hash,
             safe_fs,
             vault,
+            room_ttls: Arc::new(Mutex::new(HashMap::new())),
             event_sender,
         })
     }
@@ -299,6 +345,7 @@ impl App {
         let signing_key = self.signing_key.clone();
         let shared_secrets = self.shared_secrets.clone();
         let storage = self.storage.clone();
+        let room_ttls = self.room_ttls.clone();
         let event_sender = self.event_sender.clone();
 
         tokio::spawn(async move {
@@ -332,6 +379,7 @@ impl App {
                                 packet,
                                 &shared_secrets,
                                 &storage,
+                                &room_ttls,
                                 &identity_hash,
                                 &identity_pub_key,
                                 &identity_priv_key,
@@ -364,10 +412,12 @@ impl App {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_incoming_packet(
         packet: Vec<u8>,
         shared_secrets: &Arc<Mutex<HashMap<String, [u8; 32]>>>,
         storage: &Arc<Storage>,
+        room_ttls: &Arc<Mutex<HashMap<String, RoomTtl>>>,
         identity_hash: &str,
         identity_pub_key: &str,
         identity_priv_key: &[u8],
@@ -413,6 +463,40 @@ impl App {
             }
         };
 
+        // Внутренний конверт: текст с TTL-метаданными или SetTtl.
+        let (message_text, ttl_seconds) = match crypto::decode_payload(&message) {
+            Ok(crypto::E2ePayload::SetTtl { seconds }) => {
+                if let Ok(mut ttls) = room_ttls.lock() {
+                    match seconds {
+                        Some(value) => {
+                            ttls.insert(
+                                from_hash.clone(),
+                                RoomTtl {
+                                    seconds: Some(value),
+                                    synced: true,
+                                },
+                            );
+                        }
+                        None => {
+                            ttls.remove(&from_hash);
+                        }
+                    }
+                }
+
+                let _ = event_sender.send(AppEvent::TtlChanged {
+                    room_hash: from_hash.clone(),
+                    seconds,
+                    from_peer: from_hash != identity_hash,
+                });
+                return;
+            }
+            Ok(crypto::E2ePayload::Text { text, ttl_seconds }) => (text, ttl_seconds),
+            Err(e) => {
+                warn!("Malformed E2E payload from {}: {:#}", from_hash, e);
+                return;
+            }
+        };
+
         // Get sender name
         let from_name = if from_hash == identity_hash {
             format!("{} (self)", &identity_hash[..8.min(identity_hash.len())])
@@ -423,9 +507,24 @@ impl App {
             }
         };
 
-        // Save to DB
-        let message_text = String::from_utf8_lossy(&message).to_string();
-        let _ = storage.save_message_with_room(&from_hash, "in", &from_hash, &message_text);
+        // Входящее сообщение становится эфемерным, если TTL пришёл в
+        // метаданных или включён локальный режим этой комнаты.
+        let local_ttl = room_ttls
+            .lock()
+            .ok()
+            .and_then(|ttls| ttls.get(&from_hash).and_then(|ttl| ttl.seconds));
+        let effective_ttl = ttl_seconds.or(local_ttl);
+        let expires_at = effective_ttl.map(|seconds| now_timestamp().saturating_add(seconds));
+
+        // Save to DB (ephemeral rows never reach vault.dat).
+        let _ = storage.save_message_with_room_meta(
+            &from_hash,
+            "in",
+            &from_hash,
+            &message_text,
+            expires_at.is_some(),
+            expires_at,
+        );
 
         // Send event to UI
         let _ = event_sender.send(AppEvent::NewMessage {
@@ -433,6 +532,8 @@ impl App {
             text: message_text.clone(),
             timestamp: chrono::Utc::now().timestamp(),
             sender: from_name.clone(),
+            is_ephemeral: expires_at.is_some(),
+            expires_at,
         });
     }
 
@@ -535,6 +636,17 @@ impl App {
     }
 
     pub fn add_contact(&self, hash: &str, pub_key_hex: &str, nickname: &str) -> Result<()> {
+        self.add_contact_with_ed25519(hash, pub_key_hex, None, nickname)
+    }
+
+    /// Добавляет контакт, сохраняя Ed25519-ключ из ссылки, если он известен.
+    pub fn add_contact_with_ed25519(
+        &self,
+        hash: &str,
+        pub_key_hex: &str,
+        ed25519: Option<&str>,
+        nickname: &str,
+    ) -> Result<()> {
         let pub_key =
             hex::decode(pub_key_hex).map_err(|e| anyhow!("invalid public key hex: {}", e))?;
 
@@ -547,7 +659,8 @@ impl App {
 
         let shared_secret = crypto::generate_shared_key(&self.identity.private_key, &pub_key)?;
 
-        self.storage.add_contact(hash, &pub_key, nickname)?;
+        self.storage
+            .add_contact_with_ed25519(hash, &pub_key, ed25519, nickname)?;
 
         {
             let mut secrets = self.shared_secrets.lock().unwrap();
@@ -562,6 +675,36 @@ impl App {
         }
 
         Ok(())
+    }
+
+    /// Удаляет контакт и всю его историю сообщений/файлов.
+    pub fn delete_contact(&self, contact_hash: &str) -> Result<()> {
+        if contact_hash == self.identity.hash {
+            return Err(anyhow!("cannot delete your own identity"));
+        }
+
+        self.storage.delete_contact(contact_hash)?;
+
+        if let Ok(mut secrets) = self.shared_secrets.lock() {
+            secrets.remove(contact_hash);
+        }
+
+        if let Ok(mut ttls) = self.room_ttls.lock() {
+            ttls.remove(contact_hash);
+        }
+
+        if let Ok(mut current) = self.current_room_hash.lock() {
+            if current.as_str() == contact_hash {
+                current.clear();
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Количество сообщений контакта для карточки `/contacts`.
+    pub fn count_contact_messages(&self, contact_hash: &str) -> Result<usize> {
+        self.storage.count_messages(contact_hash)
     }
 
     pub fn update_nickname(&self, new_nickname: &str) -> Result<()> {
@@ -591,9 +734,13 @@ impl App {
     /// Меняет мастер-пароль и перешифровывает файлы профиля и базу.
     pub fn change_master_password(&self, old_password: &str, new_password: &str) -> Result<()> {
         if new_password.chars().count() < vault::MIN_PASSWORD_LEN {
+            let texts = self.get_config().lang.texts();
             return Err(anyhow!(
-                "новый пароль должен быть не короче {} символов",
-                vault::MIN_PASSWORD_LEN
+                "{}",
+                tr(
+                    texts.password_min_app,
+                    &[&vault::MIN_PASSWORD_LEN.to_string()]
+                )
             ));
         }
 
@@ -642,21 +789,141 @@ impl App {
 
     pub async fn send_message(&self, room_hash: &str, text: &str) -> Result<()> {
         let shared_secret = self.get_shared_secret(room_hash)?;
+        let ttl = self.get_room_ttl(room_hash);
 
-        let session_id = {
-            let mut id = self.session_id.lock().unwrap();
-            *id += 1;
-            *id
-        };
+        // Односторонний `/ttl` остаётся локальным: TTL не передаётся
+        // собеседнику. Двусторонний `/ttl-syn` едет в метаданных текста.
+        let wire_ttl = ttl.filter(|value| value.synced).and_then(|value| value.seconds);
+        let payload = crypto::encode_text_payload(text, wire_ttl);
 
-        let packet = crypto::encrypt_message(text.as_bytes(), &shared_secret, session_id)?;
+        let session_id = self.next_session_id()?;
+        let packet = crypto::encrypt_message(&payload, &shared_secret, session_id)?;
 
         self.sender.send_message(room_hash, &packet).await?;
 
-        self.storage
-            .save_message_with_room(room_hash, "out", room_hash, text)?;
+        self.store_outgoing_message(room_hash, text)
+    }
+
+    /// Выдаёт следующий идентификатор сессии (используется как nonce-база).
+    fn next_session_id(&self) -> Result<u64> {
+        let mut id = self
+            .session_id
+            .lock()
+            .map_err(|_| anyhow!("session id lock poisoned"))?;
+        *id = id
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("session id overflow"))?;
+        Ok(*id)
+    }
+
+    /// Возвращает активный RAM-TTL комнаты. `None`, если таймер выключен.
+    pub fn get_room_ttl(&self, room_hash: &str) -> Option<RoomTtl> {
+        self.room_ttls
+            .lock()
+            .ok()
+            .and_then(|ttls| ttls.get(room_hash).copied())
+            .filter(|ttl| ttl.seconds.is_some())
+    }
+
+    /// Устанавливает односторонний RAM-TTL комнаты (только локально).
+    pub fn set_room_ttl(&self, room_hash: &str, seconds: Option<u64>) -> Result<()> {
+        let mut ttls = self
+            .room_ttls
+            .lock()
+            .map_err(|_| anyhow!("ttl lock poisoned"))?;
+        match seconds {
+            Some(value) => {
+                ttls.insert(
+                    room_hash.to_string(),
+                    RoomTtl {
+                        seconds: Some(value),
+                        synced: false,
+                    },
+                );
+            }
+            None => {
+                ttls.remove(room_hash);
+            }
+        }
+        Ok(())
+    }
+
+    /// Устанавливает двусторонний RAM-TTL и отправляет `SetTtl` собеседнику.
+    ///
+    /// Пакет собирается до изменения локального состояния, а при ошибке
+    /// отправки предыдущее значение откатывается.
+    pub async fn set_synced_ttl(&self, room_hash: &str, seconds: Option<u64>) -> Result<()> {
+        let shared_secret = self.get_shared_secret(room_hash)?;
+        let session_id = self.next_session_id()?;
+        let payload = crypto::encode_set_ttl(seconds);
+        let packet = crypto::encrypt_message(&payload, &shared_secret, session_id)?;
+
+        let previous = {
+            let mut ttls = self
+                .room_ttls
+                .lock()
+                .map_err(|_| anyhow!("ttl lock poisoned"))?;
+            let previous = ttls.get(room_hash).copied();
+            match seconds {
+                Some(value) => {
+                    ttls.insert(
+                        room_hash.to_string(),
+                        RoomTtl {
+                            seconds: Some(value),
+                            synced: true,
+                        },
+                    );
+                }
+                None => {
+                    ttls.remove(room_hash);
+                }
+            }
+            previous
+        };
+
+        if let Err(e) = self.sender.send_message(room_hash, &packet).await {
+            if let Ok(mut ttls) = self.room_ttls.lock() {
+                match previous {
+                    Some(value) => {
+                        ttls.insert(room_hash.to_string(), value);
+                    }
+                    None => {
+                        ttls.remove(room_hash);
+                    }
+                }
+            }
+            return Err(anyhow!("failed to send TTL update: {}", e));
+        }
 
         Ok(())
+    }
+
+    /// Сохраняет исходящее сообщение, делая его эфемерным при активном TTL.
+    pub fn store_outgoing_message(&self, room_hash: &str, text: &str) -> Result<()> {
+        let expires_at = self
+            .get_room_ttl(room_hash)
+            .and_then(|ttl| ttl.seconds)
+            .map(|seconds| now_timestamp().saturating_add(seconds));
+
+        self.storage.save_message_with_room_meta(
+            room_hash,
+            "out",
+            room_hash,
+            text,
+            expires_at.is_some(),
+            expires_at,
+        )
+    }
+
+    /// Удаляет из RAM сообщения с истёкшим `expires_at`.
+    pub fn purge_expired_messages(&self) -> Result<usize> {
+        self.purge_expired_messages_at(now_timestamp())
+    }
+
+    /// То же, что [`Self::purge_expired_messages`], но с явным временем
+    /// (удобно для детерминированных тестов).
+    pub fn purge_expired_messages_at(&self, now: u64) -> Result<usize> {
+        Ok(self.storage.purge_expired_messages(now)?.len())
     }
 
     pub async fn send_file_native(
@@ -667,12 +934,15 @@ impl App {
     ) -> Result<()> {
         use std::io::Read;
 
+        let lang = self.get_config().lang;
+        let texts = lang.texts();
+
         // Путь читается из PWD (или абсолютный/~/), а не из каталога данных.
-        let path = resolve_upload_path(file_path, force)?;
+        let path = resolve_upload_path(file_path, force, lang)?;
         let file_name = path
             .file_name()
             .and_then(|n| n.to_str())
-            .ok_or_else(|| anyhow!("invalid file path"))?;
+            .ok_or_else(|| anyhow!("{}", texts.invalid_file_path))?;
 
         // Emit upload started event
         self.emit_event(AppEvent::UploadStarted {
@@ -683,10 +953,19 @@ impl App {
         let mut file = match std::fs::File::open(&path) {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                return Err(anyhow!("нет прав на чтение: {}", path.display()));
+                return Err(anyhow!(
+                    "{}",
+                    tr(texts.permission_denied, &[&path.display().to_string()])
+                ));
             }
             Err(e) => {
-                return Err(anyhow!("не удалось открыть {}: {}", path.display(), e));
+                return Err(anyhow!(
+                    "{}",
+                    tr(
+                        texts.open_file_failed,
+                        &[&path.display().to_string(), &e.to_string()]
+                    )
+                ));
             }
         };
         let mut file_data = Vec::new();
@@ -697,7 +976,7 @@ impl App {
 
         // Emit progress event
         self.emit_event(AppEvent::UploadProgress {
-            status: "Шифрование...".to_string(),
+            status: texts.upload_encrypting.to_string(),
             progress: 30,
         });
 
@@ -709,7 +988,7 @@ impl App {
 
         // Emit progress event
         self.emit_event(AppEvent::UploadProgress {
-            status: "Отправка на сервер...".to_string(),
+            status: texts.upload_sending.to_string(),
             progress: 60,
         });
 
@@ -730,7 +1009,7 @@ impl App {
 
         // Emit progress event
         self.emit_event(AppEvent::UploadProgress {
-            status: "Завершено".to_string(),
+            status: texts.upload_finished.to_string(),
             progress: 100,
         });
 
@@ -742,12 +1021,11 @@ impl App {
         });
 
         // Send file notification message
-        let message_text = format!(
-            "📎 Файл: {}\nРазмер: {}\nХеш: {}",
-            file_name,
-            humanize_bytes(file_size as u64),
-            file_hash
-        );
+        let message_text = texts
+            .file_notification
+            .replacen("{}", file_name, 1)
+            .replacen("{}", &humanize_bytes(file_size as u64), 1)
+            .replacen("{}", &file_hash, 1);
 
         self.send_message(room_hash, &message_text).await?;
 
@@ -926,7 +1204,7 @@ impl App {
         let mut guard = self
             .config
             .write()
-            .map_err(|_| anyhow!("конфигурация недоступна: блокировка повреждена"))?;
+            .map_err(|_| anyhow!("{}", config.lang.texts().config_lock_failed))?;
         *guard = config;
 
         Ok(())
@@ -952,13 +1230,10 @@ impl App {
     /// Отправляет тестовое уведомление с текущими настройками (`/set test`).
     pub fn send_test_notification(&self) -> Result<()> {
         let config = self.get_config();
+        let texts = config.lang.texts();
         let (title, body) = config
-            .notification_content(
-                "LastChance",
-                "Тестовое сообщение: уведомления настроены.",
-                1,
-            )
-            .ok_or_else(|| anyhow!("уведомления отключены (Notify Level: 0)"))?;
+            .notification_content("LastChance", texts.notify_test_body, 1)
+            .ok_or_else(|| anyhow!("{}", texts.notify_disabled))?;
 
         show_system_notification(&notification_appname(&config), &title, &body)
     }
@@ -1192,5 +1467,68 @@ mod tests {
         assert_eq!(contacts[0].nickname, "Alice");
         let messages = reopened.get_messages(&hash, 10).unwrap();
         assert_eq!(messages[0].text, "secret message");
+    }
+
+    #[test]
+    fn ttl_messages_stay_in_ram_and_expire() {
+        let (app, _temp_dir, _receiver) = setup_test_app();
+
+        let hash = "e".repeat(64);
+        app.add_contact(&hash, &"a".repeat(64), "TtlPeer").unwrap();
+
+        // Включаем односторонний TTL и сохраняем исходящее сообщение.
+        app.set_room_ttl(&hash, Some(30)).unwrap();
+        let ttl = app.get_room_ttl(&hash).expect("ttl must be enabled");
+        assert_eq!(ttl.seconds, Some(30));
+        assert!(!ttl.synced);
+
+        app.store_outgoing_message(&hash, "ephemeral secret")
+            .unwrap();
+
+        let messages = app.get_messages(&hash, 10).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].is_ephemeral);
+        assert!(messages[0].expires_at.is_some());
+
+        // Эфемерного сообщения нет в зашифрованном снимке на диске.
+        let persisted = app
+            .get_storage()
+            .persisted_messages_for_test()
+            .unwrap();
+        assert!(persisted
+            .iter()
+            .all(|message| message.text != "ephemeral secret"));
+
+        // /ttl off: следующее сообщение снова сохраняется в vault.dat.
+        app.set_room_ttl(&hash, None).unwrap();
+        assert!(app.get_room_ttl(&hash).is_none());
+        app.store_outgoing_message(&hash, "persistent secret")
+            .unwrap();
+
+        let persisted = app
+            .get_storage()
+            .persisted_messages_for_test()
+            .unwrap();
+        assert!(persisted
+            .iter()
+            .any(|message| message.text == "persistent secret"));
+        assert!(persisted
+            .iter()
+            .all(|message| message.text != "ephemeral secret"));
+
+        // Истёкшее эфемерное сообщение удаляется из памяти.
+        let expires_at = messages[0].expires_at.expect("ephemeral must expire");
+        let removed = app
+            .purge_expired_messages_at(expires_at + 1)
+            .unwrap();
+        assert_eq!(removed, 1);
+
+        let remaining = app.get_messages(&hash, 10).unwrap();
+        assert!(remaining
+            .iter()
+            .all(|message| message.text != "ephemeral secret"));
+        assert!(remaining
+            .iter()
+            .any(|message| message.text == "persistent secret"));
     }
 }
