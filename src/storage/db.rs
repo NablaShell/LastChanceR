@@ -9,6 +9,31 @@ use crate::vault::{self, MasterKey, Vault};
 
 pub const DB_FILE_NAME: &str = "user.db";
 
+/// Ограничивает доступ к файлам SQLite (включая WAL и SHM) владельцем.
+///
+/// `global.conf` и `identity.json` пишутся с правами 0600, поэтому база
+/// данных не должна оказаться доступнее остальных файлов профиля.
+#[cfg(unix)]
+fn restrict_db_permissions(db_path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let file_name = db_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(DB_FILE_NAME);
+
+    for suffix in ["", "-wal", "-shm"] {
+        let path = db_path.with_file_name(format!("{}{}", file_name, suffix));
+        if !path.exists() {
+            continue;
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| anyhow!("failed to restrict permissions on {}: {}", path.display(), e))?;
+    }
+
+    Ok(())
+}
+
 // ============================================================
 // DATA MODELS
 // ============================================================
@@ -56,6 +81,10 @@ impl Storage {
         let conn =
             Connection::open(&db_path).map_err(|e| anyhow!("failed to open database: {}", e))?;
 
+        // Файл создан с правами по умолчанию — сразу закрываем его.
+        #[cfg(unix)]
+        restrict_db_permissions(&db_path)?;
+
         // Enable WAL mode for concurrent access
         conn.execute_batch(
             "
@@ -74,6 +103,10 @@ impl Storage {
 
         storage.init_tables()?;
         storage.migrate_plaintext_fields()?;
+
+        // После настройки WAL могли появиться user.db-wal и user.db-shm.
+        #[cfg(unix)]
+        restrict_db_permissions(&db_path)?;
 
         // После миграции открытые значения могли остаться в WAL — усекаем журнал.
         if let Ok(conn) = storage.conn() {

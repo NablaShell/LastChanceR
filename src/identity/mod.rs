@@ -86,6 +86,18 @@ impl IdentityManager {
         Ok(identity)
     }
 
+    /// Восстанавливает личность из существующей BIP-39 фразы.
+    ///
+    /// Фраза нормализуется (регистр и лишние пробелы), после чего из неё
+    /// детерминированно выводятся те же ключи, что были созданы при
+    /// первоначальной генерации. Файл на диск не пишется — для этого
+    /// нужно отдельно вызвать [`IdentityManager::save`].
+    pub fn restore_from_mnemonic(&mut self, seed_phrase: &str, nickname: &str) -> Result<Identity> {
+        let identity = Identity::from_mnemonic(seed_phrase, nickname)?;
+        self.cached_id = Some(identity.clone());
+        Ok(identity)
+    }
+
     pub fn load_or_create(&mut self, nickname: &str) -> Result<Identity> {
         self.init_safe_fs()?;
 
@@ -193,6 +205,51 @@ impl IdentityManager {
     }
 }
 
+impl Identity {
+    /// Строит личность из мнемонической фразы без обращения к хранилищу.
+    ///
+    /// BIP-39 не чувствителен к регистру и лишним пробелам, поэтому ввод
+    /// пользователя приводится к каноническому виду до проверки контрольной
+    /// суммы. Невалидная фраза возвращает ошибку.
+    pub fn from_mnemonic(seed_phrase: &str, nickname: &str) -> Result<Identity> {
+        let normalized = normalize_seed_phrase(seed_phrase);
+        let mnemonic = Mnemonic::parse(&normalized)
+            .map_err(|e| anyhow!("некорректная мнемоническая фраза: {}", e))?;
+
+        let seed = mnemonic.to_seed("");
+        let keys = derive_keys_from_seed(&seed)?;
+
+        let nickname = if nickname.trim().is_empty() {
+            format!("user_{}", &keys.identity_hash[..8])
+        } else {
+            nickname.trim().to_string()
+        };
+
+        let now = chrono::Utc::now().timestamp();
+
+        Ok(Identity {
+            nickname,
+            seed_phrase: normalized,
+            public_key: keys.x25519_public,
+            private_key: keys.x25519_private,
+            ed25519_public_key: keys.ed25519_public,
+            ed25519_private_key: keys.ed25519_private,
+            hash: keys.identity_hash,
+            created_at: now,
+            updated_at: now,
+        })
+    }
+}
+
+/// Приводит ввод к каноническому виду BIP-39: один пробел между словами,
+/// нижний регистр.
+fn normalize_seed_phrase(raw: &str) -> String {
+    raw.split_whitespace()
+        .map(|word| word.to_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 struct DerivedKeys {
     x25519_public: Vec<u8>,
     x25519_private: Vec<u8>,
@@ -269,5 +326,55 @@ impl Identity {
         let signature = signing_key.sign(message.as_bytes());
 
         Ok(hex::encode(signature.to_bytes()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Стандартный тестовый вектор BIP-39: 128 нулевых бит энтропии.
+    const VALID_PHRASE: &str =
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    #[test]
+    fn restore_from_same_mnemonic_is_deterministic() {
+        let first = Identity::from_mnemonic(VALID_PHRASE, "").unwrap();
+        let second = Identity::from_mnemonic(VALID_PHRASE, "").unwrap();
+
+        assert_eq!(first.seed_phrase, VALID_PHRASE);
+        assert_eq!(first.hash, second.hash);
+        assert_eq!(first.public_key, second.public_key);
+        assert_eq!(first.private_key, second.private_key);
+        assert_eq!(first.ed25519_public_key, second.ed25519_public_key);
+        assert_eq!(first.ed25519_private_key, second.ed25519_private_key);
+        assert_eq!(first.nickname, second.nickname);
+        assert!(first.nickname.starts_with("user_"));
+    }
+
+    #[test]
+    fn restore_normalizes_case_and_extra_whitespace() {
+        let messy = format!("  {}  ", VALID_PHRASE.to_uppercase().replace(' ', " \t\n "));
+        let identity = Identity::from_mnemonic(&messy, "alice").unwrap();
+
+        assert_eq!(identity.seed_phrase, VALID_PHRASE);
+        assert_eq!(identity.nickname, "alice");
+        assert_eq!(identity.hash, Identity::from_mnemonic(VALID_PHRASE, "bob").unwrap().hash);
+    }
+
+    #[test]
+    fn restore_rejects_invalid_checksum() {
+        let invalid =
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon";
+        let error = Identity::from_mnemonic(invalid, "").unwrap_err().to_string();
+
+        assert!(error.contains("некорректная мнемоническая фраза"), "{error}");
+    }
+
+    #[test]
+    fn restore_rejects_unknown_word() {
+        let invalid =
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon notaword";
+        assert!(Identity::from_mnemonic(invalid, "").is_err());
     }
 }

@@ -449,7 +449,8 @@ impl App {
         })
     }
 
-    /// Seed-фраза вынесена из `/profile` в отдельную команду `/seed`.
+    /// Seed-фраза вынесена из `/profile` в модальное окно `/recovery`,
+    /// которое требует текущий мастер-пароль.
     pub fn get_seed_phrase(&self) -> String {
         self.identity_manager
             .lock()
@@ -465,6 +466,27 @@ impl App {
     /// Публичный геттер актуального ника (используется TUI-статус-баром).
     pub fn get_nickname(&self) -> String {
         self.current_nickname()
+    }
+
+    /// Перезаписывает `identity.json` личностью, восстановленной из BIP-39.
+    ///
+    /// Текущий ник сохраняется. Запущенный `App` продолжает работать со
+    /// старыми ключами до перезапуска — вызывающая сторона должна об этом
+    /// предупредить пользователя.
+    pub fn restore_identity_from_mnemonic(&self, seed_phrase: &str) -> Result<String> {
+        let mut manager = self
+            .identity_manager
+            .lock()
+            .map_err(|_| anyhow!("identity lock poisoned"))?;
+
+        let nickname = manager
+            .current()
+            .map(|identity| identity.nickname.clone())
+            .unwrap_or_default();
+        let identity = manager.restore_from_mnemonic(seed_phrase, &nickname)?;
+        manager.save(&identity)?;
+
+        Ok(identity.hash)
     }
 
     /// Источник истины для ника — `IdentityManager`, а не копия в `App`.

@@ -31,7 +31,9 @@ use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc;
 use zeroize::Zeroizing;
 
+use lastchance::identity::{Identity, IdentityManager, IDENTITY_FILE_NAME};
 use lastchance::network::config::notify_level_label;
+use lastchance::storage::{Storage, DB_FILE_NAME};
 use lastchance::{get_base_dir_with_override, vault, App, AppEvent, Config, Vault};
 
 /// Строка таблицы справки: слева — команда и её алиасы.
@@ -121,8 +123,8 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 desc: "Профиль: ник, hash и ключи",
             },
             HelpRow {
-                keys: "/seed",
-                desc: "Показать seed-фразу (никому не показывайте!)",
+                keys: "/recovery",
+                desc: "Восстановить идентичность из BIP-39 фразы (с подтверждением перезаписи)",
             },
             HelpRow {
                 keys: "/invite, /in [-f [dir | file]]",
@@ -283,7 +285,7 @@ struct CompletionCycle {
 const COMMANDS: &[&str] = &[
     "/help",
     "/profile",
-    "/seed",
+    "/recovery",
     "/invite",
     "/export",
     "/contacts",
@@ -346,6 +348,8 @@ struct UiState {
     settings: Option<SettingsFlow>,
     /// Открытое модальное окно справки (F1, /help).
     help: Option<HelpFlow>,
+    /// Модальное окно восстановления идентичности (`/recovery`).
+    recovery: Option<RecoveryFlow>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -369,6 +373,44 @@ impl PasswdFlow {
             stage: PasswdStage::Current,
             old: Zeroizing::new(String::new()),
             new: Zeroizing::new(String::new()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecoveryStage {
+    /// Подтверждение текущего мастер-пароля.
+    Password,
+    /// Просмотр текущей фразы восстановления.
+    View,
+    /// Явное подтверждение перезаписи `identity.json`.
+    Confirm,
+    /// Ввод новой мнемонической фразы.
+    Input,
+}
+
+/// Модальное окно `/recovery`.
+/// Фраза хранится в `Zeroizing`, чтобы затираться при закрытии окна.
+struct RecoveryFlow {
+    stage: RecoveryStage,
+    phrase: Zeroizing<String>,
+    error: Option<String>,
+}
+
+impl RecoveryFlow {
+    fn password() -> Self {
+        Self {
+            stage: RecoveryStage::Password,
+            phrase: Zeroizing::new(String::new()),
+            error: None,
+        }
+    }
+
+    fn view(phrase: String) -> Self {
+        Self {
+            stage: RecoveryStage::View,
+            phrase: Zeroizing::new(phrase),
+            error: None,
         }
     }
 }
@@ -623,6 +665,7 @@ impl UiState {
             passwd: None,
             settings: None,
             help: None,
+            recovery: None,
         };
         refresh_chats(app, &mut state);
         reload_room(app, &mut state);
@@ -1958,6 +2001,14 @@ fn draw_ui(frame: &mut Frame, state: &mut UiState) {
             flow.field().label(),
             if flow.editing { "ввод" } else { "выбор" }
         )
+    } else if let Some(flow) = state.recovery.as_ref() {
+        let stage = match flow.stage {
+            RecoveryStage::Password => "пароль",
+            RecoveryStage::View => "просмотр фразы",
+            RecoveryStage::Confirm => "подтверждение",
+            RecoveryStage::Input => "новая фраза",
+        };
+        format!(" Восстановление: {}   Esc — закрыть ", stage)
     } else {
         format!(
             " {}   Room: {}   {} ",
@@ -1974,6 +2025,11 @@ fn draw_ui(frame: &mut Frame, state: &mut UiState) {
 
     // ---------- 3. Поле ввода ----------
     let settings_open = state.settings.is_some();
+    let recovery_password = state
+        .recovery
+        .as_ref()
+        .map(|flow| flow.stage == RecoveryStage::Password)
+        .unwrap_or(false);
     let (input_title, masked) = if settings_open {
         (" Настройки ".to_string(), false)
     } else if let Some(flow) = state.passwd.as_ref() {
@@ -1983,6 +2039,10 @@ fn draw_ui(frame: &mut Frame, state: &mut UiState) {
             PasswdStage::Confirm => " Пароль: повтор ",
         };
         (title.to_string(), true)
+    } else if recovery_password {
+        (" Пароль: текущий ".to_string(), true)
+    } else if state.recovery.is_some() {
+        (" Восстановление · /recovery ".to_string(), false)
     } else {
         (" Ввод ".to_string(), false)
     };
@@ -2019,7 +2079,10 @@ fn draw_ui(frame: &mut Frame, state: &mut UiState) {
             before.min(avail - 1)
         };
         let start = before - cursor_col;
-        let visible: String = if masked {
+        let visible: String = if state.recovery.is_some() {
+            // Ввод и секреты показывает модальное окно восстановления.
+            String::new()
+        } else if masked {
             "*".repeat(state.input.chars().count().min(avail))
         } else {
             state.input.chars().skip(start).take(avail).collect()
@@ -2032,7 +2095,7 @@ fn draw_ui(frame: &mut Frame, state: &mut UiState) {
 
         let cursor_x = input_inner.x + prefix.len() as u16 + cursor_col as u16;
         let cursor_y = input_inner.y;
-        if state.help.is_none() {
+        if state.help.is_none() && state.recovery.is_none() {
             frame.set_cursor_position(Position::new(
                 cursor_x.min(input_inner.right().saturating_sub(1)),
                 cursor_y,
@@ -2045,6 +2108,9 @@ fn draw_ui(frame: &mut Frame, state: &mut UiState) {
     }
     if state.help.is_some() {
         draw_help_modal(frame, state);
+    }
+    if state.recovery.is_some() {
+        draw_recovery_modal(frame, state);
     }
 }
 
@@ -2184,6 +2250,133 @@ fn draw_help_modal(frame: &mut Frame, state: &mut UiState) {
             footer_area,
         );
     }
+}
+
+/// Рисует модальное окно восстановления идентичности (`/recovery`).
+fn draw_recovery_modal(frame: &mut Frame, state: &UiState) {
+    let Some(flow) = state.recovery.as_ref() else {
+        return;
+    };
+
+    let area = frame.area();
+    let width = 88
+        .min(area.width.saturating_sub(2))
+        .max(24)
+        .min(area.width);
+    let height = 20
+        .min(area.height.saturating_sub(2))
+        .max(10)
+        .min(area.height);
+    let rect = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+
+    frame.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Line::from(vec![
+            Span::styled(
+                " Восстановление ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" /recovery ", Style::default().fg(Color::DarkGray)),
+        ]))
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    match flow.stage {
+        RecoveryStage::Password => {
+            lines.push(Line::from(Span::styled(
+                "Введите текущий мастер-пароль, чтобы открыть фразу восстановления.",
+                Style::default().fg(Color::Gray),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("> {}", "*".repeat(state.input.chars().count())),
+                Style::default().fg(Color::White),
+            )));
+        }
+        RecoveryStage::View => {
+            lines.push(Line::from(Span::styled(
+                "Текущая BIP-39 фраза восстановления:",
+                Style::default().fg(Color::Gray),
+            )));
+            lines.push(Line::from(""));
+            for chunk in wrap_help_text(&flow.phrase, inner.width.saturating_sub(2) as usize) {
+                lines.push(Line::from(Span::styled(
+                    chunk,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Никому не показывайте фразу: она полностью заменяет идентичность.",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        RecoveryStage::Confirm => {
+            lines.push(Line::from(Span::styled(
+                "Перезаписать идентичность?",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Текущий identity.json будет заменён личностью, восстановленной из новой фразы.",
+                Style::default().fg(Color::Gray),
+            )));
+            lines.push(Line::from(Span::styled(
+                "Старые ключи перестанут действовать; отменить это можно только старой фразой.",
+                Style::default().fg(Color::Gray),
+            )));
+        }
+        RecoveryStage::Input => {
+            lines.push(Line::from(Span::styled(
+                "Новая BIP-39 фраза (12/15/18/21/24 слова):",
+                Style::default().fg(Color::Gray),
+            )));
+            lines.push(Line::from(""));
+            let max_input = inner.width.saturating_sub(3) as usize;
+            lines.push(Line::from(Span::styled(
+                format!("> {}", truncate_chars(&state.input, max_input.max(1))),
+                Style::default().fg(Color::White),
+            )));
+        }
+    }
+
+    if let Some(error) = flow.error.as_ref() {
+        lines.push(Line::from(""));
+        for chunk in wrap_help_text(error, inner.width.saturating_sub(2) as usize) {
+            lines.push(Line::from(Span::styled(chunk, Style::default().fg(Color::Red))));
+        }
+    }
+
+    lines.push(Line::from(""));
+    let hint = match flow.stage {
+        RecoveryStage::Password => "Enter — подтвердить · Esc — закрыть",
+        RecoveryStage::View => "Tab или R — ввести новую фразу · Esc — закрыть",
+        RecoveryStage::Confirm => "Enter — продолжить · Esc — закрыть",
+        RecoveryStage::Input => "Enter — восстановить · Esc — закрыть",
+    };
+    lines.push(Line::from(Span::styled(
+        hint,
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    frame.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), inner);
 }
 
 fn help_modal_rect(area: Rect) -> Rect {
@@ -2488,6 +2681,134 @@ fn notify_incoming(app: &Arc<App>, sender: &str, text: &str, unread: usize) {
     });
 }
 
+/// Разрешена ли вставка из буфера в текущем состоянии интерфейса.
+fn can_paste(state: &UiState) -> bool {
+    if let Some(flow) = state.settings.as_ref() {
+        return flow.editing;
+    }
+    match state.recovery.as_ref() {
+        Some(flow) => matches!(flow.stage, RecoveryStage::Password | RecoveryStage::Input),
+        None => true,
+    }
+}
+
+fn clear_input(state: &mut UiState) {
+    state.input.clear();
+    state.cursor = 0;
+    state.history_index = None;
+    state.history_draft.clear();
+}
+
+/// Начинает восстановление идентичности: сначала спрашиваем мастер-пароль.
+fn start_recovery(state: &mut UiState) {
+    if state.settings.is_some() {
+        push_error(state, "Сначала закройте настройки (Esc — сохранить и выйти)");
+    } else if state.passwd.is_some() {
+        push_error(state, "Сначала завершите смену мастер-пароля");
+    } else if state.recovery.is_some() {
+        push_error(state, "Восстановление уже открыто");
+    } else {
+        clear_input(state);
+        state.recovery = Some(RecoveryFlow::password());
+        push_system(
+            state,
+            "Восстановление идентичности.\nВведите текущий мастер-пароль (Esc — отмена).",
+        );
+        state.status = "введите текущий мастер-пароль".to_string();
+    }
+}
+
+/// Обрабатывает клавиши в модальном окне `/recovery`.
+fn handle_recovery_key(app: &App, state: &mut UiState, key: KeyEvent) {
+    let Some(stage) = state.recovery.as_ref().map(|flow| flow.stage) else {
+        return;
+    };
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+    if key.code == KeyCode::Esc {
+        state.recovery = None;
+        clear_input(state);
+        state.status = "восстановление закрыто".to_string();
+        return;
+    }
+
+    match stage {
+        RecoveryStage::Password => match key.code {
+            KeyCode::Enter => {
+                let password = Zeroizing::new(std::mem::take(&mut state.input));
+                state.cursor = 0;
+                match app.verify_master_password(password.as_str()) {
+                    Ok(()) => {
+                        state.recovery = Some(RecoveryFlow::view(app.get_seed_phrase()));
+                        state.status =
+                            "пароль подтверждён · Tab/R — новая фраза".to_string();
+                    }
+                    Err(e) => {
+                        if let Some(flow) = state.recovery.as_mut() {
+                            flow.error = Some(format!("Неверный мастер-пароль: {:#}", e));
+                        }
+                        state.status = "неверный мастер-пароль".to_string();
+                    }
+                }
+            }
+            _ => {
+                apply_line_edit_key(state, key, ctrl, alt);
+            }
+        },
+        RecoveryStage::View => match key.code {
+            KeyCode::Tab | KeyCode::Char('r') | KeyCode::Char('R') => {
+                if let Some(flow) = state.recovery.as_mut() {
+                    flow.stage = RecoveryStage::Confirm;
+                    flow.error = None;
+                }
+                clear_input(state);
+                state.status = "подтвердите перезапись идентичности".to_string();
+            }
+            _ => {}
+        },
+        RecoveryStage::Confirm => {
+            if key.code == KeyCode::Enter {
+                if let Some(flow) = state.recovery.as_mut() {
+                    flow.stage = RecoveryStage::Input;
+                    flow.error = None;
+                }
+                clear_input(state);
+                state.status = "введите новую мнемоническую фразу".to_string();
+            }
+        }
+        RecoveryStage::Input => match key.code {
+            KeyCode::Enter => {
+                let phrase = Zeroizing::new(std::mem::take(&mut state.input));
+                state.cursor = 0;
+                match app.restore_identity_from_mnemonic(phrase.as_str()) {
+                    Ok(hash) => {
+                        state.recovery = Some(RecoveryFlow::view(app.get_seed_phrase()));
+                        push_system(
+                            state,
+                            &format!(
+                                "Идентичность восстановлена: {}.\nПерезапустите клиент, \
+                                 чтобы новые ключи вступили в силу.",
+                                short_hash(&hash)
+                            ),
+                        );
+                        state.status = "идентичность восстановлена".to_string();
+                    }
+                    Err(e) => {
+                        if let Some(flow) = state.recovery.as_mut() {
+                            flow.error = Some(format!("{:#}", e));
+                        }
+                        state.status = "некорректная мнемоническая фраза".to_string();
+                    }
+                }
+            }
+            _ => {
+                apply_line_edit_key(state, key, ctrl, alt);
+            }
+        },
+    }
+}
+
 /// Открывает модальное окно справки.
 fn open_help(state: &mut UiState) {
     state.help = Some(HelpFlow::new());
@@ -2580,7 +2901,12 @@ async fn handle_terminal_event(
                 }
 
                 // Пароль никогда не копируем в системный буфер.
-                if state.passwd.is_some() {
+                let recovery_password = state
+                    .recovery
+                    .as_ref()
+                    .map(|flow| flow.stage == RecoveryStage::Password)
+                    .unwrap_or(false);
+                if state.passwd.is_some() || recovery_password {
                     state.input.clear();
                     state.cursor = 0;
                     state.history_index = None;
@@ -2625,6 +2951,8 @@ async fn handle_terminal_event(
                 }
                 if state.passwd.is_some() {
                     state.status = "сначала завершите смену мастер-пароля".to_string();
+                } else if state.recovery.is_some() {
+                    state.status = "сначала закройте восстановление (Esc)".to_string();
                 } else if state.settings.is_none() {
                     start_settings(app, state);
                 }
@@ -2634,7 +2962,11 @@ async fn handle_terminal_event(
             // F1 открывает/закрывает справку. Одиночный `?` не перехватываем:
             // он должен попадать в поле ввода как обычный текст.
             if matches!(key.code, KeyCode::F(1)) {
-                toggle_help(state);
+                if state.recovery.is_some() {
+                    state.status = "сначала закройте восстановление (Esc)".to_string();
+                } else {
+                    toggle_help(state);
+                }
                 return Ok(false);
             }
 
@@ -2645,14 +2977,15 @@ async fn handle_terminal_event(
             }
 
             if ctrl && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V')) {
-                let can_paste = state
-                    .settings
-                    .as_ref()
-                    .map(|flow| flow.editing)
-                    .unwrap_or(true);
-                if can_paste {
+                if can_paste(state) {
                     paste_from_clipboard(state);
                 }
+                return Ok(false);
+            }
+
+            // Модальное окно восстановления перехватывает ввод и навигацию.
+            if state.recovery.is_some() {
+                handle_recovery_key(app, state, key);
                 return Ok(false);
             }
 
@@ -2752,12 +3085,7 @@ async fn handle_terminal_event(
             }
         }
         Event::Paste(text) => {
-            let can_paste = state
-                .settings
-                .as_ref()
-                .map(|flow| flow.editing)
-                .unwrap_or(true);
-            if can_paste {
+            if can_paste(state) {
                 state.dl_cycle = None;
                 state.sf_cycle = None;
                 insert_text(state, &text);
@@ -3228,13 +3556,7 @@ async fn handle_command(
             Err(e) => push_error(state, &format!("Ошибка сериализации профиля: {}", e)),
         },
 
-        "/seed" => push_system(
-            state,
-            &format!(
-                "Seed-фраза (никому не показывайте):\n{}",
-                app.get_seed_phrase()
-            ),
-        ),
+        "/recovery" => start_recovery(state),
 
         "/invite" => match validated_invite_link(app) {
             Ok(link) => {
@@ -3671,6 +3993,150 @@ async fn handle_command(
 // АРГУМЕНТЫ И ГЛАВНЫЙ ЦИКЛ
 // ============================================================
 
+/// Печатает справку по аргументам командной строки.
+fn print_cli_help(program: &str) {
+    println!("LastChance — защищённый мессенджер с TUI.");
+    println!();
+    println!("Использование: {} [--data-dir <path>] [--recovery]", program);
+    println!();
+    println!("Аргументы:");
+    println!("  --data-dir <path>  Каталог профиля (по умолчанию системный или LASTCHANCE_DIR)");
+    println!("  --recovery         Восстановить идентичность из BIP-39 фразы");
+    println!("                     Внимание: перезаписывает текущий identity.json!");
+    println!("  -h, --help         Показать эту справку");
+    println!();
+    println!("Без аргументов запускается обычный клиент: мастер-пароль, затем TUI.");
+}
+
+/// Читает строку с эхом (для мнемонической фразы и подтверждений).
+fn prompt_line(prompt: &str) -> Result<String> {
+    use std::io::Write;
+
+    let mut stdout = io::stdout();
+    write!(stdout, "{}", prompt)?;
+    stdout.flush()?;
+
+    let mut line = String::new();
+    let read = io::stdin().read_line(&mut line)?;
+    if read == 0 {
+        return Err(anyhow!("ввод прерван (EOF)"));
+    }
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
+}
+
+/// Запрашивает подтверждение y/N. По умолчанию (Enter) — отказ.
+fn confirm_overwrite(prompt: &str) -> Result<bool> {
+    let answer = prompt_line(&format!("{} [y/N]: ", prompt))?;
+    Ok(matches!(
+        answer.trim().to_lowercase().as_str(),
+        "y" | "yes" | "д" | "да"
+    ))
+}
+
+/// Стандартная установка нового мастер-пароля: ввод дважды с проверкой длины.
+fn prompt_new_master_password() -> Result<Zeroizing<String>> {
+    loop {
+        let password = read_password("Новый мастер-пароль: ")?;
+        if password.chars().count() < vault::MIN_PASSWORD_LEN {
+            eprintln!(
+                "Пароль должен быть не короче {} символов.",
+                vault::MIN_PASSWORD_LEN
+            );
+            continue;
+        }
+
+        let confirm = read_password("Повторите мастер-пароль: ")?;
+        if password.as_str() != confirm.as_str() {
+            eprintln!("Пароли не совпадают — попробуйте ещё раз.");
+            continue;
+        }
+
+        return Ok(password);
+    }
+}
+
+/// Перешифровывает профиль на новый мастер-пароль при восстановлении
+/// существующей идентичности. Возвращает хранилище с новым ключом.
+fn rekey_profile(base_dir: &str, old_vault: &Vault, new_password: &str) -> Result<Vault> {
+    let old_key = old_vault.key()?;
+    let (new_salt, new_key) = vault::derive_new(new_password)?;
+    let db_exists = std::path::Path::new(base_dir).join(DB_FILE_NAME).exists();
+
+    let rewrite = |from: &vault::MasterKey, to: &vault::MasterKey| -> Result<()> {
+        Config::reencrypt(base_dir, from, to)?;
+        if db_exists {
+            let storage = Storage::new(base_dir, old_vault.clone())?;
+            storage.reencrypt_fields_and_replace_key(from, to)?;
+        } else {
+            old_vault.replace_key(to.clone())?;
+        }
+        Ok(())
+    };
+
+    if let Err(e) = rewrite(&old_key, &new_key) {
+        // Best-effort откат: профиль должен остаться доступным старым паролем.
+        let _ = rewrite(&new_key, &old_key);
+        return Err(e);
+    }
+
+    vault::write_meta(base_dir, &new_salt, &new_key)?;
+    Ok(old_vault.clone())
+}
+
+/// Восстанавливает идентичность из BIP-39 и заново настраивает мастер-пароль.
+fn run_recovery(base_dir: &str) -> Result<Vault> {
+    let identity_path = std::path::Path::new(base_dir).join(IDENTITY_FILE_NAME);
+    if identity_path.exists() {
+        println!("⚠ В профиле уже существует identity.json.");
+        println!("  Продолжение заменит текущую идентичность без возможности отмены.");
+        if !confirm_overwrite("Перезаписать текущую идентичность?")? {
+            return Err(anyhow!("восстановление отменено"));
+        }
+    }
+
+    let identity = loop {
+        let phrase = prompt_line("Мнемоническая фраза BIP-39: ")?;
+        match Identity::from_mnemonic(&phrase, "") {
+            Ok(identity) => break identity,
+            Err(e) => eprintln!("Ошибка: {:#}\nВведите фразу повторно.", e),
+        }
+    };
+
+    let old_vault = if Vault::is_initialized(base_dir)? {
+        println!("Профиль уже существует: нужен текущий мастер-пароль, чтобы сохранить данные.");
+        let mut unlocked = None;
+        for _ in 0..3 {
+            let current = read_password("Текущий мастер-пароль: ")?;
+            match Vault::unlock(base_dir, current.as_str()) {
+                Ok(vault) => {
+                    unlocked = Some(vault);
+                    break;
+                }
+                Err(e) => eprintln!("{:#}", e),
+            }
+        }
+        Some(unlocked.ok_or_else(|| anyhow!("не удалось разблокировать профиль"))?)
+    } else {
+        None
+    };
+
+    let new_password = prompt_new_master_password()?;
+    let vault = match old_vault {
+        Some(old_vault) => rekey_profile(base_dir, &old_vault, new_password.as_str())?,
+        None => Vault::create(base_dir, new_password.as_str())?,
+    };
+
+    let mut manager = IdentityManager::new(base_dir.to_string(), vault.clone());
+    let restored = manager.restore_from_mnemonic(&identity.seed_phrase, &identity.nickname)?;
+    manager.save(&restored)?;
+
+    println!("Идентичность восстановлена.");
+    println!("  hash: {}", restored.hash);
+    println!("  файл: {}", identity_path.display());
+
+    Ok(vault)
+}
+
 /// Разбирает `--data-dir <path>` (и `--data-dir=<path>`) из argv.
 fn parse_data_dir(args: &[String]) -> Result<Option<String>> {
     let mut iter = args.iter().skip(1);
@@ -3867,9 +4333,19 @@ async fn main() -> Result<()> {
     install_panic_hook();
 
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().skip(1).any(|arg| arg == "--help" || arg == "-h") {
+        print_cli_help(&args[0]);
+        return Ok(());
+    }
+
     let data_dir = parse_data_dir(&args)?;
     let base_dir = get_base_dir_with_override(data_dir.as_deref())?;
-    let vault = unlock_vault(&base_dir)?;
+    let recovery = args.iter().skip(1).any(|arg| arg == "--recovery");
+    let vault = if recovery {
+        run_recovery(&base_dir)?
+    } else {
+        unlock_vault(&base_dir)?
+    };
     let config = Config::load(&base_dir, &vault)?;
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<AppEvent>();
     let app = Arc::new(App::new(config, base_dir, vault, event_tx)?);
