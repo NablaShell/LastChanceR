@@ -9,6 +9,8 @@ use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
 use anyhow::{anyhow, Result};
 
+pub mod ratchet;
+
 pub const NONCE_SIZE: usize = 24;
 pub const TAG_SIZE: usize = 16;
 pub const FRAME_HEADER_SIZE: usize = 14;
@@ -39,6 +41,15 @@ pub fn generate_shared_key(my_private_key: &[u8], their_public_key: &[u8]) -> Re
     let public_key = PublicKey::from(public_bytes);
 
     let shared_secret = private_key.diffie_hellman(&public_key);
+
+    // X25519 не кодирует валидность точки в public key. Низкопорядковые
+    // точки дают all-zero shared secret, который нельзя использовать как
+    // ключ (это классический invalid-curve/small-subgroup вектор).
+    if !shared_secret.was_contributory() {
+        return Err(anyhow!(
+            "invalid X25519 public key: shared secret is all-zero (low-order point)"
+        ));
+    }
 
     // HKDF derivation
     let hkdf = Hkdf::<Sha256>::new(None, shared_secret.as_bytes());
@@ -184,6 +195,7 @@ pub const E2E_MAGIC: &[u8; 4] = b"LCE1";
 
 const E2E_KIND_TEXT: u8 = 1;
 const E2E_KIND_SET_TTL: u8 = 2;
+const E2E_KIND_RATCHET_RESET: u8 = 3;
 const E2E_HEADER_MIN: usize = 6; // magic + kind + optional-flag
 
 /// Расшифрованная полезная нагрузка E2E-сообщения.
@@ -197,6 +209,9 @@ pub enum E2ePayload {
     },
     /// Управляющий сигнал двустороннего TTL.
     SetTtl { seconds: Option<u64> },
+    /// Собеседник сбросил сессию Double Ratchet: локальное состояние
+    /// нужно заново инициализировать из общего секрета.
+    RatchetReset,
 }
 
 fn write_optional_u64(out: &mut Vec<u8>, value: Option<u64>) {
@@ -255,10 +270,18 @@ pub fn encode_set_ttl(seconds: Option<u64>) -> Vec<u8> {
     out
 }
 
+/// Собирает управляющий пакет сброса храповика.
+pub fn encode_ratchet_reset() -> Vec<u8> {
+    let mut out = Vec::with_capacity(E2E_HEADER_MIN);
+    out.extend_from_slice(E2E_MAGIC);
+    out.push(E2E_KIND_RATCHET_RESET);
+    out
+}
+
 /// Разбирает полезную нагрузку. Сообщения без магии считаются обычным
 /// текстом: это сохраняет совместимость со старыми клиентами.
 pub fn decode_payload(payload: &[u8]) -> Result<E2ePayload> {
-    if payload.len() < E2E_HEADER_MIN || &payload[..E2E_MAGIC.len()] != E2E_MAGIC {
+    if payload.len() < E2E_MAGIC.len() + 1 || &payload[..E2E_MAGIC.len()] != E2E_MAGIC {
         return Ok(E2ePayload::Text {
             text: String::from_utf8_lossy(payload).to_string(),
             ttl_seconds: None,
@@ -282,6 +305,12 @@ pub fn decode_payload(payload: &[u8]) -> Result<E2ePayload> {
                 return Err(anyhow!("trailing bytes in SetTtl payload"));
             }
             Ok(E2ePayload::SetTtl { seconds })
+        }
+        E2E_KIND_RATCHET_RESET => {
+            if pos != payload.len() {
+                return Err(anyhow!("trailing bytes in RatchetReset payload"));
+            }
+            Ok(E2ePayload::RatchetReset)
         }
         other => Err(anyhow!("unknown e2e payload kind: {}", other)),
     }
@@ -388,6 +417,17 @@ mod tests {
     }
 
     #[test]
+    fn ecdh_rejects_low_order_public_keys() {
+        let alice_secret = StaticSecret::random_from_rng(OsRng);
+        let zero = [0u8; 32];
+        assert!(generate_shared_key(alice_secret.as_bytes(), &zero).is_err());
+
+        let mut one = [0u8; 32];
+        one[0] = 1;
+        assert!(generate_shared_key(alice_secret.as_bytes(), &one).is_err());
+    }
+
+    #[test]
     fn test_message_encryption_decryption() {
         let shared_secret = [42u8; 32];
         let plaintext = b"Hello, World!";
@@ -421,6 +461,14 @@ mod tests {
         assert_eq!(
             decode_payload(&encode_set_ttl(None)).unwrap(),
             E2ePayload::SetTtl { seconds: None }
+        );
+    }
+
+    #[test]
+    fn e2e_ratchet_reset_envelope_round_trips() {
+        assert_eq!(
+            decode_payload(&encode_ratchet_reset()).unwrap(),
+            E2ePayload::RatchetReset
         );
     }
 

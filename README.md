@@ -20,6 +20,8 @@ This is still early software. The code is not audited, the protocol is not final
 - HTTP long-polling for incoming messages.
 - Optional SOCKS5/HTTP proxy support, including `socks5h://` with remote DNS (Tor/I2P).
 - Stealth system notifications that can hide the name of the messenger.
+- Ephemeral messages: a per-room TTL timer (local or synced with the peer) keeps the ratchet state in RAM only.
+- English and Russian interface with a language picker on first launch.
 - A TUI with a help window, a settings wizard, tab completion, input history, mouse scrolling and a file picker.
 
 There is no server bundled with the client. You need to run your own compatible text and file API servers and set their URLs with `/set`.
@@ -66,31 +68,42 @@ files: App ──> encrypt with the room secret ──> file API server
 
 ### Identity
 
-- A 32-byte random seed is encoded as a BIP-39 mnemonic (`/seed`).
+- A 32-byte random seed is encoded as a BIP-39 mnemonic. `/recovery` asks for the current master password, shows the current phrase and can overwrite the identity with a phrase of 12/15/18/21/24 words; restart the client after restoring.
 - Two key pairs are derived from the seed with HKDF-SHA256:
   - X25519 (`X25519_E2EE_Key_v1`) for message/file encryption;
   - Ed25519 (`Ed25519_Auth_Key_v1`) for authentication.
 - The public identity hash is `SHA256(Ed25519 public key)`, hex-encoded.
-- A contact invite contains `hash`, `x25519`, `ed25519` and `nickname`:
+- A contact invite contains the signed canonical CBOR identity document (`doc`) and its Ed25519 signature (`sig`):
 
 ```text
-lastchance://contact?hash=...&x25519=...&ed25519=...&nickname=...
+lastchance://contact?hash=...&doc=<cbor-hex>&sig=<signature-hex>&x25519=...&ed25519=...&nickname=...
 ```
+
+- `doc` encodes `version`, `ed25519_pub`, `x25519_pub`, the optional `nickname` and `created_at` using RFC 8949 deterministic CBOR (sorted keys, minimal integers). `sig` is Ed25519 over the exact `doc` bytes. The `hash`, `x25519`, `ed25519` and `nickname` parameters are unsigned copies and must match the signed document.
+- Imports reject legacy/unsigned links, duplicate parameters, invalid signatures and any `Ed25519 ↔ X25519 ↔ hash` mismatch. The invite fingerprint is `SHA256("lastchance:identity-fingerprint:v1" || ed25519_pub || x25519_pub)`; compare it out-of-band before trusting a contact.
+- Each contact stores its fingerprint and TOFU state (`pending`, `verified` or `changed`). If the X25519 key changes under the same signed Ed25519 identity, the contact is marked `changed` and must be verified again.
+- In the contact manager (`/contacts`, `/cnt`, `/ls`, `/c`), `↑`/`↓` or `j`/`k` select a contact, `Enter` opens the chat, `/` filters, `r` renames, `i` shows the fingerprint and TOFU state, `c` copies the fingerprint, `d` deletes and `q`/`Esc` closes. In the info view, `v` marks the fingerprint as verified after an out-of-band check, while `Esc` or `i` returns to the list.
 
 - `/pull` requests are signed with Ed25519 over `timestamp + identity_hash`; the server receives the public key in `X-Identity-Key`, the timestamp in `X-Timestamp` and the signature in `X-Signature`.
 
 ### Message encryption
 
-- Each contact has a static shared secret: `X25519(my_private, their_public)` followed by HKDF-SHA256 with the `ECDH_v1` label.
-- Messages are encrypted with XChaCha20-Poly1305 using a fresh 24-byte nonce.
-- The plaintext frame is `magic (0x4E53) || session_id (u64) || payload_len (u32) || payload`.
-- The whole frame is padded with random bytes to one of four total packet sizes:
+- Each contact has a static shared secret: `X25519(my_private, their_public)` followed by HKDF-SHA256 with the `ECDH_v1` label. It seeds the Double Ratchet session.
+- ECDH rejects invalid curve points: an all-zero X25519 output (low-order point) aborts the key agreement instead of producing a shared secret.
+- Messages use a Double Ratchet over X25519 ephemeral DH steps, HKDF-SHA256 (`RootKey`, `ChainKey`, `MessageKey`) and XChaCha20-Poly1305 with a fresh 24-byte nonce.
+- The v2 open ratchet header is `version (1) || session_id (16) || bootstrap_nonce (32) || dh_pub (32) || n (u32) || pn (u32)`; the whole header is authenticated as AEAD AAD. Inside the encrypted frame: `payload_len (u32) || payload || random padding`.
+- Every ratchet state gets a fresh CSPRNG `session_id` and `bootstrap_nonce`. Bootstrap keys are derived as `HKDF(salt = bootstrap_nonce, ikm = shared_secret, info = role label)`; the peer derives the same context from the nonce carried in the packet. After a TTL change or `/ratchet-reset` the next session uses new entropy, so a captured bootstrap packet from an old session cannot be accepted by a new one.
+- Destroyed and evicted `session_id` values are remembered and rejected as `StaleSession` even when the AEAD tag is valid. For normal rooms these tombstones are stored in `vault.dat` and survive a client restart; for RAM-TTL rooms they intentionally live only in RAM (H-3) and are lost on restart. The tombstone registry holds up to 128 ids: a `session_id` changes only on reset, TTL transition or session eviction, not on every DH epoch, so 128 entries cover 32 full windows of 4 concurrent sessions. v1 ratchet packets are rejected outright: there is no downgrade path.
+- Received peer `dh_pub` values are remembered per session (last 128). A packet whose `dh_pub` was already accepted but whose epoch has left the 5-epoch window is rejected as `ReplayedDhPub` before any cryptography; the registry is filled only after a successful authentication, and a new session starts with an empty registry. `remote_pub` never rewinds when a packet from an epoch already present in the receive window is accepted. The v2 header has no epoch counter, so a genuine but previously unseen older `dh_pub` is indistinguishable from a new epoch and is accepted as one; it can therefore move `remote_pub` to that authentic older key. Forgery is impossible (AEAD), the effect is bounded by the 5-epoch window, and a complete fix requires an epoch counter in a v3 wire format. The newest epoch is never evicted; when the window is full and nothing but protected epochs remains, decryption fails with `EpochOverflow` and leaves the state untouched.
+- The client keeps a sliding window of the last 5 epochs (plus up to 32 skipped message keys per epoch), so messages sent concurrently or delivered out of order still decrypt. Old epochs and used message keys are wiped with `Zeroizing`.
+- Total packet sizes remain one of:
 
 ```text
 256 B   1024 B   4096 B   65536 B
 ```
 
-- The final packet is `nonce || ciphertext || tag`; only those four exact sizes are accepted.
+- The final ratchet packet is `header || nonce || ciphertext || tag`; only those four exact sizes are accepted. Legacy static-secret frames are still accepted for compatibility with older clients.
+- `/ratchet-reset` forces a fresh session with the active contact and notifies the peer. The reset creates a new `session_id`, `bootstrap_nonce` and bootstrap keys.
 
 This hides the exact message length inside one of four size classes. It does not hide the size class itself.
 
@@ -120,8 +133,9 @@ On first launch the client asks for a master password (minimum 8 characters). Th
 - The master key is derived with Argon2id (19 MiB, 2 passes, 1 lane) and kept in memory inside `Zeroizing`.
 - `vault.check` is an encrypted marker used to detect a wrong password.
 - `identity.json` and `global.conf` are sealed as `LCVAULT1 || nonce || ciphertext || tag` with XChaCha20-Poly1305 and associated data.
-- Contacts, rooms, messages and file records live in an in-memory SQLite database; nothing is ever written to `user.db`, `user.db-wal` or `user.db-shm`.
+- Contacts, rooms, messages, file records and normal Double Ratchet sessions live in an in-memory SQLite database; nothing is ever written to `user.db`, `user.db-wal` or `user.db-shm`.
 - On every change the whole database is serialized, padded with random bytes to a multiple of 4096 and sealed with XChaCha20-Poly1305 into `vault.dat` as `nonce || ciphertext || tag`; no magic bytes or open headers are stored on disk. The schema version and payload length sit inside the encrypted block.
+- Rooms with an active `/ttl` or `/ttl-syn` timer keep the ratchet state strictly in RAM: it is never written to `vault.dat` and is wiped when TTL is disabled or the client exits.
 - `vault.dat` is replaced atomically through a temporary file and receives mode `0600` on Unix.
 - A legacy plaintext `user.db` is imported on first open, after which `user.db`, `user.db-wal` and `user.db-shm` are overwritten with zeros and deleted.
 - Files created by the client are written with mode `0600` on Unix; a read-only fallback is used where POSIX permissions are unavailable.
@@ -211,10 +225,9 @@ Type a normal line to send it to the active room. Lines starting with `/` are co
 | Command | Description |
 | --- | --- |
 | `/help`, `/h`, `/?` | Open the scrollable help window (same as `F1`) |
-| `/contacts`, `/ls`, `/c` | List contacts |
-| `/join`, `/jn <link>` | Add a contact from a `lastchance://contact?...` link and open the chat |
-| `/join <hash> <x25519> <nickname>` | Add a contact manually |
-| `/join -f <path>` | Add a contact from an invite file |
+| `/contacts`, `/cnt`, `/ls`, `/c` | Contact manager: `↑`/`↓` or `j`/`k` select, `Enter` opens the chat, `/` filters, `r` renames, `i` shows info, `c` copies the fingerprint, `d` deletes, `q`/`Esc` closes |
+| `/join`, `/jn <link>` | Verify a signed `lastchance://contact?...` link and open the import confirmation dialog |
+| `/join -f <path>` | Verify a signed invite from a file and open the import confirmation dialog |
 | `/room`, `/r [hash \| nick]` | Show or switch the active room |
 | `/sidebar`, `/sb` | Hide or show the chat sidebar |
 
@@ -223,6 +236,9 @@ Type a normal line to send it to the active room. Lines starting with `/` are co
 | Command | Description |
 | --- | --- |
 | `/messages [limit]` | Show recent messages of the active room (default 50) |
+| `/ttl [duration\|off]` | One-way TTL for new messages in the active room; without an argument — show the status |
+| `/ttl-syn [duration\|off]` | Two-way TTL: the peer receives the same timer in an encrypted `SetTtl` control packet |
+| `/ratchet-reset` | Reset the Double Ratchet session with the active contact and notify the peer |
 | `/sendfile`, `/sf [--force] <path>` | Encrypt and upload a file |
 | `/download`, `/dl [id \| name \| hash] [path]` | Download a file from the active room |
 | `/set`, `/settings` | Open the interactive settings window |
@@ -230,12 +246,15 @@ Type a normal line to send it to the active room. Lines starting with `/` are co
 | `/set test` | Show a test notification |
 | `/passwd` | Change the master password and re-encrypt local data |
 
+TTL durations accept `off`, a number with an `s`, `m` or `h` suffix (`30s`, `5m`, `2h`), or plain seconds; zero is rejected. TTL rooms keep the ratchet state in RAM only, and the timer is wiped when TTL is disabled or the client exits. `/ttl-syn` starts a new ratchet session after any change, and `/ttl off` also resets it with the peer.
+
 ### Profile
 
 | Command | Description |
 | --- | --- |
 | `/profile`, `/p` | Show nickname, hash and public keys as JSON |
-| `/seed` | Show the BIP-39 seed phrase (keep it secret) |
+| `/recovery` | Show the current BIP-39 phrase after confirming the master password; `Tab`/`r` then starts an overwrite: confirm, enter a new 12/15/18/21/24-word phrase and restart the client |
+| `/lang [en\|ru]` | Switch the interface language; without an argument — toggle it |
 | `/invite`, `/in [-f [dir \| file]]` | Copy the invite link; with `-f`, also save it to `<nickname>_lastchance.invite` |
 | `/export` | Print your contact as JSON |
 | `/nick <name>` | Change your nickname |
@@ -280,8 +299,11 @@ The settings window has these fields:
 | `Stealth Title` | Notification title in stealth mode |
 | `Stealth Body` | Notification body in stealth mode |
 | `Stealth Seconds` | Value substituted for `{sec}` |
+| `Language` | Interface language: `English` or `Русский` |
 
-Controls: `Up`/`Down` or `Tab`/`Shift+Tab` select a field, `Enter` edits it, `Esc` cancels editing. In the editing prompt, `Enter` applies and `Esc` cancels. On the `Notify Level` row, `Left`/`Right` or `Space` cycles the value. `Esc` outside editing saves and closes the window.
+Controls: `Up`/`Down` or `Tab`/`Shift+Tab` select a field, `Enter` edits it, `Esc` cancels editing. In the editing prompt, `Enter` applies and `Esc` cancels. On the `Notify Level` and `Language` rows, `Left`/`Right` or `Space` cycles the value. `Esc` outside editing saves and closes the window.
+
+On first launch, when the config has no `lang` field yet, a welcome modal asks to choose the interface language (`←`/`→` or `1`/`2`, `Enter` confirms).
 
 The defaults point at `https://msg.example.com` and `https://files.example.com`; set your real server URLs before chatting.
 
@@ -361,7 +383,7 @@ On first launch you will be asked to create a master password. On later launches
 
 ## Security notes and limitations
 
-- The shared secret is static per contact. There is no Double Ratchet, no per-message forward secrecy and no post-compromise security. If a long-term private key leaks, previously captured traffic for that contact can be decrypted.
+- The shared secret is static per contact and seeds every ratchet session. Each session adds fresh `session_id`/`bootstrap_nonce` entropy and ephemeral DH epochs, so session keys are not reused and captured packets cannot be replayed into a new session. Bootstrap keys are nevertheless derived from the long-term shared secret: an attacker who records a session's first packet and later obtains that secret can recompute its bootstrap root. There is no post-compromise security, and true first-message forward secrecy would require an interactive prekey/response handshake. For normal rooms destroyed session ids are persisted in `vault.dat`, so replay of a reset session stays blocked across restarts. For RAM-TTL rooms the list of destroyed session ids lives only in RAM (for the lifetime of the process), so after a client restart a replayed first packet is indistinguishable from first contact (the same TOFU boundary as the very first session). The per-session `dh_pub` registry is bounded to 128 keys: beyond that horizon an ancient key would again look new, but its local DH private key has already left the 5-epoch send window, so the packet still cannot be decrypted. Finally, the v2 header has no epoch counter: a genuine first-seen `dh_pub` from an older epoch is accepted as a new epoch and may move `remote_pub` back to that authentic key. This is a limited denial-of-progress inside the 5-epoch window, not forgery; a v3 epoch counter would close it.
 - The server still learns the recipient identity hash, traffic timing, packet size class and the file blob size. Use Tor/I2P and your own servers if that metadata matters to you.
 - Local metadata such as contact hashes, public keys and timestamps is not encrypted; message bodies, nicknames and file names are.
 - The seed phrase is the identity. Anyone who obtains it can impersonate you and read your chats. The master password protects local data only; there is no password recovery.
@@ -390,6 +412,8 @@ LastChance — мессенджер на Rust с фокусом на прива�
 - HTTP Long-Polling для входящих сообщений.
 - Необязательный прокси SOCKS5/HTTP, включая `socks5h://` с удалённым DNS (Tor/I2P).
 - Stealth-уведомления, скрывающие название мессенджера.
+- Эфемерные сообщения: TTL-таймер для комнаты (локальный или синхронизированный с собеседником) держит состояние храповика только в RAM.
+- Интерфейс на английском и русском с выбором языка при первом запуске.
 - TUI с окном справки, мастером настроек, автодополнением, историей ввода, прокруткой мышью и выбором файлов.
 
 Сервер в комплект не входит. Нужно поднять совместимые текстовый и файловый API-серверы и указать их адреса через `/set`.
@@ -430,31 +454,42 @@ LastChance — мессенджер на Rust с фокусом на прива�
 
 ### Идентичность
 
-- 32 случайных байта кодируются в BIP-39 мнемонику (`/seed`).
+- 32 случайных байта кодируются в BIP-39 мнемонику. `/recovery` запрашивает текущий мастер-пароль, показывает текущую фразу и позволяет перезаписать идентичность фразой из 12/15/18/21/24 слов; после восстановления перезапустите клиент.
 - Из seed через HKDF-SHA256 выводятся две пары ключей:
   - X25519 (`X25519_E2EE_Key_v1`) — для шифрования сообщений и файлов;
   - Ed25519 (`Ed25519_Auth_Key_v1`) — для аутентификации.
 - Публичный хеш идентичности — `SHA256(Ed25519 public key)` в hex.
-- Инвайт-ссылка содержит `hash`, `x25519`, `ed25519` и `nickname`:
+- Инвайт-ссылка содержит подписанный канонический CBOR-документ идентичности (`doc`) и его Ed25519-подпись (`sig`):
 
 ```text
-lastchance://contact?hash=...&x25519=...&ed25519=...&nickname=...
+lastchance://contact?hash=...&doc=<cbor-hex>&sig=<signature-hex>&x25519=...&ed25519=...&nickname=...
 ```
+
+- `doc` кодирует `version`, `ed25519_pub`, `x25519_pub`, необязательный `nickname` и `created_at` в детерминированном CBOR по RFC 8949 (отсортированные ключи, минимальные целые). `sig` — Ed25519-подпись ровно над байтами `doc`. Параметры `hash`, `x25519`, `ed25519` и `nickname` — неподписанные копии и обязаны совпадать с подписанным документом.
+- Импорт отклоняет старые/неподписанные ссылки, дублирующиеся параметры, неверную подпись и любое несоответствие `Ed25519 ↔ X25519 ↔ hash`. Отпечаток инвайта — `SHA256("lastchance:identity-fingerprint:v1" || ed25519_pub || x25519_pub)`; сверяйте его по независимому каналу до того, как доверять контакту.
+- Для каждого контакта хранятся отпечаток и состояние TOFU (`pending`, `verified` или `changed`). Если X25519-ключ меняется при той же подписанной Ed25519-идентичности, контакт помечается как `changed` и требует повторной проверки.
+- В менеджере контактов (`/contacts`, `/cnt`, `/ls`, `/c`) клавиши `↑`/`↓` или `j`/`k` выбирают контакт, `Enter` открывает чат, `/` включает фильтр, `r` переименовывает, `i` показывает отпечаток и состояние TOFU, `c` копирует отпечаток, `d` удаляет, `q`/`Esc` закрывает. В окне информации `v` отмечает отпечаток проверенным после сверки вне канала, а `Esc` или `i` возвращают к списку.
 
 - Запросы `/pull` подписываются Ed25519 над строкой `timestamp + identity_hash`. Сервер получает публичный ключ в `X-Identity-Key`, время в `X-Timestamp`, подпись в `X-Signature`.
 
 ### Шифрование сообщений
 
-- Для каждого контакта вычисляется статический общий секрет: `X25519(мой_private, его_public)`, затем HKDF-SHA256 с меткой `ECDH_v1`.
-- Сообщения шифруются XChaCha20-Poly1305 со свежим 24-байтным nonce.
-- Открытый кадр: `magic (0x4E53) || session_id (u64) || payload_len (u32) || payload`.
-- Кадр добивается случайными байтами до одного из четырёх размеров:
+- Для каждого контакта вычисляется статический общий секрет: `X25519(мой_private, его_public)`, затем HKDF-SHA256 с меткой `ECDH_v1`. Он инициализирует сессию Double Ratchet.
+- ECDH отклоняет некорректные точки: полностью нулевой выход X25519 (точка малого порядка) прерывает согласование ключа вместо выдачи общего секрета.
+- Сообщения используют Double Ratchet поверх эфемерных X25519 DH-шагов, HKDF-SHA256 (`RootKey`, `ChainKey`, `MessageKey`) и XChaCha20-Poly1305 со свежим 24-байтным nonce.
+- Открытый заголовок храповика v2: `version (1) || session_id (16) || bootstrap_nonce (32) || dh_pub (32) || n (u32) || pn (u32)`; заголовок целиком аутентифицируется как AEAD AAD. Внутри шифротекста: `payload_len (u32) || payload || случайный паддинг`.
+- Каждое состояние храповика получает свежие `session_id` и `bootstrap_nonce` из CSPRNG. Bootstrap-ключи выводятся как `HKDF(salt = bootstrap_nonce, ikm = shared_secret, info = метка роли)`; собеседник строит тот же контекст из nonce в пакете. После смены TTL или `/ratchet-reset` следующая сессия использует новую энтропию, поэтому перехваченный bootstrap-пакет старой сессии не может быть принят новой.
+- Уничтоженные и вытесненные `session_id` запоминаются и отклоняются как `StaleSession`, даже если AEAD-тег валиден. Для обычных комнат tombstone-и пишутся в `vault.dat` и переживают перезапуск клиента; для RAM-TTL комнат они намеренно живут только в RAM (H-3) и теряются при перезапуске. Реестр хранит до 128 id: `session_id` меняется только при reset, TTL-переходе или вытеснении сессии, а не на каждой DH-эпохе, поэтому 128 записей покрывают 32 полных окна из 4 одновременных сессий. Пакеты v1 отклоняются без режима совместимости: downgrade невозможен.
+- Принятые `dh_pub` собеседника запоминаются на сессию (последние 128). Пакет, чей `dh_pub` уже принимался, но чья эпоха вышла из окна в 5 эпох, отклоняется как `ReplayedDhPub` ещё до криптографии; реестр пополняется только после успешной аутентификации, а новая сессия начинает с пустого реестра. `remote_pub` не откатывается, когда принимается пакет эпохи, уже присутствующей в окне приёма. В заголовке v2 нет счётчика эпох, поэтому подлинный, но впервые увиденный старый `dh_pub` неотличим от новой эпохи и принимается как новая; он может сдвинуть `remote_pub` на этот подлинный старый ключ. Подделка невозможна (AEAD), эффект ограничен окном в 5 эпох, а полное решение требует счётчика эпох в wire-format v3. Самая новая эпоха не вытесняется никогда; если окно заполнено и защищены все эпохи, приём завершается `EpochOverflow`, не меняя состояние.
+- Клиент держит скользящее окно из 5 последних эпох (и до 32 пропущенных ключей на эпоху), поэтому одновременные и пришедшие не по порядку сообщения расшифровываются. Старые эпохи и использованные ключи сообщений затираются через `Zeroizing`.
+- Итоговый размер пакета по-прежнему один из:
 
 ```text
 256 Б   1024 Б   4096 Б   65536 Б
 ```
 
-- Итоговый пакет — `nonce || ciphertext || tag`; принимаются только эти четыре точных размера.
+- Итоговый пакет — `header || nonce || ciphertext || tag`; принимаются только эти четыре точных размера. Старые кадры со статическим секретом всё ещё принимаются для совместимости.
+- `/ratchet-reset` принудительно создаёт новую сессию с активным контактом и уведомляет собеседника. Reset генерирует новые `session_id`, `bootstrap_nonce` и bootstrap-ключи.
 
 Так скрывается точная длина сообщения внутри класса размера, но не сам класс.
 
@@ -482,8 +517,9 @@ lastchance://contact?hash=...&x25519=...&ed25519=...&nickname=...
 - Мастер-ключ выводится через Argon2id (19 МиБ, 2 прохода, 1 поток) и хранится в памяти внутри `Zeroizing`.
 - `vault.check` — зашифрованный маркер для проверки пароля.
 - `identity.json` и `global.conf` целиком шифруются как `LCVAULT1 || nonce || ciphertext || tag` с XChaCha20-Poly1305 и associated data.
-- Контакты, комнаты, сообщения и файловые записи живут в SQLite исключительно в оперативной памяти; на диск никогда не пишутся `user.db`, `user.db-wal` или `user.db-shm`.
+- Контакты, комнаты, сообщения, файловые записи и обычные сессии Double Ratchet живут в SQLite исключительно в оперативной памяти; на диск никогда не пишутся `user.db`, `user.db-wal` или `user.db-shm`.
 - При каждом изменении вся база сериализуется, дополняется случайным паддингом до размера, кратного 4096, и шифруется XChaCha20-Poly1305 в `vault.dat` как `nonce || ciphertext || tag`; магические байты и открытые заголовки на диск не попадают. Версия схемы и длина полезной нагрузки хранятся внутри зашифрованного блока.
+- Комнаты с активным `/ttl` или `/ttl-syn` держат состояние храповика строго в RAM: оно не попадает в `vault.dat` и затирается при отключении TTL или выходе из клиента.
 - `vault.dat` заменяется атомарно через временный файл и получает права `0600` на Unix.
 - Старая открытая `user.db` импортируется при первом открытии, после чего `user.db`, `user.db-wal` и `user.db-shm` перезаписываются нулями и удаляются.
 - Созданные клиентом файлы получают права `0600` на Unix; там, где POSIX-права недоступны, используется read-only заглушка.
@@ -567,10 +603,9 @@ Seconds: 10
 | Команда | Описание |
 | --- | --- |
 | `/help`, `/h`, `/?` | Открыть прокручиваемую справку (как `F1`) |
-| `/contacts`, `/ls`, `/c` | Список контактов |
-| `/join`, `/jn <link>` | Добавить контакт по ссылке `lastchance://contact?...` и открыть чат |
-| `/join <hash> <x25519> <nickname>` | Добавить контакт вручную |
-| `/join -f <path>` | Добавить контакт из файла-инвайта |
+| `/contacts`, `/cnt`, `/ls`, `/c` | Менеджер контактов: `↑`/`↓` или `j`/`k` — выбор, `Enter` — открыть чат, `/` — фильтр, `r` — переименовать, `i` — информация, `c` — копировать отпечаток, `d` — удалить, `q`/`Esc` — закрыть |
+| `/join`, `/jn <link>` | Проверить подписанную ссылку `lastchance://contact?...` и открыть диалог подтверждения импорта |
+| `/join -f <path>` | Проверить подписанный инвайт из файла и открыть диалог подтверждения импорта |
 | `/room`, `/r [hash \| nick]` | Показать или сменить активную комнату |
 | `/sidebar`, `/sb` | Скрыть или показать панель чатов |
 
@@ -579,6 +614,9 @@ Seconds: 10
 | Команда | Описание |
 | --- | --- |
 | `/messages [limit]` | Последние сообщения активной комнаты (по умолчанию 50) |
+| `/ttl [duration\|off]` | Односторонний TTL для новых сообщений в активной комнате; без аргумента — показать состояние |
+| `/ttl-syn [duration\|off]` | Двусторонний TTL: собеседник получает тот же таймер в зашифрованном управляющем пакете `SetTtl` |
+| `/ratchet-reset` | Сбросить сессию Double Ratchet с активным контактом и уведомить собеседника |
 | `/sendfile`, `/sf [--force] <path>` | Зашифровать и загрузить файл |
 | `/download`, `/dl [id \| name \| hash] [path]` | Скачать файл активной комнаты |
 | `/set`, `/settings` | Открыть интерактивные настройки |
@@ -586,12 +624,15 @@ Seconds: 10
 | `/set test` | Показать тестовое уведомление |
 | `/passwd` | Сменить мастер-пароль и перешифровать локальные данные |
 
+Длительность TTL принимает `off`, число с суффиксом `s`, `m` или `h` (`30s`, `5m`, `2h`) либо секунды без суффикса; ноль отклоняется. TTL-комнаты держат состояние храповика только в RAM, а таймер затирается при отключении TTL или выходе из клиента. `/ttl-syn` запускает новую сессию храповика после любого изменения, а `/ttl off` дополнительно сбрасывает её с собеседником.
+
 ### Профиль
 
 | Команда | Описание |
 | --- | --- |
 | `/profile`, `/p` | Ник, хеш и публичные ключи в JSON |
-| `/seed` | Показать BIP-39 seed-фразу (никому не показывайте) |
+| `/recovery` | Показать текущую BIP-39 фразу после подтверждения мастер-пароля; `Tab`/`r` затем запускает перезапись: подтверждение, ввод новой фразы из 12/15/18/21/24 слов и перезапуск клиента |
+| `/lang [en\|ru]` | Переключить язык интерфейса; без аргумента — сменить текущий |
 | `/invite`, `/in [-f [dir \| file]]` | Скопировать инвайт-ссылку; с `-f` сохранить в `<ник>_lastchance.invite` |
 | `/export` | Вывести свой контакт в JSON |
 | `/nick <name>` | Сменить свой ник |
@@ -623,7 +664,7 @@ Seconds: 10
 
 ### `/set`
 
-В окне настроек девять полей:
+В окне настроек десять полей:
 
 | Поле | Значение |
 | --- | --- |
@@ -636,8 +677,11 @@ Seconds: 10
 | `Stealth Title` | Заголовок уведомления в stealth-режиме |
 | `Stealth Body` | Тело уведомления в stealth-режиме |
 | `Stealth Seconds` | Значение для `{sec}` |
+| `Language` | Язык интерфейса: `English` или `Русский` |
 
-Управление: `Up`/`Down` или `Tab`/`Shift+Tab` — выбор поля, `Enter` — редактировать, `Esc` — отменить редактирование. В режиме ввода `Enter` применяет значение, `Esc` отменяет. На строке `Notify Level` клавиши `Left`/`Right` или `Space` переключают значение. `Esc` вне редактирования сохраняет и закрывает окно.
+Управление: `Up`/`Down` или `Tab`/`Shift+Tab` — выбор поля, `Enter` — редактировать, `Esc` — отменить редактирование. В режиме ввода `Enter` применяет значение, `Esc` отменяет. На строках `Notify Level` и `Language` клавиши `Left`/`Right` или `Space` переключают значение. `Esc` вне редактирования сохраняет и закрывает окно.
+
+При первом запуске, если в конфиге ещё нет поля `lang`, приветственное окно предлагает выбрать язык интерфейса (`←`/`→` или `1`/`2`, `Enter` подтверждает).
 
 По умолчанию указаны `https://msg.example.com` и `https://files.example.com`; перед началом переписки задайте реальные адреса серверов.
 
@@ -711,7 +755,7 @@ chmod +x lastchance-linux-x86_64
 
 ## Безопасность и ограничения
 
-- Общий секрет статический для каждого контакта. Здесь нет Double Ratchet, посуточной forward secrecy и post-compromise security. При утечке долговременного приватного ключа ранее перехваченный трафик этого контакта можно расшифровать.
+- Общий секрет статический для каждого контакта и инициализирует каждую сессию Double Ratchet. Свежие `session_id`/`bootstrap_nonce` и эфемерные DH-эпохи не дают переиспользовать ключи между сессиями и воспроизводить старые пакеты в новую сессию. Однако bootstrap-ключи по-прежнему выводятся из долговременного общего секрета: перехвативший первый пакет сессии и позже получивший этот секрет сможет восстановить её bootstrap-root. Post-compromise security отсутствует; настоящая forward secrecy на первом сообщении требует интерактивного prekey/ответного хендшейка. Для обычных комнат уничтоженные `session_id` пишутся в `vault.dat`, поэтому replay сброшенной сессии блокируется и после перезапуска. Для RAM-TTL комнат список уничтоженных `session_id` живёт только в RAM (в пределах жизни процесса), поэтому после перезапуска клиента повторно поданный первый пакет неотличим от первого контакта (та же граница TOFU, что и у самой первой сессии). Реестр `dh_pub` ограничен 128 ключами на сессию: за этим горизонтом древний ключ снова выглядит новым, но его локальный DH-приватный ключ уже покинул окно отправки в 5 эпох, поэтому расшифровать пакет всё равно не получится. Наконец, в заголовке v2 нет счётчика эпох: подлинный впервые увиденный `dh_pub` старой эпохи принимается как новая эпоха и может сдвинуть `remote_pub` на этот подлинный ключ. Это ограниченный отказ в продвижении внутри окна из 5 эпох, а не подделка; счётчик эпох в v3 закрыл бы и его.
 - Сервер по-прежнему узнаёт хеш получателя, тайминг, класс размера пакета и размер файлового блока. Если это важно, используйте Tor/I2P и собственные серверы.
 - Локальные метаданные (хеши контактов, публичные ключи, время) не шифруются; тела сообщений, ники и имена файлов — шифруются.
 - Seed-фраза — это идентичность. Тот, кто её получил, может выдать себя за вас и читать ваши чаты. Мастер-пароль защищает только локальные данные; восстановления пароля нет.

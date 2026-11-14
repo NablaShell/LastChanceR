@@ -7,12 +7,18 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
+use zeroize::Zeroizing;
 
 use crate::crypto;
+use crate::crypto::ratchet::{self, RatchetState, Role as RatchetRole};
 use crate::i18n::{tr, Lang};
-use crate::identity::{Identity, IdentityManager};
+use crate::identity::{
+    hash_ed25519_public, Identity, IdentityDoc, IdentityInvite, IdentityManager,
+};
 use crate::network::{Config, Listener, Sender};
-use crate::storage::{Contact, Message, SafeFSOps, Storage};
+use crate::storage::{
+    Contact, Message, SafeFSOps, Storage, TOFU_CHANGED, TOFU_PENDING, TOFU_VERIFIED,
+};
 use crate::vault::{self, MasterKey, Vault};
 
 // ============================================================
@@ -38,10 +44,7 @@ pub enum AppEvent {
         from_peer: bool,
     },
     ContactImport {
-        hash: String,
-        x25519: String,
-        ed25519: Option<String>,
-        nickname: String,
+        invite: IdentityInvite,
     },
     ContactImportError {
         error: String,
@@ -82,6 +85,21 @@ pub struct RoomTtl {
     pub synced: bool,
 }
 
+/// Результат импорта подписанного invite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContactImportOutcome {
+    pub hash: String,
+    pub nickname: String,
+    pub fingerprint: String,
+    pub tofu_state: String,
+    /// X25519-ключ отличается от сохранённого (TOFU `changed`).
+    pub x25519_changed: bool,
+}
+
+/// `session_id` уничтоженных храповиков по hash комнаты. Держится только
+/// в оперативной памяти и не сериализуется.
+type RetiredRatchetSessions = Arc<Mutex<HashMap<String, Vec<[u8; 16]>>>>;
+
 pub struct App {
     config: RwLock<Config>,
     base_dir: String,
@@ -91,7 +109,15 @@ pub struct App {
     pub identity: Identity,
 
     shared_secrets: Arc<Mutex<HashMap<String, [u8; 32]>>>,
-    session_id: Arc<Mutex<u64>>,
+    /// Состояния Double Ratchet. Для обычных комнат они сохраняются в
+    /// `vault.dat`, для комнат с RAM-TTL остаются только здесь.
+    ratchets: Arc<Mutex<HashMap<String, RatchetState>>>,
+
+    /// `session_id` уничтоженных храповиков (reset, выключение TTL).
+    /// RAM-кэш; для обычных комнат дублируется в `vault.dat` и
+    /// восстанавливается при старте. Запоздавший bootstrap-пакет старой
+    /// сессии не должен приниматься как новая сессия (H-1/H-2).
+    retired_ratchet_sessions: RetiredRatchetSessions,
 
     sender: Arc<Sender>,
     listener: Arc<Listener>,
@@ -114,6 +140,19 @@ pub struct App {
 /// Текущее Unix-время в секундах, безопасно приведённое к `u64`.
 fn now_timestamp() -> u64 {
     chrono::Utc::now().timestamp().max(0) as u64
+}
+
+/// Обрезает UTF-8 строку до `max` байт, не разрывая символ.
+fn truncate_utf8(value: &str, max: usize) -> String {
+    if value.len() <= max {
+        return value.to_string();
+    }
+
+    let mut end = max;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
 }
 
 /// Разворачивает `~` и `~/...` в домашнюю директорию пользователя.
@@ -227,6 +266,228 @@ fn resolve_upload_path(raw: &str, force: bool, lang: Lang) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Роль стороны в Double Ratchet. Обе стороны сравнивают одинаковые hash,
+/// поэтому выбирают согласованные bootstrap-ключи.
+fn ratchet_role_for(identity_hash: &str, room_hash: &str) -> RatchetRole {
+    if room_hash == identity_hash {
+        RatchetRole::SelfChat
+    } else if identity_hash < room_hash {
+        RatchetRole::Initiator
+    } else {
+        RatchetRole::Responder
+    }
+}
+
+fn room_has_ttl(
+    room_ttls: &Arc<Mutex<HashMap<String, RoomTtl>>>,
+    room_hash: &str,
+) -> bool {
+    room_ttls
+        .lock()
+        .ok()
+        .and_then(|ttls| ttls.get(room_hash).and_then(|ttl| ttl.seconds))
+        .is_some()
+}
+
+/// Возвращает `session_id`, которые уже уничтожены для комнаты.
+fn retired_sessions_for(
+    retired: &RetiredRatchetSessions,
+    room_hash: &str,
+) -> Vec<[u8; 16]> {
+    retired
+        .lock()
+        .ok()
+        .and_then(|sessions| sessions.get(room_hash).cloned())
+        .unwrap_or_default()
+}
+
+/// Переносит tombstone-и комнаты в `vault.dat` либо удаляет их.
+///
+/// Для комнаты с активным RAM-TTL `session_id` на диск не пишутся (H-3):
+/// такие комнаты теряют replay-защиту сессий после перезапуска, что
+/// зафиксировано в threat model.
+fn persist_retired_sessions(
+    storage: &Storage,
+    retired: &RetiredRatchetSessions,
+    ttl_active: bool,
+    room_hash: &str,
+) -> Result<()> {
+    let session_ids = retired_sessions_for(retired, room_hash);
+    if ttl_active {
+        storage.delete_retired_ratchet_sessions(room_hash)
+    } else {
+        storage.save_retired_ratchet_sessions(room_hash, &session_ids)
+    }
+}
+
+/// Запоминает уничтоженные `session_id` комнаты.
+fn remember_retired_sessions(
+    retired: &RetiredRatchetSessions,
+    room_hash: &str,
+    session_ids: impl IntoIterator<Item = [u8; 16]>,
+) {
+    let Ok(mut sessions) = retired.lock() else {
+        return;
+    };
+    let entry = sessions.entry(room_hash.to_string()).or_default();
+    for session_id in session_ids {
+        if entry.contains(&session_id) {
+            continue;
+        }
+        entry.push(session_id);
+        if entry.len() > ratchet::MAX_RETIRED_SESSIONS {
+            entry.remove(0);
+        }
+    }
+}
+
+/// Загружает состояние из `vault.dat` либо создаёт новую сессию.
+///
+/// Для комнат с активным RAM-TTL диск не читается и не пишется.
+#[allow(clippy::too_many_arguments)]
+fn ensure_ratchet_state(
+    states: &mut HashMap<String, RatchetState>,
+    room_hash: &str,
+    shared_secret: &[u8; 32],
+    identity_hash: &str,
+    storage: &Storage,
+    ttl_active: bool,
+    retired: &[[u8; 16]],
+) -> Result<()> {
+    if states.contains_key(room_hash) {
+        return Ok(());
+    }
+
+    let restored = if ttl_active {
+        None
+    } else {
+        match storage.load_ratchet_state(room_hash) {
+            Ok(state) => state,
+            Err(e) => {
+                warn!("Failed to load ratchet state: {:#}", e);
+                None
+            }
+        }
+    };
+
+    let role = ratchet_role_for(identity_hash, room_hash);
+    let state = match restored {
+        Some(bytes) => match RatchetState::from_bytes(&bytes) {
+            Ok(mut state) => {
+                state.retire_sessions(retired.iter().copied());
+                state
+            }
+            Err(e) => {
+                warn!("Ignoring unreadable ratchet state: {:#}", e);
+                RatchetState::new_with_retired(shared_secret, role, retired.to_vec())?
+            }
+        },
+        None => RatchetState::new_with_retired(shared_secret, role, retired.to_vec())?,
+    };
+
+    states.insert(room_hash.to_string(), state);
+    Ok(())
+}
+
+/// H-3: единая точка записи состояния храповика.
+///
+/// При `ttl_active == true` снапшот не пишется никогда, независимо от
+/// того, какой путь вызвал сохранение. TTL-комната держит ratchet в RAM.
+fn persist_ratchet(
+    ttl_active: bool,
+    storage: &Storage,
+    room_hash: &str,
+    state: &[u8],
+) -> Result<()> {
+    if ttl_active {
+        return Ok(());
+    }
+    storage.save_ratchet_state(room_hash, state)
+}
+
+/// Открытый текст и обновлённое состояние храповика после расшифровки.
+type DecryptedRatchet = (Vec<u8>, Option<Zeroizing<Vec<u8>>>);
+
+/// Расшифровывает пакет и возвращает открытый текст вместе с обновлённым
+/// состоянием храповика (если оно подлежит сохранению).
+///
+/// Состояние намеренно не пишется здесь: вызывающий сначала обрабатывает
+/// полезную нагрузку (например, `SetTtl`), затем решает, нужен ли снапшот.
+#[allow(clippy::too_many_arguments)]
+fn try_ratchet_decrypt(
+    packet: &[u8],
+    room_hash: &str,
+    shared_secret: &[u8; 32],
+    identity_hash: &str,
+    storage: &Arc<Storage>,
+    ratchets: &Arc<Mutex<HashMap<String, RatchetState>>>,
+    retired_sessions: &RetiredRatchetSessions,
+    ttl_active: bool,
+) -> Option<DecryptedRatchet> {
+    let retired = retired_sessions_for(retired_sessions, room_hash);
+
+    let (plaintext, serialized) = {
+        let mut states = ratchets.lock().ok()?;
+        ensure_ratchet_state(
+            &mut states,
+            room_hash,
+            shared_secret,
+            identity_hash,
+            storage,
+            ttl_active,
+            &retired,
+        )
+        .ok()?;
+
+        let state = states.get_mut(room_hash)?;
+        match state.decrypt(packet, shared_secret) {
+            Ok(plaintext) => {
+                let serialized = if ttl_active {
+                    None
+                } else {
+                    state.to_bytes().ok()
+                };
+                (plaintext, serialized)
+            }
+            Err(_) => return None,
+        }
+    };
+
+    Some((plaintext, serialized))
+}
+
+fn clear_ratchet_state(
+    ratchets: &Arc<Mutex<HashMap<String, RatchetState>>>,
+    storage: &Arc<Storage>,
+    retired_sessions: &RetiredRatchetSessions,
+    room_ttls: &Arc<Mutex<HashMap<String, RoomTtl>>>,
+    room_hash: &str,
+) {
+    // Удаление из HashMap запускает Drop для Zeroizing-ключей. Перед этим
+    // запоминаем id сессий, чтобы запоздавший пакет не был принят снова.
+    let session_ids = if let Ok(mut states) = ratchets.lock() {
+        states
+            .remove(room_hash)
+            .map(|state| state.session_ids())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    remember_retired_sessions(retired_sessions, room_hash, session_ids);
+
+    // Сначала фиксируем tombstone-и, затем удаляем состояние: сбой записи
+    // оставляет старую сессию на диске, а не теряет защиту от replay.
+    let ttl_active = room_has_ttl(room_ttls, room_hash);
+    if let Err(e) = persist_retired_sessions(storage, retired_sessions, ttl_active, room_hash) {
+        warn!("Failed to persist retired ratchet sessions: {:#}", e);
+        return;
+    }
+
+    if let Err(e) = storage.delete_ratchet_state(room_hash) {
+        warn!("Failed to delete ratchet state: {:#}", e);
+    }
+}
+
 impl App {
     pub fn new(
         config: Config,
@@ -241,6 +502,28 @@ impl App {
 
         // Initialize storage
         let storage = Arc::new(Storage::new(&base_dir, vault.clone())?);
+
+        // Tombstone-и переживают перезапуск: без них запоздавший пакет
+        // сброшенной сессии снова выглядел бы как первый контакт (H-2).
+        let retired_ratchet_sessions = {
+            let mut sessions: HashMap<String, Vec<[u8; 16]>> = HashMap::new();
+            match storage.load_retired_ratchet_sessions() {
+                Ok(entries) => {
+                    for (room_hash, session_id) in entries {
+                        let entry = sessions.entry(room_hash).or_default();
+                        if entry.contains(&session_id) {
+                            continue;
+                        }
+                        entry.push(session_id);
+                        if entry.len() > ratchet::MAX_RETIRED_SESSIONS {
+                            entry.remove(0);
+                        }
+                    }
+                }
+                Err(e) => warn!("Failed to load retired ratchet sessions: {:#}", e),
+            }
+            Arc::new(Mutex::new(sessions))
+        };
 
         // Initialize identity
         let identity_manager = Arc::new(Mutex::new(IdentityManager::new(
@@ -277,6 +560,23 @@ impl App {
             let mut secrets = shared_secrets.lock().unwrap();
 
             for contact in &contacts {
+                if let Some(ed25519_hex) = contact.ed25519.as_deref() {
+                    let valid_hash = hex::decode(ed25519_hex)
+                        .ok()
+                        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+                        .map(|ed25519| hash_ed25519_public(&ed25519))
+                        .map(|hash| hash.eq_ignore_ascii_case(&contact.hash))
+                        .unwrap_or(false);
+
+                    if !valid_hash {
+                        warn!(
+                            "Skipping contact {}: stored ed25519 key contradicts identity hash",
+                            &contact.hash[..16.min(contact.hash.len())]
+                        );
+                        continue;
+                    }
+                }
+
                 match crypto::generate_shared_key(&identity.private_key, &contact.public_key) {
                     Ok(secret) => {
                         secrets.insert(contact.hash.clone(), secret);
@@ -291,13 +591,16 @@ impl App {
                 }
             }
 
-            // Set current room
-            if !contacts.is_empty() {
+            // Set current room to the first contact whose keys validated.
+            if let Some(contact) = contacts
+                .iter()
+                .find(|contact| secrets.contains_key(&contact.hash))
+            {
                 let mut current = current_room_hash.lock().unwrap();
-                *current = contacts[0].hash.clone();
+                *current = contact.hash.clone();
                 drop(current);
 
-                let _ = storage.ensure_room(&contacts[0].nickname, &contacts[0].hash);
+                let _ = storage.ensure_room(&contact.nickname, &contact.hash);
             }
         }
 
@@ -314,7 +617,8 @@ impl App {
             identity_manager,
             identity,
             shared_secrets,
-            session_id: Arc::new(Mutex::new(0)),
+            ratchets: Arc::new(Mutex::new(HashMap::new())),
+            retired_ratchet_sessions,
             sender,
             listener,
             signing_key,
@@ -346,6 +650,8 @@ impl App {
         let shared_secrets = self.shared_secrets.clone();
         let storage = self.storage.clone();
         let room_ttls = self.room_ttls.clone();
+        let ratchets = self.ratchets.clone();
+        let retired_ratchet_sessions = self.retired_ratchet_sessions.clone();
         let event_sender = self.event_sender.clone();
 
         tokio::spawn(async move {
@@ -380,6 +686,8 @@ impl App {
                                 &shared_secrets,
                                 &storage,
                                 &room_ttls,
+                                &ratchets,
+                                &retired_ratchet_sessions,
                                 &identity_hash,
                                 &identity_pub_key,
                                 &identity_priv_key,
@@ -418,41 +726,69 @@ impl App {
         shared_secrets: &Arc<Mutex<HashMap<String, [u8; 32]>>>,
         storage: &Arc<Storage>,
         room_ttls: &Arc<Mutex<HashMap<String, RoomTtl>>>,
+        ratchets: &Arc<Mutex<HashMap<String, RatchetState>>>,
+        retired_ratchet_sessions: &RetiredRatchetSessions,
         identity_hash: &str,
         identity_pub_key: &str,
         identity_priv_key: &[u8],
         event_sender: &mpsc::UnboundedSender<AppEvent>,
     ) {
-        let secrets = shared_secrets.lock().unwrap();
+        // Сначала Double Ratchet, затем legacy-пакеты со статическим
+        // секретом: это позволяет принимать сообщения от старых клиентов.
+        let mut candidates: Vec<(String, [u8; 32])> = match shared_secrets.lock() {
+            Ok(secrets) => secrets
+                .iter()
+                .map(|(hash, secret)| (hash.clone(), *secret))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+
+        if !candidates
+            .iter()
+            .any(|(hash, _)| hash.as_str() == identity_hash)
+        {
+            if let Ok(public_key) = hex::decode(identity_pub_key) {
+                if let Ok(self_secret) =
+                    crypto::generate_shared_key(identity_priv_key, &public_key)
+                {
+                    candidates.push((identity_hash.to_string(), self_secret));
+                }
+            }
+        }
 
         let mut decrypted_message = None;
         let mut from_hash = String::new();
+        // Обновлённый ratchet сохраняется только после обработки payload
+        // и только если комната не эфемерна (H-3).
+        let mut ratchet_update = None;
 
-        // Try all known keys
-        for (hash, secret) in secrets.iter() {
-            if let Ok((decrypted, _)) = crypto::decrypt_message(&packet, secret) {
+        for (hash, secret) in &candidates {
+            let ttl_active = room_has_ttl(room_ttls, hash);
+            if let Some((decrypted, serialized)) = try_ratchet_decrypt(
+                &packet,
+                hash,
+                secret,
+                identity_hash,
+                storage,
+                ratchets,
+                retired_ratchet_sessions,
+                ttl_active,
+            ) {
                 decrypted_message = Some(decrypted);
                 from_hash = hash.clone();
+                ratchet_update = serialized;
                 break;
             }
         }
 
-        // If not decrypted, try as self-message
         if decrypted_message.is_none() {
-            drop(secrets);
-
-            // Generate self shared key
-            if let Ok(public_key) = hex::decode(identity_pub_key) {
-                if let Ok(self_secret) = crypto::generate_shared_key(identity_priv_key, &public_key)
-                {
-                    if let Ok((decrypted, _)) = crypto::decrypt_message(&packet, &self_secret) {
-                        decrypted_message = Some(decrypted);
-                        from_hash = identity_hash.to_string();
-                    }
+            for (hash, secret) in &candidates {
+                if let Ok((decrypted, _)) = crypto::decrypt_message(&packet, secret) {
+                    decrypted_message = Some(decrypted);
+                    from_hash = hash.clone();
+                    break;
                 }
             }
-        } else {
-            drop(secrets);
         }
 
         let message = match decrypted_message {
@@ -463,7 +799,7 @@ impl App {
             }
         };
 
-        // Внутренний конверт: текст с TTL-метаданными или SetTtl.
+        // Внутренний конверт: текст с TTL-метаданными или служебные пакеты.
         let (message_text, ttl_seconds) = match crypto::decode_payload(&message) {
             Ok(crypto::E2ePayload::SetTtl { seconds }) => {
                 if let Ok(mut ttls) = room_ttls.lock() {
@@ -483,6 +819,16 @@ impl App {
                     }
                 }
 
+                // Смена режима TTL сбрасывает сессию храповика с обеих
+                // сторон: дальше состояние живёт только в RAM.
+                clear_ratchet_state(
+                    ratchets,
+                    storage,
+                    retired_ratchet_sessions,
+                    room_ttls,
+                    &from_hash,
+                );
+
                 let _ = event_sender.send(AppEvent::TtlChanged {
                     room_hash: from_hash.clone(),
                     seconds,
@@ -490,7 +836,30 @@ impl App {
                 });
                 return;
             }
-            Ok(crypto::E2ePayload::Text { text, ttl_seconds }) => (text, ttl_seconds),
+            Ok(crypto::E2ePayload::RatchetReset) => {
+                clear_ratchet_state(
+                    ratchets,
+                    storage,
+                    retired_ratchet_sessions,
+                    room_ttls,
+                    &from_hash,
+                );
+                info!("Ratchet session reset by peer for {}", &from_hash[..16.min(from_hash.len())]);
+                return;
+            }
+            Ok(crypto::E2ePayload::Text { text, ttl_seconds }) => {
+                if let Some(bytes) = ratchet_update.take() {
+                    if let Err(e) = persist_ratchet(
+                        room_has_ttl(room_ttls, &from_hash),
+                        storage.as_ref(),
+                        &from_hash,
+                        &bytes,
+                    ) {
+                        warn!("Failed to persist ratchet state: {:#}", e);
+                    }
+                }
+                (text, ttl_seconds)
+            }
             Err(e) => {
                 warn!("Malformed E2E payload from {}: {:#}", from_hash, e);
                 return;
@@ -601,80 +970,131 @@ impl App {
             .unwrap_or_else(|| self.identity.nickname.clone())
     }
 
-    pub fn get_my_contact_link(&self) -> String {
-        use url::form_urlencoded;
-
-        let public_key_hex = self.identity.get_public_key_hex();
+    /// Текущий подписываемый документ личности. Ник берётся из менеджера,
+    /// чтобы `/nick` сразу попадал в новые invite-ссылки.
+    fn current_identity_doc(&self) -> Result<IdentityDoc> {
         let nickname = self.current_nickname();
-        let params = [
-            ("hash", self.identity.hash.as_str()),
-            ("x25519", public_key_hex.as_str()),
-            ("ed25519", self.ed25519_pub_key_hex.as_str()),
-            ("nickname", nickname.as_str()),
-        ];
+        let nickname = truncate_utf8(&nickname, crate::identity::MAX_NICKNAME_BYTES);
 
-        let encoded: String = form_urlencoded::Serializer::new(String::new())
-            .extend_pairs(params.iter())
-            .finish();
-
-        format!("lastchance://contact?{}", encoded)
+        IdentityDoc::from_slices(
+            &self.identity.ed25519_public_key,
+            &self.identity.public_key,
+            Some(nickname),
+            self.identity.created_at.max(0) as u64,
+        )
     }
 
-    pub fn get_my_contact_json(&self) -> String {
+    fn current_identity_invite(&self) -> Result<IdentityInvite> {
+        IdentityInvite::sign(self.current_identity_doc()?, &self.signing_key)
+    }
+
+    pub fn get_my_contact_link(&self) -> Result<String> {
+        self.current_identity_invite()?.to_link()
+    }
+
+    pub fn get_my_contact_json(&self) -> Result<String> {
+        let invite = self.current_identity_invite()?;
+        let doc_hex = hex::encode(invite.doc.canonical_cbor()?);
         let data = serde_json::json!({
-            "hash": self.identity.hash,
-            "x25519": self.identity.get_public_key_hex(),
-            "ed25519": self.ed25519_pub_key_hex,
-            "nickname": self.current_nickname(),
+            "hash": invite.hash_hex(),
+            "x25519": hex::encode(invite.doc.x25519_pub),
+            "ed25519": hex::encode(invite.doc.ed25519_pub),
+            "nickname": invite.display_nickname(),
+            "fingerprint": invite.fingerprint_hex(),
+            "identityDoc": doc_hex,
+            "identitySig": hex::encode(invite.signature),
         });
 
-        serde_json::to_string_pretty(&data).unwrap_or_default()
+        serde_json::to_string_pretty(&data)
+            .map_err(|e| anyhow!("failed to serialize contact JSON: {}", e))
     }
 
     pub fn get_contacts(&self) -> Result<Vec<Contact>> {
         self.storage.get_all_contacts()
     }
 
-    pub fn add_contact(&self, hash: &str, pub_key_hex: &str, nickname: &str) -> Result<()> {
-        self.add_contact_with_ed25519(hash, pub_key_hex, None, nickname)
-    }
-
-    /// Добавляет контакт, сохраняя Ed25519-ключ из ссылки, если он известен.
+    /// Добавляет контакт только из криптографически проверенного invite.
+    ///
+    /// Подпись Ed25519 над CBOR-документом подтверждает, что владелец
+    /// Ed25519-ключа действительно выдал этот X25519-ключ. Hash пересчитан
+    /// из документа и сверен с ссылкой, поэтому подмена полей невозможна.
     pub fn add_contact_with_ed25519(
         &self,
-        hash: &str,
-        pub_key_hex: &str,
-        ed25519: Option<&str>,
-        nickname: &str,
-    ) -> Result<()> {
-        let pub_key =
-            hex::decode(pub_key_hex).map_err(|e| anyhow!("invalid public key hex: {}", e))?;
+        invite: &IdentityInvite,
+    ) -> Result<ContactImportOutcome> {
+        invite.verify()?;
 
-        if pub_key.len() != 32 {
-            return Err(anyhow!(
-                "public key must be 32 bytes, got {}",
-                pub_key.len()
-            ));
-        }
+        let doc = &invite.doc;
+        let hash = invite.hash_hex();
+        let ed25519 = hex::encode(doc.ed25519_pub);
+        let fingerprint = invite.fingerprint_hex();
+        let pub_key = doc.x25519_pub.to_vec();
+
+        let existing = self.storage.get_contact(&hash).ok();
+        let (tofu_state, x25519_changed) = match existing.as_ref() {
+            None => (TOFU_PENDING.to_string(), false),
+            Some(contact) => {
+                if let Some(stored_ed25519) = contact.ed25519.as_deref() {
+                    if !stored_ed25519.eq_ignore_ascii_case(&ed25519) {
+                        return Err(anyhow!(
+                            "stored ed25519 key contradicts sha256-derived identity hash"
+                        ));
+                    }
+                }
+
+                if contact.public_key != pub_key {
+                    (TOFU_CHANGED.to_string(), true)
+                } else if contact.tofu_state.is_empty() {
+                    (TOFU_PENDING.to_string(), false)
+                } else {
+                    (contact.tofu_state.clone(), false)
+                }
+            }
+        };
 
         let shared_secret = crypto::generate_shared_key(&self.identity.private_key, &pub_key)?;
 
-        self.storage
-            .add_contact_with_ed25519(hash, &pub_key, ed25519, nickname)?;
+        let nickname = invite.display_nickname();
+        self.storage.upsert_verified_contact(
+            &hash,
+            &pub_key,
+            &ed25519,
+            &fingerprint,
+            &tofu_state,
+            &nickname,
+        )?;
 
         {
-            let mut secrets = self.shared_secrets.lock().unwrap();
-            secrets.insert(hash.to_string(), shared_secret);
+            let mut secrets = self
+                .shared_secrets
+                .lock()
+                .map_err(|_| anyhow!("shared secrets lock poisoned"))?;
+            secrets.insert(hash.clone(), shared_secret);
         }
 
-        let _ = self.storage.ensure_room(nickname, hash);
+        let _ = self.storage.ensure_room(&nickname, &hash);
 
-        let mut current = self.current_room_hash.lock().unwrap();
+        let mut current = self
+            .current_room_hash
+            .lock()
+            .map_err(|_| anyhow!("current room lock poisoned"))?;
         if current.is_empty() {
-            *current = hash.to_string();
+            *current = hash.clone();
         }
 
-        Ok(())
+        Ok(ContactImportOutcome {
+            hash,
+            nickname,
+            fingerprint,
+            tofu_state: tofu_state.to_string(),
+            x25519_changed,
+        })
+    }
+
+    /// Пользователь сверил отпечаток вне канала и подтверждает контакт.
+    pub fn verify_contact_fingerprint(&self, contact_hash: &str) -> Result<()> {
+        self.storage
+            .set_contact_tofu_state(contact_hash, TOFU_VERIFIED)
     }
 
     /// Удаляет контакт и всю его историю сообщений/файлов.
@@ -691,6 +1111,10 @@ impl App {
 
         if let Ok(mut ttls) = self.room_ttls.lock() {
             ttls.remove(contact_hash);
+        }
+
+        if let Ok(mut ratchets) = self.ratchets.lock() {
+            ratchets.remove(contact_hash);
         }
 
         if let Ok(mut current) = self.current_room_hash.lock() {
@@ -788,7 +1212,6 @@ impl App {
     }
 
     pub async fn send_message(&self, room_hash: &str, text: &str) -> Result<()> {
-        let shared_secret = self.get_shared_secret(room_hash)?;
         let ttl = self.get_room_ttl(room_hash);
 
         // Односторонний `/ttl` остаётся локальным: TTL не передаётся
@@ -796,24 +1219,138 @@ impl App {
         let wire_ttl = ttl.filter(|value| value.synced).and_then(|value| value.seconds);
         let payload = crypto::encode_text_payload(text, wire_ttl);
 
-        let session_id = self.next_session_id()?;
-        let packet = crypto::encrypt_message(&payload, &shared_secret, session_id)?;
+        let packet = self.encrypt_with_ratchet(room_hash, &payload)?;
 
         self.sender.send_message(room_hash, &packet).await?;
 
         self.store_outgoing_message(room_hash, text)
     }
 
-    /// Выдаёт следующий идентификатор сессии (используется как nonce-база).
-    fn next_session_id(&self) -> Result<u64> {
-        let mut id = self
-            .session_id
-            .lock()
-            .map_err(|_| anyhow!("session id lock poisoned"))?;
-        *id = id
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("session id overflow"))?;
-        Ok(*id)
+    /// Шифрует полезную нагрузку текущей эпохой Double Ratchet.
+    ///
+    /// Для обычной комнаты обновлённое состояние сразу сохраняется в
+    /// `vault.dat`. Для комнаты с RAM-TTL состояние остаётся в памяти.
+    fn encrypt_with_ratchet(&self, room_hash: &str, payload: &[u8]) -> Result<Vec<u8>> {
+        let ttl_active = self.get_room_ttl(room_hash).is_some();
+        let shared_secret = self.get_shared_secret(room_hash)?;
+        let identity_hash = self.identity.hash.clone();
+        let retired = retired_sessions_for(&self.retired_ratchet_sessions, room_hash);
+
+        let (packet, serialized) = {
+            let mut states = self
+                .ratchets
+                .lock()
+                .map_err(|_| anyhow!("ratchet lock poisoned"))?;
+
+            ensure_ratchet_state(
+                &mut states,
+                room_hash,
+                &shared_secret,
+                &identity_hash,
+                self.storage.as_ref(),
+                ttl_active,
+                &retired,
+            )?;
+
+            let state = states
+                .get_mut(room_hash)
+                .ok_or_else(|| anyhow!("ratchet state is missing"))?;
+            let packet = state.encrypt(payload)?;
+            let serialized = if ttl_active {
+                None
+            } else {
+                Some(state.to_bytes()?)
+            };
+            (packet, serialized)
+        };
+
+        if let Some(bytes) = serialized {
+            self.persist_ratchet_if_needed(room_hash, &bytes)?;
+        }
+
+        Ok(packet)
+    }
+
+    /// H-3: для TTL-комнаты состояние храповика не пишется в `vault.dat`.
+    fn persist_ratchet_if_needed(&self, room_hash: &str, state: &[u8]) -> Result<()> {
+        persist_ratchet(
+            self.get_room_ttl(room_hash).is_some(),
+            self.storage.as_ref(),
+            room_hash,
+            state,
+        )
+    }
+
+    /// Принудительно сбрасывает сессию храповика и уведомляет собеседника.
+    pub async fn reset_ratchet_with_peer(&self, room_hash: &str) -> Result<()> {
+        let payload = crypto::encode_ratchet_reset();
+        let packet = self.encrypt_with_ratchet(room_hash, &payload)?;
+        self.sender.send_message(room_hash, &packet).await?;
+        self.clear_ratchet(room_hash)
+    }
+
+    /// Удаляет состояние храповика из RAM и `vault.dat`.
+    ///
+    /// `session_id` уничтоженных сессий остаются в RAM-реестре и (для
+    /// обычных комнат) в `vault.dat`, чтобы запоздавший пакет старой
+    /// сессии не был принят как новая сессия даже после перезапуска.
+    pub fn clear_ratchet(&self, room_hash: &str) -> Result<()> {
+        let ttl_active = self.get_room_ttl(room_hash).is_some();
+        let session_ids = if let Ok(mut states) = self.ratchets.lock() {
+            states
+                .remove(room_hash)
+                .map(|state| state.session_ids())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        remember_retired_sessions(&self.retired_ratchet_sessions, room_hash, session_ids);
+
+        // Сначала tombstone-и, затем удаление состояния: при ошибке записи
+        // старая сессия остаётся на диске, а не теряет replay-защиту.
+        persist_retired_sessions(
+            self.storage.as_ref(),
+            &self.retired_ratchet_sessions,
+            ttl_active,
+            room_hash,
+        )?;
+        self.storage.delete_ratchet_state(room_hash)
+    }
+
+    /// Переносит текущую сессию храповика в RAM и удаляет её с диска.
+    ///
+    /// Используется при включении `/ttl` или `/ttl-syn`: собеседник
+    /// сохраняет прежнюю сессию, поэтому локальная копия должна остаться
+    /// доступной, но только в оперативной памяти.
+    fn enter_ram_ttl(&self, room_hash: &str) -> Result<()> {
+        let retired = retired_sessions_for(&self.retired_ratchet_sessions, room_hash);
+        {
+            let mut states = self
+                .ratchets
+                .lock()
+                .map_err(|_| anyhow!("ratchet lock poisoned"))?;
+
+            if !states.contains_key(room_hash) {
+                if let Some(bytes) = self.storage.load_ratchet_state(room_hash)? {
+                    match RatchetState::from_bytes(&bytes) {
+                        Ok(mut state) => {
+                            state.retire_sessions(retired);
+                            states.insert(room_hash.to_string(), state);
+                        }
+                        Err(e) => {
+                            warn!("Ignoring unreadable ratchet state: {:#}", e);
+                        }
+                    }
+                }
+            }
+        }
+
+        // H-3: вместе с ключами с диска уходят и tombstone-и сессий.
+        if let Err(e) = self.storage.delete_retired_ratchet_sessions(room_hash) {
+            warn!("Failed to delete retired ratchet sessions: {:#}", e);
+        }
+
+        self.storage.delete_ratchet_state(room_hash)
     }
 
     /// Возвращает активный RAM-TTL комнаты. `None`, если таймер выключен.
@@ -845,57 +1382,78 @@ impl App {
                 ttls.remove(room_hash);
             }
         }
-        Ok(())
+        drop(ttls);
+
+        match seconds {
+            // Включение TTL: текущая сессия переносится в RAM, а её копия
+            // удаляется с диска. Сбрасывать храповик не нужно.
+            Some(_) => self.enter_ram_ttl(room_hash),
+            // Выключение TTL: состояние затирается, следующая сессия
+            // начнётся заново.
+            None => self.clear_ratchet(room_hash),
+        }
     }
 
     /// Устанавливает двусторонний RAM-TTL и отправляет `SetTtl` собеседнику.
     ///
-    /// Пакет собирается до изменения локального состояния, а при ошибке
-    /// отправки предыдущее значение откатывается.
+    /// При включении TTL флаг выставляется до шифрования: иначе `SetTtl`
+    /// создаст/сдвинет храповик, и тот попадёт в `vault.dat` (H-3).
+    /// Ошибка отправки не откатывает TTL — снапшот с ratchet всё равно не
+    /// записывается, а ошибка возвращается вызывающему.
     pub async fn set_synced_ttl(&self, room_hash: &str, seconds: Option<u64>) -> Result<()> {
-        let shared_secret = self.get_shared_secret(room_hash)?;
-        let session_id = self.next_session_id()?;
         let payload = crypto::encode_set_ttl(seconds);
-        let packet = crypto::encrypt_message(&payload, &shared_secret, session_id)?;
 
-        let previous = {
-            let mut ttls = self
-                .room_ttls
-                .lock()
-                .map_err(|_| anyhow!("ttl lock poisoned"))?;
-            let previous = ttls.get(room_hash).copied();
-            match seconds {
-                Some(value) => {
-                    ttls.insert(
-                        room_hash.to_string(),
-                        RoomTtl {
-                            seconds: Some(value),
-                            synced: true,
-                        },
-                    );
-                }
-                None => {
-                    ttls.remove(room_hash);
-                }
+        if seconds.is_some() {
+            // Сначала переносим сессию в RAM и только затем включаем TTL,
+            // чтобы `encrypt_with_ratchet` не писал ratchet на диск.
+            self.enter_ram_ttl(room_hash)?;
+            {
+                let mut ttls = self
+                    .room_ttls
+                    .lock()
+                    .map_err(|_| anyhow!("ttl lock poisoned"))?;
+                ttls.insert(
+                    room_hash.to_string(),
+                    RoomTtl {
+                        seconds,
+                        synced: true,
+                    },
+                );
             }
-            previous
-        };
 
-        if let Err(e) = self.sender.send_message(room_hash, &packet).await {
-            if let Ok(mut ttls) = self.room_ttls.lock() {
-                match previous {
-                    Some(value) => {
+            let packet = self.encrypt_with_ratchet(room_hash, &payload)?;
+            if let Err(e) = self.sender.send_message(room_hash, &packet).await {
+                // TTL намеренно не откатываем: сессия уже переключена в RAM,
+                // а на диске ratchet-состояния быть не должно (H-3).
+                return Err(anyhow!("failed to send TTL update: {}", e));
+            }
+        } else {
+            // Выключение TTL: пакет шифруется в текущей RAM-сессии, затем
+            // режим снимается; при ошибке отправки возвращаем прежний TTL.
+            let packet = self.encrypt_with_ratchet(room_hash, &payload)?;
+
+            let previous = {
+                let mut ttls = self
+                    .room_ttls
+                    .lock()
+                    .map_err(|_| anyhow!("ttl lock poisoned"))?;
+                let previous = ttls.get(room_hash).copied();
+                ttls.remove(room_hash);
+                previous
+            };
+
+            if let Err(e) = self.sender.send_message(room_hash, &packet).await {
+                if let Some(value) = previous {
+                    if let Ok(mut ttls) = self.room_ttls.lock() {
                         ttls.insert(room_hash.to_string(), value);
                     }
-                    None => {
-                        ttls.remove(room_hash);
-                    }
                 }
+                return Err(anyhow!("failed to send TTL update: {}", e));
             }
-            return Err(anyhow!("failed to send TTL update: {}", e));
         }
 
-        Ok(())
+        // Обе стороны начинают храповик заново после смены TTL-режима.
+        self.clear_ratchet(room_hash)
     }
 
     /// Сохраняет исходящее сообщение, делая его эфемерным при активном TTL.
@@ -1003,9 +1561,15 @@ impl App {
             }
         };
 
-        // Save file record
-        self.storage
-            .save_file_record(&file_hash, room_hash, file_name, file_size)?;
+        // Save file record (TTL-комнаты не пишут метаданные на диск, H-3).
+        let is_ephemeral = self.get_room_ttl(room_hash).is_some();
+        self.storage.save_file_record(
+            &file_hash,
+            room_hash,
+            file_name,
+            file_size,
+            is_ephemeral,
+        )?;
 
         // Emit progress event
         self.emit_event(AppEvent::UploadProgress {
@@ -1145,39 +1709,15 @@ impl App {
     pub fn handle_scheme_url(&self, raw_url: &str) {
         info!("Scheme URL received: {}", raw_url);
 
-        if !raw_url.starts_with("lastchance://contact?") {
-            warn!("Unknown scheme URL");
-            self.emit_event(AppEvent::ContactImportError {
-                error: "Invalid contact link format".to_string(),
-            });
-            return;
+        match IdentityInvite::from_link(raw_url) {
+            Ok(invite) => self.emit_event(AppEvent::ContactImport { invite }),
+            Err(e) => {
+                warn!("Rejected invite link: {:#}", e);
+                self.emit_event(AppEvent::ContactImportError {
+                    error: format!("{:#}", e),
+                });
+            }
         }
-
-        let params_str = raw_url.trim_start_matches("lastchance://contact?");
-        let params: HashMap<String, String> = url::form_urlencoded::parse(params_str.as_bytes())
-            .into_owned()
-            .collect();
-
-        let hash = params.get("hash").cloned().unwrap_or_default();
-        let x25519 = params.get("x25519").cloned().unwrap_or_default();
-        let ed25519 = params.get("ed25519").cloned();
-        let nickname = params
-            .get("nickname").cloned()
-            .unwrap_or_default();
-
-        if hash.is_empty() || x25519.is_empty() || nickname.is_empty() {
-            self.emit_event(AppEvent::ContactImportError {
-                error: "Missing required contact parameters".to_string(),
-            });
-            return;
-        }
-
-        self.emit_event(AppEvent::ContactImport {
-            hash,
-            x25519,
-            ed25519,
-            nickname,
-        });
     }
 
     pub fn get_base_dir(&self) -> &str {
@@ -1290,11 +1830,17 @@ fn humanize_bytes(bytes: u64) -> String {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519Secret};
 
     fn setup_test_app() -> (App, tempfile::TempDir, mpsc::UnboundedReceiver<AppEvent>) {
+        setup_test_app_with_config(Config::default())
+    }
+
+    fn setup_test_app_with_config(
+        config: Config,
+    ) -> (App, tempfile::TempDir, mpsc::UnboundedReceiver<AppEvent>) {
         let temp_dir = tempdir().unwrap();
         let base_dir = temp_dir.path().to_str().unwrap().to_string();
-        let config = Config::default();
         let (event_sender, event_receiver) = mpsc::unbounded_channel();
 
         let vault = Vault::create(&base_dir, "test-password").unwrap();
@@ -1302,20 +1848,115 @@ mod tests {
         (app, temp_dir, event_receiver)
     }
 
+    /// Минимальный HTTP-stub для проверки успешной/неуспешной отправки
+    /// без реальной сети.
+    async fn spawn_http_stub(status: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let mut data = Vec::new();
+            let header_end = loop {
+                let n = stream.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break data.len();
+                }
+                data.extend_from_slice(&buf[..n]);
+                if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+
+            let headers = String::from_utf8_lossy(&data[..header_end]).to_ascii_lowercase();
+            let content_length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            let mut remaining = content_length.saturating_sub(data.len().saturating_sub(header_end));
+            while remaining > 0 {
+                let n = stream.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                remaining = remaining.saturating_sub(n);
+            }
+
+            let response =
+                format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        });
+
+        format!("http://{addr}")
+    }
+
+    fn test_invite_variant(seed: u8, x_seed: u8, nickname: &str) -> IdentityInvite {
+        let signing_key = SigningKey::from_bytes(&[seed; 32]);
+        let x_secret = X25519Secret::from([x_seed; 32]);
+        let x_public = X25519PublicKey::from(&x_secret);
+        let doc = IdentityDoc::from_slices(
+            signing_key.verifying_key().as_bytes(),
+            x_public.as_bytes(),
+            Some(nickname.to_string()),
+            u64::from(seed),
+        )
+        .unwrap();
+        IdentityInvite::sign(doc, &signing_key).unwrap()
+    }
+
+    fn test_invite(seed: u8, nickname: &str) -> IdentityInvite {
+        test_invite_variant(seed, seed.wrapping_add(1), nickname)
+    }
+
     #[test]
     fn test_add_contact() {
         let (app, _temp_dir, _receiver) = setup_test_app();
 
-        let hash = "a".repeat(64);
-        let pub_key_hex = "b".repeat(64);
-        let nickname = "Test User";
+        let invite = test_invite(1, "Test User");
+        let hash = invite.hash_hex();
+        let nickname = invite.display_nickname();
 
-        app.add_contact(&hash, &pub_key_hex, nickname).unwrap();
+        app.add_contact_with_ed25519(&invite).unwrap();
 
         let contacts = app.get_contacts().unwrap();
         assert_eq!(contacts.len(), 1);
         assert_eq!(contacts[0].hash, hash);
         assert_eq!(contacts[0].nickname, nickname);
+        assert_eq!(contacts[0].tofu_state, TOFU_PENDING);
+        assert_eq!(
+            contacts[0].fingerprint.as_deref(),
+            Some(invite.fingerprint_hex().as_str())
+        );
+    }
+
+    #[test]
+    fn tofu_marks_changed_x25519_and_can_be_verified() {
+        let (app, _temp_dir, _receiver) = setup_test_app();
+
+        let first = test_invite_variant(20, 21, "Alice");
+        let hash = first.hash_hex();
+        let outcome = app.add_contact_with_ed25519(&first).unwrap();
+        assert_eq!(outcome.tofu_state, TOFU_PENDING);
+        assert!(!outcome.x25519_changed);
+
+        // Тот же Ed25519-ключ подписал новый X25519-ключ: это не MITM,
+        // но контакт обязан показать смену ключа до ручной сверки.
+        let rotated = test_invite_variant(20, 22, "Alice");
+        assert_eq!(rotated.hash_hex(), hash);
+        let outcome = app.add_contact_with_ed25519(&rotated).unwrap();
+        assert!(outcome.x25519_changed);
+        assert_eq!(outcome.tofu_state, TOFU_CHANGED);
+        assert_eq!(app.get_contacts().unwrap()[0].tofu_state, TOFU_CHANGED);
+
+        app.verify_contact_fingerprint(&hash).unwrap();
+        assert_eq!(app.get_contacts().unwrap()[0].tofu_state, TOFU_VERIFIED);
     }
 
     #[test]
@@ -1412,12 +2053,18 @@ mod tests {
     fn test_contact_link() {
         let (app, _temp_dir, _receiver) = setup_test_app();
 
-        let link = app.get_my_contact_link();
+        let link = app.get_my_contact_link().unwrap();
         assert!(link.starts_with("lastchance://contact?"));
         assert!(link.contains("hash="));
+        assert!(link.contains("doc="));
+        assert!(link.contains("sig="));
         assert!(link.contains("x25519="));
         assert!(link.contains("ed25519="));
         assert!(link.contains("nickname="));
+
+        let parsed = IdentityInvite::from_link(&link).unwrap();
+        assert_eq!(parsed.hash_hex(), app.identity.hash);
+        assert_eq!(parsed.doc.x25519_pub.to_vec(), app.identity.public_key);
     }
 
     #[test]
@@ -1437,8 +2084,9 @@ mod tests {
         )
         .unwrap();
 
-        let hash = "f".repeat(64);
-        app.add_contact(&hash, &"a".repeat(64), "Alice").unwrap();
+        let invite = test_invite(2, "Alice");
+        let hash = invite.hash_hex();
+        app.add_contact_with_ed25519(&invite).unwrap();
         app.get_storage()
             .save_message(&hash, "out", "secret message")
             .unwrap();
@@ -1470,11 +2118,60 @@ mod tests {
     }
 
     #[test]
+    fn ratchet_state_is_persisted_only_without_ram_ttl() {
+        let (app, _temp_dir, _receiver) = setup_test_app();
+
+        let invite = test_invite(3, "RatchetPeer");
+        let hash = invite.hash_hex();
+        app.add_contact_with_ed25519(&invite).unwrap();
+
+        // Обычная комната: состояние храповика попадает в vault.dat.
+        app.encrypt_with_ratchet(&hash, b"persistent-ratchet")
+            .unwrap();
+        assert!(app
+            .get_storage()
+            .persisted_ratchet_state_for_test(&hash)
+            .unwrap()
+            .is_some());
+
+        // Включаем RAM-TTL: старое состояние удаляется с диска, новые
+        // сообщения обновляют только память.
+        app.set_room_ttl(&hash, Some(30)).unwrap();
+        assert!(app
+            .get_storage()
+            .persisted_ratchet_state_for_test(&hash)
+            .unwrap()
+            .is_none());
+
+        app.encrypt_with_ratchet(&hash, b"ram-only-ratchet")
+            .unwrap();
+        assert!(app
+            .get_storage()
+            .persisted_ratchet_state_for_test(&hash)
+            .unwrap()
+            .is_none());
+
+        // Выключение TTL затирает RAM-состояние и не восстанавливает диск.
+        app.set_room_ttl(&hash, None).unwrap();
+        assert!(!app
+            .ratchets
+            .lock()
+            .map(|states| states.contains_key(&hash))
+            .unwrap_or(true));
+        assert!(app
+            .get_storage()
+            .persisted_ratchet_state_for_test(&hash)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn ttl_messages_stay_in_ram_and_expire() {
         let (app, _temp_dir, _receiver) = setup_test_app();
 
-        let hash = "e".repeat(64);
-        app.add_contact(&hash, &"a".repeat(64), "TtlPeer").unwrap();
+        let invite = test_invite(4, "TtlPeer");
+        let hash = invite.hash_hex();
+        app.add_contact_with_ed25519(&invite).unwrap();
 
         // Включаем односторонний TTL и сохраняем исходящее сообщение.
         app.set_room_ttl(&hash, Some(30)).unwrap();
@@ -1530,5 +2227,334 @@ mod tests {
         assert!(remaining
             .iter()
             .any(|message| message.text == "persistent secret"));
+    }
+
+    #[tokio::test]
+    async fn synced_ttl_send_failure_keeps_ttl_and_no_ratchet_on_disk() {
+        // H-3: неудачная отправка не должна оставлять ratchet в vault.dat
+        // и не должна молча откатывать уже включённый TTL.
+        let server = spawn_http_stub("400 Bad Request").await;
+        let config = Config {
+            server_url: server,
+            ..Config::default()
+        };
+        let (app, _temp_dir, _receiver) = setup_test_app_with_config(config);
+
+        let invite = test_invite(5, "SyncPeer");
+        let hash = invite.hash_hex();
+        app.add_contact_with_ed25519(&invite).unwrap();
+
+        // Обычная комната: ratchet уже записан на диск.
+        app.encrypt_with_ratchet(&hash, b"prime").unwrap();
+        assert!(app
+            .get_storage()
+            .persisted_ratchet_state_for_test(&hash)
+            .unwrap()
+            .is_some());
+
+        let result = app.set_synced_ttl(&hash, Some(30)).await;
+        assert!(result.is_err(), "send failure must surface");
+
+        assert_eq!(
+            app.get_room_ttl(&hash).and_then(|ttl| ttl.seconds),
+            Some(30),
+            "TTL must not be silently rolled back"
+        );
+        assert!(app
+            .get_storage()
+            .persisted_ratchet_state_for_test(&hash)
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn synced_ttl_removes_previously_persisted_ratchet() {
+        let server = spawn_http_stub("200 OK").await;
+        let config = Config {
+            server_url: server,
+            ..Config::default()
+        };
+        let (app, _temp_dir, _receiver) = setup_test_app_with_config(config);
+
+        let invite = test_invite(6, "SyncPeer");
+        let hash = invite.hash_hex();
+        app.add_contact_with_ed25519(&invite).unwrap();
+
+        app.encrypt_with_ratchet(&hash, b"prime").unwrap();
+        assert!(app
+            .get_storage()
+            .persisted_ratchet_state_for_test(&hash)
+            .unwrap()
+            .is_some());
+
+        app.set_synced_ttl(&hash, Some(30)).await.unwrap();
+
+        assert_eq!(
+            app.get_room_ttl(&hash).and_then(|ttl| ttl.seconds),
+            Some(30)
+        );
+        assert!(app
+            .get_storage()
+            .persisted_ratchet_state_for_test(&hash)
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn incoming_set_ttl_does_not_persist_ratchet_before_processing() {
+        // H-3: расшифровка SetTtl не должна писать ratchet до того, как
+        // станет известно, включает ли пакет TTL.
+        let (app, _temp_dir, _receiver) = setup_test_app();
+        let hash = app.identity.hash.clone();
+
+        app.encrypt_with_ratchet(&hash, b"prime").unwrap();
+        let packet = app
+            .encrypt_with_ratchet(&hash, &crypto::encode_set_ttl(Some(60)))
+            .unwrap();
+
+        // Стираем предыдущий снимок, чтобы отличить новую запись от старой.
+        app.get_storage().delete_ratchet_state(&hash).unwrap();
+        assert!(app
+            .get_storage()
+            .persisted_ratchet_state_for_test(&hash)
+            .unwrap()
+            .is_none());
+
+        let shared_secret = app.get_shared_secret(&hash).unwrap();
+        let (plaintext, serialized) = try_ratchet_decrypt(
+            &packet,
+            &hash,
+            &shared_secret,
+            &app.identity.hash,
+            &app.storage,
+            &app.ratchets,
+            &app.retired_ratchet_sessions,
+            false,
+        )
+        .expect("self-chat packet must decrypt");
+
+        assert_eq!(
+            crypto::decode_payload(&plaintext).unwrap(),
+            crypto::E2ePayload::SetTtl { seconds: Some(60) }
+        );
+        assert!(serialized.is_some());
+        assert!(
+            app.get_storage()
+                .persisted_ratchet_state_for_test(&hash)
+                .unwrap()
+                .is_none(),
+            "decryption must not persist ratchet before payload handling"
+        );
+    }
+
+    #[tokio::test]
+    async fn incoming_set_ttl_leaves_no_ratchet_on_disk() {
+        let (app, _temp_dir, mut receiver) = setup_test_app();
+        let hash = app.identity.hash.clone();
+
+        app.encrypt_with_ratchet(&hash, b"prime").unwrap();
+        let packet = app
+            .encrypt_with_ratchet(&hash, &crypto::encode_set_ttl(Some(60)))
+            .unwrap();
+        assert!(app
+            .get_storage()
+            .persisted_ratchet_state_for_test(&hash)
+            .unwrap()
+            .is_some());
+
+        let identity_pub_key = app.identity.get_public_key_hex();
+        App::handle_incoming_packet(
+            packet,
+            &app.shared_secrets,
+            &app.storage,
+            &app.room_ttls,
+            &app.ratchets,
+            &app.retired_ratchet_sessions,
+            &app.identity.hash,
+            &identity_pub_key,
+            &app.identity.private_key,
+            &app.event_sender,
+        )
+        .await;
+
+        assert_eq!(
+            app.get_room_ttl(&hash).and_then(|ttl| ttl.seconds),
+            Some(60)
+        );
+        assert!(app
+            .get_storage()
+            .persisted_ratchet_state_for_test(&hash)
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(AppEvent::TtlChanged { seconds: Some(60), .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_packet_from_cleared_ratchet_is_rejected() {
+        // H-1: после reset старая bootstrap-сессия не должна приниматься
+        // даже как «незнакомая»: приложение помнит её session_id.
+        let (app, _temp_dir, _receiver) = setup_test_app();
+        let hash = app.identity.hash.clone();
+
+        let bootstrap = app.encrypt_with_ratchet(&hash, b"old-bootstrap").unwrap();
+        let old_session = ratchet::RatchetHeader::parse(&bootstrap)
+            .unwrap()
+            .session_id;
+        let shared_secret = app.get_shared_secret(&hash).unwrap();
+
+        app.clear_ratchet(&hash).unwrap();
+
+        // Новая сессия получает свежий session_id и принимается.
+        let fresh = app.encrypt_with_ratchet(&hash, b"fresh").unwrap();
+        assert_ne!(
+            ratchet::RatchetHeader::parse(&fresh).unwrap().session_id,
+            old_session
+        );
+        let (plaintext, _) = try_ratchet_decrypt(
+            &fresh,
+            &hash,
+            &shared_secret,
+            &app.identity.hash,
+            &app.storage,
+            &app.ratchets,
+            &app.retired_ratchet_sessions,
+            false,
+        )
+        .expect("new bootstrap packet must decrypt");
+        assert_eq!(plaintext, b"fresh");
+
+        // Старый bootstrap-пакет отклоняется как StaleSession.
+        assert!(
+            try_ratchet_decrypt(
+                &bootstrap,
+                &hash,
+                &shared_secret,
+                &app.identity.hash,
+                &app.storage,
+                &app.ratchets,
+                &app.retired_ratchet_sessions,
+                false,
+            )
+            .is_none(),
+            "bootstrap packet from a cleared ratchet must not decrypt"
+        );
+    }
+
+    #[test]
+    fn retired_session_survives_restart_and_blocks_replay() {
+        // H-2: после reset tombstone должен попасть в vault.dat, иначе
+        // перезапуск снова принимает старый bootstrap-пакет как новый.
+        let temp_dir = tempdir().unwrap();
+        let base_dir = temp_dir.path().to_str().unwrap().to_string();
+        let (event_sender, _receiver) = mpsc::unbounded_channel();
+        let vault = Vault::create(&base_dir, "test-password").unwrap();
+        let app = App::new(
+            Config::default(),
+            base_dir.clone(),
+            vault,
+            event_sender,
+        )
+        .unwrap();
+
+        let invite = test_invite(7, "ReplayPeer");
+        let hash = invite.hash_hex();
+        app.add_contact_with_ed25519(&invite).unwrap();
+
+        let bootstrap = app.encrypt_with_ratchet(&hash, b"old-bootstrap").unwrap();
+        let old_session = ratchet::RatchetHeader::parse(&bootstrap)
+            .unwrap()
+            .session_id;
+        let shared_secret = app.get_shared_secret(&hash).unwrap();
+
+        app.clear_ratchet(&hash).unwrap();
+        drop(app);
+
+        let vault = Vault::unlock(&base_dir, "test-password").unwrap();
+        let (event_sender, _receiver) = mpsc::unbounded_channel();
+        let reopened = App::new(Config::default(), base_dir, vault, event_sender).unwrap();
+
+        assert!(
+            reopened
+                .retired_ratchet_sessions
+                .lock()
+                .unwrap()
+                .get(&hash)
+                .is_some_and(|ids| ids.contains(&old_session)),
+            "retired session id must be restored from vault.dat"
+        );
+        assert!(
+            try_ratchet_decrypt(
+                &bootstrap,
+                &hash,
+                &shared_secret,
+                &reopened.identity.hash,
+                &reopened.storage,
+                &reopened.ratchets,
+                &reopened.retired_ratchet_sessions,
+                false,
+            )
+            .is_none(),
+            "replayed bootstrap packet must stay rejected after restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn incoming_ratchet_reset_persists_retired_session() {
+        // H-2: reset от собеседника проходит через clear_ratchet_state и
+        // тоже должен оставить tombstone в vault.dat.
+        let (app, _temp_dir, _receiver) = setup_test_app();
+        let hash = app.identity.hash.clone();
+
+        let bootstrap = app.encrypt_with_ratchet(&hash, b"prime").unwrap();
+        let old_session = ratchet::RatchetHeader::parse(&bootstrap)
+            .unwrap()
+            .session_id;
+        let reset = app
+            .encrypt_with_ratchet(&hash, &crypto::encode_ratchet_reset())
+            .unwrap();
+        let identity_pub_key = app.identity.get_public_key_hex();
+
+        App::handle_incoming_packet(
+            reset,
+            &app.shared_secrets,
+            &app.storage,
+            &app.room_ttls,
+            &app.ratchets,
+            &app.retired_ratchet_sessions,
+            &app.identity.hash,
+            &identity_pub_key,
+            &app.identity.private_key,
+            &app.event_sender,
+        )
+        .await;
+
+        let persisted = app
+            .get_storage()
+            .load_retired_ratchet_sessions()
+            .unwrap();
+        assert!(persisted
+            .iter()
+            .any(|(room_hash, session_id)| room_hash == &hash && session_id == &old_session));
+    }
+
+    #[test]
+    fn ttl_room_does_not_persist_retired_sessions() {
+        // H-3: включение RAM-TTL убирает с диска не только ключи, но и
+        // tombstone-и сессий.
+        let (app, _temp_dir, _receiver) = setup_test_app();
+        let hash = app.identity.hash.clone();
+
+        app.set_room_ttl(&hash, Some(30)).unwrap();
+        app.encrypt_with_ratchet(&hash, b"ttl-only").unwrap();
+        app.clear_ratchet(&hash).unwrap();
+
+        let persisted = app
+            .get_storage()
+            .load_retired_ratchet_sessions()
+            .unwrap();
+        assert!(persisted.iter().all(|(room_hash, _)| room_hash != &hash));
     }
 }

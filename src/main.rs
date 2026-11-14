@@ -33,9 +33,13 @@ use zeroize::Zeroizing;
 
 use lastchance::cli::{parse_headless_args, parse_profile_dir, HeadlessArgs};
 use lastchance::i18n::{tr, Lang, Texts, WelcomeText};
-use lastchance::identity::{Identity, IdentityManager, IDENTITY_FILE_NAME};
+use lastchance::identity::{
+    fingerprint_hex, Identity, IdentityInvite, IdentityManager, IDENTITY_FILE_NAME,
+};
 use lastchance::network::config::notify_level_label;
-use lastchance::storage::{Storage, LEGACY_DB_FILE_NAME, VAULT_FILE_NAME};
+use lastchance::storage::{
+    Storage, LEGACY_DB_FILE_NAME, TOFU_CHANGED, TOFU_PENDING, TOFU_VERIFIED, VAULT_FILE_NAME,
+};
 use lastchance::{get_base_dir_with_override, vault, App, AppEvent, Config, Vault};
 
 // ============================================================
@@ -103,6 +107,7 @@ const COMMANDS: &[&str] = &[
     "/messages",
     "/ttl",
     "/ttl-syn",
+    "/ratchet-reset",
     "/sendfile",
     "/download",
     "/nick",
@@ -164,6 +169,8 @@ struct UiState {
     recovery: Option<RecoveryFlow>,
     /// Менеджер контактов (`/contacts`, `/cnt`).
     contacts: Option<ContactsFlow>,
+    /// Диалог подтверждения импорта подписанного invite.
+    pending_import: Option<PendingImport>,
     /// Текущий язык интерфейса.
     lang: Lang,
     /// Активный RAM-TTL текущей комнаты (секунды).
@@ -327,7 +334,14 @@ struct ContactRow {
     nickname: String,
     x25519: String,
     ed25519: Option<String>,
+    fingerprint: Option<String>,
+    tofu_state: String,
     messages: usize,
+}
+
+/// Подписанный invite, ожидающий подтверждения пользователем.
+struct PendingImport {
+    invite: IdentityInvite,
 }
 
 /// Модальное окно `/contacts`: список, фильтр, карточка и действия.
@@ -398,6 +412,12 @@ impl ContactsFlow {
             row.nickname = nickname.to_string();
         }
         self.apply_filter();
+    }
+
+    fn mark_verified(&mut self, hash: &str) {
+        if let Some(row) = self.rows.iter_mut().find(|row| row.hash == hash) {
+            row.tofu_state = TOFU_VERIFIED.to_string();
+        }
     }
 }
 
@@ -627,6 +647,7 @@ impl UiState {
             help: None,
             recovery: None,
             contacts: None,
+            pending_import: None,
             lang,
             ttl_seconds: None,
             ttl_synced: false,
@@ -2263,7 +2284,12 @@ fn draw_ui(frame: &mut Frame, state: &mut UiState) {
 
         let cursor_x = input_inner.x + prefix.len() as u16 + cursor_col as u16;
         let cursor_y = input_inner.y;
-        if state.help.is_none() && state.recovery.is_none() && state.welcome.is_none() && state.contacts.is_none() {
+        if state.help.is_none()
+            && state.recovery.is_none()
+            && state.welcome.is_none()
+            && state.contacts.is_none()
+            && state.pending_import.is_none()
+        {
             frame.set_cursor_position(Position::new(
                 cursor_x.min(input_inner.right().saturating_sub(1)),
                 cursor_y,
@@ -2285,6 +2311,9 @@ fn draw_ui(frame: &mut Frame, state: &mut UiState) {
     }
     if state.welcome.is_some() {
         draw_welcome_modal(frame, state);
+    }
+    if state.pending_import.is_some() {
+        draw_import_modal(frame, state);
     }
 }
 
@@ -2766,9 +2795,16 @@ fn draw_contact_info(frame: &mut Frame, flow: &ContactsFlow, inner: Rect, lang: 
     let width = inner.width.max(1) as usize;
 
     let missing = texts.contacts_info_ed25519_missing.to_string();
-    let fields: [(&str, String); 5] = [
+    let fingerprint = row
+        .fingerprint
+        .as_deref()
+        .map(group_fingerprint)
+        .unwrap_or_else(|| texts.contacts_info_none.to_string());
+    let fields: [(&str, String); 7] = [
         (texts.contacts_info_name, row.nickname.clone()),
         (texts.contacts_info_hash, row.hash.clone()),
+        (texts.contacts_info_fingerprint, fingerprint),
+        (texts.contacts_info_tofu, tofu_label(lang, &row.tofu_state)),
         (texts.contacts_info_x25519, row.x25519.clone()),
         (
             texts.contacts_info_ed25519,
@@ -2811,6 +2847,97 @@ fn draw_contact_info(frame: &mut Frame, flow: &ContactsFlow, inner: Rect, lang: 
         footer.remove(0);
     }
     frame.render_widget(Paragraph::new(Text::from(footer)), footer_area);
+}
+
+/// Диалог подтверждения импорта подписанного invite.
+fn draw_import_modal(frame: &mut Frame, state: &UiState) {
+    let Some(pending) = state.pending_import.as_ref() else {
+        return;
+    };
+    let invite = &pending.invite;
+    let texts = state.lang.texts();
+
+    let area = frame.area();
+    let width = 88
+        .min(area.width.saturating_sub(2))
+        .max(20)
+        .min(area.width);
+    let height = 24
+        .min(area.height.saturating_sub(2))
+        .max(10)
+        .min(area.height);
+    let rect = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+
+    frame.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Line::from(Span::styled(
+            texts.import_title,
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )))
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    let fields = [
+        (texts.import_nickname, invite.display_nickname()),
+        (texts.import_hash, invite.hash_hex()),
+        (
+            texts.import_fingerprint,
+            group_fingerprint(&invite.fingerprint_hex()),
+        ),
+        (
+            texts.import_x25519,
+            hex::encode(invite.doc.x25519_pub),
+        ),
+        (
+            texts.import_ed25519,
+            hex::encode(invite.doc.ed25519_pub),
+        ),
+    ];
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        texts.import_intro,
+        Style::default().fg(Color::Yellow),
+    )));
+    lines.push(Line::from(""));
+    for (template, value) in fields {
+        let text = tr(template, &[&value]);
+        for chunk in wrap_help_text(&text, inner.width.max(1) as usize) {
+            lines.push(Line::from(Span::styled(
+                chunk,
+                Style::default().fg(Color::Gray),
+            )));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        texts.import_hint,
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+fn tofu_label(lang: Lang, state: &str) -> String {
+    let texts = lang.texts();
+    match state {
+        TOFU_VERIFIED => texts.contacts_tofu_verified.to_string(),
+        TOFU_CHANGED => texts.contacts_tofu_changed.to_string(),
+        TOFU_PENDING => texts.contacts_tofu_pending.to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// Рисует приветственное окно первого запуска с выбором языка.
@@ -3164,37 +3291,9 @@ fn handle_app_event(app: &Arc<App>, state: &mut UiState, event: AppEvent) {
             push_system(state, &message);
             state.status = message;
         }
-        AppEvent::ContactImport {
-            hash,
-            x25519,
-            ed25519,
-            nickname,
-        } => match app.add_contact_with_ed25519(
-            &hash,
-            &x25519,
-            ed25519.as_deref(),
-            &nickname,
-        ) {
-            Ok(()) => {
-                refresh_chats(app, state);
-                switch_to_room(app, state, &hash);
-                push_system(
-                    state,
-                    &tr(
-                        state.lang.texts().deep_link_added,
-                        &[&nickname, &short_hash(&hash)],
-                    ),
-                );
-                state.status = state.lang.texts().contact_added.to_string();
-            }
-            Err(e) => push_error(
-                state,
-                &tr(
-                    state.lang.texts().deep_link_error,
-                    &[&format!("{:#}", e)],
-                ),
-            ),
-        },
+        AppEvent::ContactImport { invite } => {
+            open_import_dialog(state, invite);
+        }
         AppEvent::ContactImportError { error } => {
             push_error(state, &tr(state.lang.texts().contact_import_error, &[&error]));
         }
@@ -3515,9 +3614,21 @@ fn load_contact_rows(app: &App) -> Result<Vec<ContactRow>> {
             .count_contact_messages(&contact.hash)
             .unwrap_or(0);
 
+        let computed_fingerprint = contact
+            .ed25519
+            .as_deref()
+            .and_then(|value| hex::decode(value).ok())
+            .and_then(|value| <[u8; 32]>::try_from(value).ok())
+            .and_then(|ed25519| {
+                let x25519 = <[u8; 32]>::try_from(contact.public_key.as_slice()).ok()?;
+                Some(fingerprint_hex(&ed25519, &x25519))
+            });
+
         rows.push(ContactRow {
             x25519: hex::encode(&contact.public_key),
             ed25519: contact.ed25519,
+            fingerprint: contact.fingerprint.or(computed_fingerprint),
+            tofu_state: contact.tofu_state,
             hash: contact.hash,
             nickname: contact.nickname,
             messages,
@@ -3553,24 +3664,18 @@ fn close_contacts(state: &mut UiState) {
     state.status = state.lang.texts().contacts_closed.to_string();
 }
 
-/// Собирает ссылку-приглашение для выбранного контакта.
-fn contact_link(row: &ContactRow) -> String {
-    use url::form_urlencoded;
+/// Отпечаток контакта для копирования и сверки вне канала.
+fn contact_fingerprint(row: &ContactRow) -> Option<String> {
+    row.fingerprint.as_deref().map(group_fingerprint)
+}
 
-    let mut params = vec![
-        ("hash", row.hash.as_str()),
-        ("x25519", row.x25519.as_str()),
-        ("nickname", row.nickname.as_str()),
-    ];
-    if let Some(ed25519) = row.ed25519.as_deref() {
-        params.push(("ed25519", ed25519));
-    }
-
-    let encoded: String = form_urlencoded::Serializer::new(String::new())
-        .extend_pairs(params)
-        .finish();
-
-    format!("lastchance://contact?{}", encoded)
+fn group_fingerprint(fingerprint: &str) -> String {
+    fingerprint
+        .as_bytes()
+        .chunks(4)
+        .map(|chunk| String::from_utf8_lossy(chunk).to_string())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Возвращает актуальный список контактов в открытое окно, сохраняя фильтр.
@@ -3731,8 +3836,20 @@ fn handle_contacts_list_key(app: &App, state: &mut UiState, key: KeyEvent, ctrl:
             }
         }
         ContactsAction::Copy(row) => {
-            let link = contact_link(&row);
-            match copy_to_clipboard(state, &link) {
+            let Some(fingerprint) = contact_fingerprint(&row) else {
+                if let Some(flow) = state.contacts.as_mut() {
+                    flow.notice = Some(
+                        state
+                            .lang
+                            .texts()
+                            .contacts_fingerprint_missing
+                            .to_string(),
+                    );
+                }
+                return;
+            };
+
+            match copy_to_clipboard(state, &fingerprint) {
                 Ok(()) => {
                     if let Some(flow) = state.contacts.as_mut() {
                         flow.notice =
@@ -3929,6 +4046,34 @@ fn handle_contacts_key(app: &App, state: &mut UiState, key: KeyEvent) {
                 if let Some(flow) = state.contacts.as_mut() {
                     flow.stage = ContactsStage::List;
                 }
+            } else if matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V')) {
+                let hash = state
+                    .contacts
+                    .as_ref()
+                    .and_then(ContactsFlow::selected_row)
+                    .map(|row| row.hash.clone());
+                let Some(hash) = hash else {
+                    return;
+                };
+
+                match app.verify_contact_fingerprint(&hash) {
+                    Ok(()) => {
+                        if let Some(flow) = state.contacts.as_mut() {
+                            flow.mark_verified(&hash);
+                            flow.notice =
+                                Some(state.lang.texts().contacts_verified.to_string());
+                        }
+                        state.status = state.lang.texts().contacts_verified_status.to_string();
+                    }
+                    Err(e) => {
+                        if let Some(flow) = state.contacts.as_mut() {
+                            flow.notice = Some(tr(
+                                state.lang.texts().contacts_verify_error,
+                                &[&format!("{:#}", e)],
+                            ));
+                        }
+                    }
+                }
             }
         }
         ContactsStage::ConfirmDelete => match key.code {
@@ -4045,6 +4190,13 @@ async fn handle_terminal_event(
             // Приветственное окно первого запуска перехватывает навигацию.
             if state.welcome.is_some() {
                 handle_welcome_key(app, state, key);
+                return Ok(false);
+            }
+
+            // Подтверждение импорта invite имеет приоритет над остальными
+            // модальными окнами.
+            if state.pending_import.is_some() {
+                handle_import_key(app, state, key);
                 return Ok(false);
             }
 
@@ -4491,29 +4643,13 @@ async fn send_plain_message(app: &Arc<App>, state: &mut UiState, text: &str) {
 }
 
 fn validated_invite_link(app: &App, lang: Lang) -> Result<String> {
-    let link = app.get_my_contact_link();
-    let ed25519 = link
-        .split("ed25519=")
-        .nth(1)
-        .and_then(|rest| rest.split('&').next())
-        .unwrap_or_default();
-
-    let bytes = hex::decode(ed25519).map_err(|e| {
+    let link = app.get_my_contact_link()?;
+    IdentityInvite::from_link(&link).map_err(|e| {
         anyhow!(
             "{}",
-            tr(lang.texts().invalid_ed25519, &[&e.to_string()])
+            tr(lang.texts().invalid_invite, &[&format!("{:#}", e)])
         )
     })?;
-    if bytes.len() != 32 {
-        return Err(anyhow!(
-            "{}",
-            tr(
-                lang.texts().truncated_ed25519,
-                &[&ed25519.len().to_string()]
-            )
-        ));
-    }
-
     Ok(link)
 }
 
@@ -4693,24 +4829,61 @@ fn save_invite_file(
     Ok(full)
 }
 
-/// Добавляет контакт и открывает с ним активную комнату.
-fn apply_join(
-    app: &App,
-    state: &mut UiState,
-    hash: &str,
-    x25519: &str,
-    ed25519: Option<&str>,
-    nickname: &str,
-) -> Result<()> {
-    app.add_contact_with_ed25519(hash, x25519, ed25519, nickname)?;
-    refresh_chats(app, state);
-    switch_to_room(app, state, hash);
-    push_system(
-        state,
-        &tr(state.lang.texts().contact_added_room, &[&state.room_label]),
-    );
-    state.status = state.lang.texts().contact_added.to_string();
-    Ok(())
+/// Открывает диалог подтверждения импорта; добавление произойдёт только
+/// после явного подтверждения пользователем.
+fn open_import_dialog(state: &mut UiState, invite: IdentityInvite) {
+    clear_input(state);
+    state.pending_import = Some(PendingImport { invite });
+    state.status = state.lang.texts().import_waiting.to_string();
+}
+
+fn handle_import_key(app: &App, state: &mut UiState, key: KeyEvent) {
+    match key.code {
+        KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+            let Some(pending) = state.pending_import.take() else {
+                return;
+            };
+
+            match app.add_contact_with_ed25519(&pending.invite) {
+                Ok(outcome) => {
+                    refresh_chats(app, state);
+                    switch_to_room(app, state, &outcome.hash);
+
+                    let fingerprint = group_fingerprint(&outcome.fingerprint);
+                    if outcome.x25519_changed {
+                        push_system(
+                            state,
+                            &tr(
+                                state.lang.texts().import_changed_warning,
+                                &[&outcome.nickname, &fingerprint],
+                            ),
+                        );
+                    } else {
+                        push_system(
+                            state,
+                            &tr(
+                                state.lang.texts().import_added,
+                                &[&outcome.nickname, &fingerprint],
+                            ),
+                        );
+                    }
+                    state.status = state.lang.texts().contact_added.to_string();
+                }
+                Err(e) => push_error(
+                    state,
+                    &tr(
+                        state.lang.texts().import_error,
+                        &[&format!("{:#}", e)],
+                    ),
+                ),
+            }
+        }
+        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('q') => {
+            state.pending_import = None;
+            state.status = state.lang.texts().import_cancelled.to_string();
+        }
+        _ => {}
+    }
 }
 
 async fn handle_command(
@@ -4783,7 +4956,13 @@ async fn handle_command(
             ),
         },
 
-        "/export" => push_system(state, &app.get_my_contact_json()),
+        "/export" => match app.get_my_contact_json() {
+            Ok(json) => push_system(state, &json),
+            Err(e) => push_error(
+                state,
+                &tr(state.lang.texts().profile_serialize_error, &[&format!("{:#}", e)]),
+            ),
+        },
 
         "/contacts" => open_contacts(app, state),
 
@@ -4794,47 +4973,21 @@ async fn handle_command(
                 match rest.get(1) {
                     Some(path) => std::fs::read_to_string(path)
                         .map_err(|e| anyhow!("{}", tr(state.lang.texts().join_file_error, &[path, &e.to_string()])))
-                        .and_then(|content| {
-                            let link = content.trim();
-                            parse_contact_link(link, state.lang).and_then(
-                                |(hash, key, ed25519, nickname)| {
-                                    apply_join(
-                                        app,
-                                        state,
-                                        &hash,
-                                        &key,
-                                        ed25519.as_deref(),
-                                        &nickname,
-                                    )
-                                },
-                            )
-                        }),
+                        .and_then(|content| parse_contact_link(content.trim(), state.lang)),
                     None => Err(anyhow!("{}", state.lang.texts().join_usage_file)),
                 }
             } else if rest.len() == 1 {
-                parse_contact_link(rest[0], state.lang).and_then(
-                    |(hash, key, ed25519, nickname)| {
-                        apply_join(
-                            app,
-                            state,
-                            &hash,
-                            &key,
-                            ed25519.as_deref(),
-                            &nickname,
-                        )
-                    },
-                )
-            } else if rest.len() >= 3 && !rest[0].starts_with("lastchance://") {
-                apply_join(app, state, rest[0], rest[1], None, rest[2])
+                parse_contact_link(rest[0], state.lang)
             } else {
                 Err(anyhow!("{}", state.lang.texts().join_usage))
             };
 
-            if let Err(e) = result {
-                push_error(
+            match result {
+                Ok(invite) => open_import_dialog(state, invite),
+                Err(e) => push_error(
                     state,
                     &tr(state.lang.texts().join_error, &[&format!("{:#}", e)]),
-                );
+                ),
             }
         }
 
@@ -4956,6 +5109,13 @@ async fn handle_command(
                 }
             };
 
+            // При выключении TTL состояние затирается, поэтому собеседник
+            // получает управляющий пакет и тоже начинает сессию заново.
+            // При включении текущая сессия просто переносится в RAM.
+            if seconds.is_none() {
+                let _ = app.reset_ratchet_with_peer(&state.room).await;
+            }
+
             match app.set_room_ttl(&state.room, seconds) {
                 Ok(()) => {
                     sync_ttl_state(app, state);
@@ -5029,6 +5189,28 @@ async fn handle_command(
                     state,
                     &tr(
                         state.lang.texts().ttl_apply_error,
+                        &[&format!("{:#}", e)],
+                    ),
+                ),
+            }
+        }
+
+        "/ratchet-reset" => {
+            if state.room.is_empty() {
+                push_error(state, state.lang.texts().no_active_room_short);
+                return Ok(false);
+            }
+
+            match app.reset_ratchet_with_peer(&state.room).await {
+                Ok(()) => {
+                    let text = state.lang.texts().ratchet_reset_done.to_string();
+                    push_system(state, &text);
+                    state.status = text;
+                }
+                Err(e) => push_error(
+                    state,
+                    &tr(
+                        state.lang.texts().ratchet_reset_error,
                         &[&format!("{:#}", e)],
                     ),
                 ),
@@ -5543,18 +5725,14 @@ fn resolve_headless_recipient(app: &App, raw: &str) -> Result<String> {
 
     if raw.starts_with("lastchance://") {
         let lang = app.get_config().lang;
-        let (hash, x25519, ed25519, nickname) = parse_contact_link(raw, lang)?;
+        let invite = parse_contact_link(raw, lang)?;
+        let hash = invite.hash_hex();
         let known = app
             .get_contacts()?
             .iter()
             .any(|contact| contact.hash == hash);
         if !known {
-            app.add_contact_with_ed25519(
-                &hash,
-                &x25519,
-                ed25519.as_deref(),
-                &nickname,
-            )?;
+            app.add_contact_with_ed25519(&invite)?;
         }
         return Ok(hash);
     }
@@ -5640,33 +5818,9 @@ async fn run_headless(args: &HeadlessArgs, base_dir: &str) -> Result<()> {
     Ok(())
 }
 
-fn parse_contact_link(
-    raw: &str,
-    lang: Lang,
-) -> Result<(String, String, Option<String>, String)> {
-    let params_str = raw
-        .strip_prefix("lastchance://contact?")
-        .ok_or_else(|| anyhow!("{}", lang.texts().not_contact_link))?;
-
-    let params: std::collections::HashMap<String, String> =
-        url::form_urlencoded::parse(params_str.as_bytes())
-            .into_owned()
-            .collect();
-
-    let hash = params.get("hash").cloned().unwrap_or_default();
-    let x25519 = params.get("x25519").cloned().unwrap_or_default();
-    let ed25519 = params
-        .get("ed25519")
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-    let nickname = params.get("nickname").cloned().unwrap_or_default();
-
-    if hash.is_empty() || x25519.is_empty() || nickname.is_empty() {
-        return Err(anyhow!("{}", lang.texts().missing_link_params));
-    }
-
-    Ok((hash, x25519, ed25519, nickname))
+fn parse_contact_link(raw: &str, lang: Lang) -> Result<IdentityInvite> {
+    IdentityInvite::from_link(raw)
+        .map_err(|e| anyhow!("{}", tr(lang.texts().invalid_invite, &[&format!("{:#}", e)])))
 }
 
 #[allow(clippy::too_many_arguments)]

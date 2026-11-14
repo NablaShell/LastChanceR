@@ -3,16 +3,399 @@ use crate::storage::SafeFSOps;
 use crate::vault::{self, MasterKey, Vault};
 use anyhow::{anyhow, Result};
 use bip39::Mnemonic;
-use ed25519_dalek::SigningKey;
+use ciborium::Value;
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hkdf::Hkdf;
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 pub const IDENTITY_FILE_NAME: &str = "identity.json";
 
 const IDENTITY_AAD: &[u8] = b"lastchance:identity.json";
+
+/// Версия подписываемого identity-документа.
+pub const IDENTITY_DOC_VERSION: u64 = 1;
+/// Максимальная длина ника в identity-документе (UTF-8 байты).
+pub const MAX_NICKNAME_BYTES: usize = 64;
+/// Максимальный размер CBOR-документа в URL (hex-строка).
+const MAX_DOC_HEX_LEN: usize = 8 * 1024;
+
+const INVITE_PREFIX: &str = "lastchance://contact?";
+const FINGERPRINT_CONTEXT: &[u8] = b"lastchance:identity-fingerprint:v1";
+
+/// Подписываемый документ личности.
+///
+/// В документ входят оба публичных ключа, поэтому Ed25519-подпись
+/// криптографически связывает X25519-ключ с владельцем Ed25519-ключа.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityDoc {
+    pub version: u64,
+    pub ed25519_pub: [u8; 32],
+    pub x25519_pub: [u8; 32],
+    pub nickname: Option<String>,
+    pub created_at: u64,
+}
+
+impl IdentityDoc {
+    pub fn new(
+        version: u64,
+        ed25519_pub: [u8; 32],
+        x25519_pub: [u8; 32],
+        nickname: Option<String>,
+        created_at: u64,
+    ) -> Result<Self> {
+        if version != IDENTITY_DOC_VERSION {
+            return Err(anyhow!(
+                "unsupported identity document version: {}",
+                version
+            ));
+        }
+        if let Some(name) = nickname.as_deref() {
+            if name.len() > MAX_NICKNAME_BYTES {
+                return Err(anyhow!(
+                    "nickname is too long: {} bytes (max {})",
+                    name.len(),
+                    MAX_NICKNAME_BYTES
+                ));
+            }
+        }
+
+        Ok(Self {
+            version,
+            ed25519_pub,
+            x25519_pub,
+            nickname,
+            created_at,
+        })
+    }
+
+    /// Создаёт документ из срезов ключей (используется `App`).
+    pub fn from_slices(
+        ed25519_pub: &[u8],
+        x25519_pub: &[u8],
+        nickname: Option<String>,
+        created_at: u64,
+    ) -> Result<Self> {
+        let ed25519_pub = ed25519_pub
+            .try_into()
+            .map_err(|_| anyhow!("ed25519 public key must be 32 bytes"))?;
+        let x25519_pub = x25519_pub
+            .try_into()
+            .map_err(|_| anyhow!("x25519 public key must be 32 bytes"))?;
+        Self::new(
+            IDENTITY_DOC_VERSION,
+            ed25519_pub,
+            x25519_pub,
+            nickname,
+            created_at,
+        )
+    }
+
+    /// RFC 8949 deterministic encoding: минимальные целые, definite-length
+    /// строки и ключи map, отсортированные по байтам их CBOR-кодирования.
+    pub fn canonical_cbor(&self) -> Result<Vec<u8>> {
+        let mut fields: Vec<(&str, Value)> = vec![
+            ("version", Value::Integer(self.version.into())),
+            ("ed25519_pub", Value::Bytes(self.ed25519_pub.to_vec())),
+            ("x25519_pub", Value::Bytes(self.x25519_pub.to_vec())),
+            ("created_at", Value::Integer(self.created_at.into())),
+        ];
+        if let Some(nickname) = self.nickname.as_deref() {
+            fields.push(("nickname", Value::Text(nickname.to_string())));
+        }
+
+        // Для коротких tstr ключей порядок encoded-key совпадает с
+        // порядком (длина, байты): заголовок major type 3 кодирует длину.
+        fields.sort_by(|(left, _), (right, _)| {
+            left.len()
+                .cmp(&right.len())
+                .then_with(|| left.as_bytes().cmp(right.as_bytes()))
+        });
+
+        let value = Value::Map(
+            fields
+                .into_iter()
+                .map(|(key, value)| (Value::Text(key.to_string()), value))
+                .collect(),
+        );
+
+        let mut out = Vec::new();
+        ciborium::ser::into_writer(&value, &mut out)
+            .map_err(|e| anyhow!("failed to encode identity document: {}", e))?;
+        Ok(out)
+    }
+
+    /// Разбирает документ и требует, чтобы вход был именно каноническим CBOR.
+    pub fn from_canonical_cbor(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > MAX_DOC_HEX_LEN / 2 {
+            return Err(anyhow!("identity document is too large"));
+        }
+
+        let value: Value = ciborium::de::from_reader(bytes)
+            .map_err(|e| anyhow!("invalid identity CBOR: {}", e))?;
+        let map = value
+            .as_map()
+            .ok_or_else(|| anyhow!("identity document must be a CBOR map"))?;
+
+        let mut seen = HashSet::new();
+        let mut version = None;
+        let mut ed25519_pub = None;
+        let mut x25519_pub = None;
+        let mut nickname = None;
+        let mut created_at = None;
+
+        for (key, value) in map {
+            let key = key
+                .as_text()
+                .ok_or_else(|| anyhow!("identity document keys must be text"))?;
+            if !seen.insert(key.to_string()) {
+                return Err(anyhow!("duplicate identity document key: {}", key));
+            }
+
+            match key {
+                "version" => version = Some(cbor_u64(value, key)?),
+                "ed25519_pub" => ed25519_pub = Some(cbor_bytes32(value, key)?),
+                "x25519_pub" => x25519_pub = Some(cbor_bytes32(value, key)?),
+                "nickname" => {
+                    let text = value
+                        .as_text()
+                        .ok_or_else(|| anyhow!("nickname must be a text string"))?;
+                    nickname = Some(text.to_string());
+                }
+                "created_at" => created_at = Some(cbor_u64(value, key)?),
+                other => return Err(anyhow!("unknown identity document key: {}", other)),
+            }
+        }
+
+        let doc = Self::new(
+            version.ok_or_else(|| anyhow!("identity document is missing version"))?,
+            ed25519_pub.ok_or_else(|| anyhow!("identity document is missing ed25519_pub"))?,
+            x25519_pub.ok_or_else(|| anyhow!("identity document is missing x25519_pub"))?,
+            nickname,
+            created_at.ok_or_else(|| anyhow!("identity document is missing created_at"))?,
+        )?;
+
+        if doc.canonical_cbor()? != bytes {
+            return Err(anyhow!(
+                "identity document is not canonical CBOR (RFC 8949 deterministic encoding required)"
+            ));
+        }
+
+        Ok(doc)
+    }
+
+    /// `sha256(ed25519_pub)`, hex. Единственный источник identity hash.
+    pub fn hash_hex(&self) -> String {
+        hash_ed25519_public(&self.ed25519_pub)
+    }
+
+    /// Отпечаток связки обоих ключей для сверки вне канала.
+    pub fn fingerprint_hex(&self) -> String {
+        fingerprint_hex(&self.ed25519_pub, &self.x25519_pub)
+    }
+}
+
+/// Подписанный identity-документ из invite-ссылки.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityInvite {
+    pub doc: IdentityDoc,
+    pub signature: [u8; 64],
+}
+
+impl IdentityInvite {
+    /// Подписывает канонический CBOR-блок целиком.
+    pub fn sign(doc: IdentityDoc, signing_key: &SigningKey) -> Result<Self> {
+        let bytes = doc.canonical_cbor()?;
+        let signature = signing_key.sign(&bytes);
+        Ok(Self {
+            doc,
+            signature: signature.to_bytes(),
+        })
+    }
+
+    /// Проверяет Ed25519-подпись документа.
+    pub fn verify(&self) -> Result<()> {
+        let bytes = self.doc.canonical_cbor()?;
+        let verifying_key = VerifyingKey::from_bytes(&self.doc.ed25519_pub)
+            .map_err(|e| anyhow!("invalid ed25519 public key: {}", e))?;
+        let signature = Signature::from_bytes(&self.signature);
+        verifying_key
+            .verify(&bytes, &signature)
+            .map_err(|_| anyhow!("invalid identity document signature"))
+    }
+
+    pub fn hash_hex(&self) -> String {
+        self.doc.hash_hex()
+    }
+
+    pub fn fingerprint_hex(&self) -> String {
+        self.doc.fingerprint_hex()
+    }
+
+    pub fn display_nickname(&self) -> String {
+        self.doc
+            .nickname
+            .clone()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| format!("user_{}", &self.hash_hex()[..8]))
+    }
+
+    /// Сериализует подписанный документ в invite-ссылку.
+    pub fn to_link(&self) -> Result<String> {
+        let doc_hex = hex::encode(self.doc.canonical_cbor()?);
+        let sig_hex = hex::encode(self.signature);
+        let hash = self.hash_hex();
+        let x25519 = hex::encode(self.doc.x25519_pub);
+        let ed25519 = hex::encode(self.doc.ed25519_pub);
+
+        let mut params = vec![
+            ("hash", hash.as_str()),
+            ("doc", doc_hex.as_str()),
+            ("sig", sig_hex.as_str()),
+            ("x25519", x25519.as_str()),
+            ("ed25519", ed25519.as_str()),
+        ];
+        if let Some(nickname) = self.doc.nickname.as_deref() {
+            params.push(("nickname", nickname));
+        }
+
+        let encoded: String = url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs(params.iter())
+            .finish();
+
+        Ok(format!("{}{}", INVITE_PREFIX, encoded))
+    }
+
+    /// Разбирает и полностью проверяет invite-ссылку.
+    ///
+    /// Ссылка без `doc`/`sig` (старый формат) отклоняется: иначе подмена
+    /// X25519-ключа в URL оставалась бы незамеченной.
+    pub fn from_link(raw: &str) -> Result<Self> {
+        let params_str = raw
+            .strip_prefix(INVITE_PREFIX)
+            .ok_or_else(|| anyhow!("this is not a lastchance://contact?... link"))?;
+
+        let mut params = HashMap::new();
+        for (key, value) in url::form_urlencoded::parse(params_str.as_bytes()) {
+            if params.contains_key(key.as_ref()) {
+                return Err(anyhow!("duplicate invite parameter: {}", key));
+            }
+            params.insert(key.into_owned(), value.into_owned());
+        }
+
+        let hash = params
+            .get("hash")
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("invite is missing identity hash"))?;
+        let doc_hex = params
+            .get("doc")
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                anyhow!("unsigned/legacy invite rejected: missing identity document")
+            })?;
+        if doc_hex.len() > MAX_DOC_HEX_LEN {
+            return Err(anyhow!("identity document in invite is too large"));
+        }
+        let sig_hex = params
+            .get("sig")
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("unsigned/legacy invite rejected: missing signature"))?;
+
+        let doc_bytes =
+            hex::decode(doc_hex).map_err(|e| anyhow!("invalid identity document hex: {}", e))?;
+        let doc = IdentityDoc::from_canonical_cbor(&doc_bytes)?;
+
+        let sig_bytes = hex::decode(sig_hex).map_err(|e| anyhow!("invalid signature hex: {}", e))?;
+        let signature: [u8; 64] = sig_bytes
+            .try_into()
+            .map_err(|_| anyhow!("identity signature must be 64 bytes"))?;
+
+        let invite = Self { doc, signature };
+        invite.verify()?;
+
+        let computed_hash = invite.hash_hex();
+        if !hash.eq_ignore_ascii_case(&computed_hash) {
+            return Err(anyhow!(
+                "identity hash mismatch: link has {}, but sha256(ed25519_pub) is {}",
+                hash,
+                computed_hash
+            ));
+        }
+
+        if let Some(value) = params.get("x25519").filter(|value| !value.is_empty()) {
+            let bytes =
+                hex::decode(value).map_err(|e| anyhow!("invalid x25519 hex in link: {}", e))?;
+            if bytes != invite.doc.x25519_pub {
+                return Err(anyhow!(
+                    "x25519 key in link does not match the signed identity document"
+                ));
+            }
+        }
+
+        if let Some(value) = params.get("ed25519").filter(|value| !value.is_empty()) {
+            let bytes =
+                hex::decode(value).map_err(|e| anyhow!("invalid ed25519 hex in link: {}", e))?;
+            if bytes != invite.doc.ed25519_pub {
+                return Err(anyhow!(
+                    "ed25519 key in link does not match the signed identity document"
+                ));
+            }
+        }
+
+        if let Some(value) = params.get("nickname").filter(|value| !value.is_empty()) {
+            match invite.doc.nickname.as_deref() {
+                Some(signed) if signed == value => {}
+                Some(_) => {
+                    return Err(anyhow!(
+                        "nickname in link does not match the signed identity document"
+                    ));
+                }
+                None => {
+                    return Err(anyhow!(
+                        "unsigned nickname is not allowed without a signed nickname"
+                    ));
+                }
+            }
+        }
+
+        Ok(invite)
+    }
+}
+
+fn cbor_u64(value: &Value, field: &str) -> Result<u64> {
+    let integer = value
+        .as_integer()
+        .ok_or_else(|| anyhow!("{} must be an unsigned integer", field))?;
+    u64::try_from(integer).map_err(|_| anyhow!("{} is out of range", field))
+}
+
+fn cbor_bytes32(value: &Value, field: &str) -> Result<[u8; 32]> {
+    let bytes = value
+        .as_bytes()
+        .ok_or_else(|| anyhow!("{} must be a byte string", field))?;
+    bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("{} must be exactly 32 bytes", field))
+}
+
+pub fn hash_ed25519_public(ed25519_pub: &[u8; 32]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(ed25519_pub);
+    hex::encode(hasher.finalize())
+}
+
+/// Отпечаток связки `ed25519_pub || x25519_pub`, hex.
+pub fn fingerprint_hex(ed25519_pub: &[u8; 32], x25519_pub: &[u8; 32]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(FINGERPRINT_CONTEXT);
+    hasher.update(ed25519_pub);
+    hasher.update(x25519_pub);
+    hex::encode(hasher.finalize())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Identity {
@@ -150,6 +533,7 @@ impl IdentityManager {
 
         let identity: Identity = serde_json::from_slice(&plaintext)
             .map_err(|e| anyhow!("failed to unmarshal identity: {}", e))?;
+        identity.validate()?;
 
         // Файл старого формата сразу перезаписываем зашифрованным.
         if legacy {
@@ -301,6 +685,56 @@ fn derive_keys_from_seed(seed: &[u8]) -> Result<DerivedKeys> {
 }
 
 impl Identity {
+    /// Проверяет, что сохранённые ключи и `hash` согласованы.
+    ///
+    /// Это защищает от повреждённого/подменённого `identity.json`:
+    /// `hash` обязан быть `sha256(ed25519_pub)`, а X25519-ключ — парой
+    /// к сохранённому приватному ключу.
+    pub fn validate(&self) -> Result<()> {
+        let ed25519_private: [u8; 32] = self
+            .ed25519_private_key
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("identity has invalid ed25519 private key length"))?;
+        let ed25519_public: [u8; 32] = self
+            .ed25519_public_key
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("identity has invalid ed25519 public key length"))?;
+        let x25519_private: [u8; 32] = self
+            .private_key
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("identity has invalid x25519 private key length"))?;
+        let x25519_public: [u8; 32] = self
+            .public_key
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("identity has invalid x25519 public key length"))?;
+
+        let signing_key = SigningKey::from_bytes(&ed25519_private);
+        if signing_key.verifying_key().as_bytes() != &ed25519_public {
+            return Err(anyhow!(
+                "identity ed25519 public key does not match its private key"
+            ));
+        }
+
+        let x_secret = StaticSecret::from(x25519_private);
+        if PublicKey::from(&x_secret).as_bytes() != &x25519_public {
+            return Err(anyhow!(
+                "identity x25519 public key does not match its private key"
+            ));
+        }
+
+        if !self.hash.eq_ignore_ascii_case(&hash_ed25519_public(&ed25519_public)) {
+            return Err(anyhow!(
+                "identity hash does not match sha256(ed25519_pub)"
+            ));
+        }
+
+        Ok(())
+    }
+
     pub fn get_public_key_hex(&self) -> String {
         hex::encode(&self.public_key)
     }
@@ -376,5 +810,141 @@ mod tests {
         let invalid =
             "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon notaword";
         assert!(Identity::from_mnemonic(invalid, "").is_err());
+    }
+
+    fn test_doc(x25519_byte: u8) -> IdentityDoc {
+        IdentityDoc::new(
+            1,
+            [7u8; 32],
+            [x25519_byte; 32],
+            Some("alice".to_string()),
+            1_700_000_000,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn identity_doc_uses_canonical_sorted_cbor() {
+        let doc = test_doc(9);
+        let cbor = doc.canonical_cbor().unwrap();
+
+        // 5 entries; the first key is "version" (shortest encoded key).
+        assert_eq!(cbor[0], 0xa5);
+        assert_eq!(&cbor[1..2], &[0x67]);
+        assert_eq!(&cbor[2..9], b"version");
+
+        assert_eq!(IdentityDoc::from_canonical_cbor(&cbor).unwrap(), doc);
+    }
+
+    #[test]
+    fn identity_doc_rejects_non_canonical_cbor() {
+        let doc = test_doc(9);
+        let unordered = Value::Map(vec![
+            (
+                Value::Text("ed25519_pub".to_string()),
+                Value::Bytes(doc.ed25519_pub.to_vec()),
+            ),
+            (
+                Value::Text("x25519_pub".to_string()),
+                Value::Bytes(doc.x25519_pub.to_vec()),
+            ),
+            (
+                Value::Text("version".to_string()),
+                Value::Integer(doc.version.into()),
+            ),
+            (
+                Value::Text("created_at".to_string()),
+                Value::Integer(doc.created_at.into()),
+            ),
+            (
+                Value::Text("nickname".to_string()),
+                Value::Text("alice".to_string()),
+            ),
+        ]);
+        let mut encoded = Vec::new();
+        ciborium::ser::into_writer(&unordered, &mut encoded).unwrap();
+
+        assert!(IdentityDoc::from_canonical_cbor(&encoded).is_err());
+    }
+
+    #[test]
+    fn signed_invite_round_trips_and_binds_both_keys() {
+        let signing_key = SigningKey::from_bytes(&[3u8; 32]);
+        let mut doc = test_doc(11);
+        doc.ed25519_pub = *signing_key.verifying_key().as_bytes();
+
+        let invite = IdentityInvite::sign(doc.clone(), &signing_key).unwrap();
+        invite.verify().unwrap();
+
+        let link = invite.to_link().unwrap();
+        let parsed = IdentityInvite::from_link(&link).unwrap();
+        assert_eq!(parsed, invite);
+        assert_eq!(parsed.hash_hex(), doc.hash_hex());
+        assert_eq!(parsed.fingerprint_hex(), doc.fingerprint_hex());
+    }
+
+    #[test]
+    fn signed_invite_without_nickname_round_trips() {
+        let signing_key = SigningKey::from_bytes(&[8u8; 32]);
+        let doc = IdentityDoc::new(
+            1,
+            *signing_key.verifying_key().as_bytes(),
+            [9u8; 32],
+            None,
+            7,
+        )
+        .unwrap();
+        let invite = IdentityInvite::sign(doc, &signing_key).unwrap();
+        let link = invite.to_link().unwrap();
+
+        assert!(!link.contains("nickname="));
+        let parsed = IdentityInvite::from_link(&link).unwrap();
+        assert_eq!(parsed.doc.nickname, None);
+        assert!(parsed.display_nickname().starts_with("user_"));
+    }
+
+    #[test]
+    fn changed_x25519_invalidates_signature() {
+        let signing_key = SigningKey::from_bytes(&[4u8; 32]);
+        let mut doc = test_doc(12);
+        doc.ed25519_pub = *signing_key.verifying_key().as_bytes();
+        let mut invite = IdentityInvite::sign(doc, &signing_key).unwrap();
+
+        invite.doc.x25519_pub = [13u8; 32];
+        assert!(invite.verify().is_err());
+    }
+
+    #[test]
+    fn invite_rejects_hash_mismatch_and_tampered_fields() {
+        let signing_key = SigningKey::from_bytes(&[5u8; 32]);
+        let mut doc = test_doc(14);
+        doc.ed25519_pub = *signing_key.verifying_key().as_bytes();
+        let invite = IdentityInvite::sign(doc, &signing_key).unwrap();
+        let link = invite.to_link().unwrap();
+
+        let bad_hash = link.replacen(&invite.hash_hex(), &"0".repeat(64), 1);
+        assert!(IdentityInvite::from_link(&bad_hash).is_err());
+
+        let bad_x25519 = link.replacen(&hex::encode(invite.doc.x25519_pub), &hex::encode([15u8; 32]), 1);
+        assert!(IdentityInvite::from_link(&bad_x25519).is_err());
+    }
+
+    #[test]
+    fn identity_validation_rejects_hash_mismatch() {
+        let mut identity = Identity::from_mnemonic(VALID_PHRASE, "alice").unwrap();
+        identity.validate().unwrap();
+        identity.hash = "00".repeat(32);
+        assert!(identity.validate().is_err());
+    }
+
+    #[test]
+    fn legacy_unsigned_invite_is_rejected() {
+        let legacy = format!(
+            "lastchance://contact?hash={}&x25519={}&ed25519={}&nickname=alice",
+            "a".repeat(64),
+            "b".repeat(64),
+            "c".repeat(64)
+        );
+        assert!(IdentityInvite::from_link(&legacy).is_err());
     }
 }

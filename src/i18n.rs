@@ -209,6 +209,10 @@ texts! {
     ttl_badge_synced: "[RAM TTL-SYN: {}s]", "[RAM TTL-SYN: {}s]";
     ttl_purge_error: "TTL cleanup error: {}", "Ошибка очистки TTL: {}";
 
+    // ---------- Double Ratchet ----------
+    ratchet_reset_done: "Double Ratchet session reset; peer notified", "Сессия Double Ratchet сброшена; собеседник уведомлён";
+    ratchet_reset_error: "Failed to reset Double Ratchet: {}", "Не удалось сбросить Double Ratchet: {}";
+
     // ---------- Автодополнение ----------
     comp_force: "flag --force: allow system paths", "флаг --force: разрешить системные пути";
     comp_command: "command: {}", "команда: {}";
@@ -352,9 +356,10 @@ texts! {
     truncated_ed25519: "ed25519 in link is truncated: {} hex chars instead of 64", "ed25519 в ссылке обрезан: {} hex-символов вместо 64";
     not_contact_link: "this is not a lastchance://contact?... link", "это не ссылка lastchance://contact?...";
     missing_link_params: "the link is missing required parameters", "в ссылке не хватает обязательных параметров";
+    invalid_invite: "invalid signed invite: {}", "некорректный подписанный инвайт: {}";
     join_file_error: "failed to read file {}: {}", "не удалось прочитать файл {}: {}";
     join_usage_file: "Usage: /join -f <path>", "Использование: /join -f <path>";
-    join_usage: "/join <link>, /join -f <path> or /join <hash> <x25519> <nickname>", "/join <link>, /join -f <path> или /join <hash> <x25519> <nickname>";
+    join_usage: "/join <signed-link> or /join -f <path>", "/join <подписанная-ссылка> или /join -f <path>";
     join_error: "/join error: {}", "Ошибка /join: {}";
     room_active: "Active room: {} ({})", "Активная комната: {} ({})";
     room_switched: "room switched", "комната переключена";
@@ -396,10 +401,10 @@ texts! {
     contacts_modal_title: " Contacts · /contacts ", " Контакты · /contacts ";
     contacts_input_title: " Contacts ", " Контакты ";
     contacts_status_bar: " Contacts: {}/{} · ↑/↓ — select · Enter — open · Esc — close ", " Контакты: {}/{} · ↑/↓ — выбор · Enter — открыть · Esc — закрыть ";
-    contacts_hint_list: " ↑/↓, j/k — select · Enter — open · / — filter · r — rename · i — info · c — copy link · d — delete · q/Esc — close ", " ↑/↓, j/k — выбор · Enter — открыть · / — фильтр · r — переименовать · i — инфо · c — копировать ссылку · d — удалить · q/Esc — закрыть ";
+    contacts_hint_list: " ↑/↓, j/k — select · Enter — open · / — filter · r — rename · i — info · c — copy fingerprint · d — delete · q/Esc — close ", " ↑/↓, j/k — выбор · Enter — открыть · / — фильтр · r — переименовать · i — инфо · c — копировать отпечаток · d — удалить · q/Esc — закрыть ";
     contacts_hint_filter: " Filter: {} · type to search by name/hash · Esc — reset ", " Фильтр: {} · ввод — поиск по имени/хешу · Esc — сбросить ";
     contacts_hint_rename: " Enter — save · Esc — cancel ", " Enter — сохранить · Esc — отменить ";
-    contacts_hint_info: " Esc or i — back to list ", " Esc или i — назад к списку ";
+    contacts_hint_info: " v — mark fingerprint verified · Esc or i — back to list ", " v — отметить отпечаток проверенным · Esc или i — назад к списку ";
     contacts_hint_confirm: " y — delete · n/Esc — cancel ", " y — удалить · n/Esc — отмена ";
     contacts_no_matches: "No contacts match «{}»", "Нет контактов по запросу «{}»";
     contacts_filter_prefix: " Filter: ", " Фильтр: ";
@@ -409,15 +414,24 @@ texts! {
     contacts_rename_error: "Failed to rename contact: {}", "Не удалось переименовать контакт: {}";
     contacts_rename_empty: "Name cannot be empty", "Имя не может быть пустым";
     contacts_copy_error: "Clipboard unavailable: {}", "Буфер обмена недоступен: {}";
-    contacts_copied: "Contact link copied to clipboard", "Ссылка на контакт скопирована в буфер";
+    contacts_copied: "Contact fingerprint copied to clipboard", "Отпечаток контакта скопирован в буфер";
+    contacts_fingerprint_missing: "Fingerprint unavailable: re-import the signed invite", "Отпечаток недоступен: импортируйте подписанный инвайт заново";
     contacts_info_title: " Contact info ", " Информация о контакте ";
     contacts_info_name: "Name: {}", "Имя: {}";
     contacts_info_hash: "Identity hash: {}", "Identity hash: {}";
+    contacts_info_fingerprint: "Fingerprint: {}", "Отпечаток: {}";
+    contacts_info_tofu: "Trust (TOFU): {}", "Доверие (TOFU): {}";
     contacts_info_x25519: "X25519 public key: {}", "Публичный ключ X25519: {}";
     contacts_info_ed25519: "Ed25519 public key: {}", "Публичный ключ Ed25519: {}";
     contacts_info_ed25519_missing: "not stored for this contact (re-import the invite link)", "не сохранён (импортируйте ссылку-приглашение заново)";
     contacts_info_messages: "Messages in database: {}", "Сообщений в базе: {}";
     contacts_info_none: "—", "—";
+    contacts_tofu_pending: "pending (compare the fingerprint out-of-band)", "не проверен (сверьте отпечаток по другому каналу)";
+    contacts_tofu_verified: "verified", "проверен";
+    contacts_tofu_changed: "CHANGED — verify the new fingerprint!", "ИЗМЕНЁН — сверьте новый отпечаток!";
+    contacts_verified: "Fingerprint marked as verified", "Отпечаток отмечен как проверенный";
+    contacts_verify_error: "Failed to mark fingerprint verified: {}", "Не удалось отметить отпечаток проверенным: {}";
+    contacts_verified_status: "contact fingerprint verified", "отпечаток контакта проверен";
     contacts_delete_confirm: "Delete contact '{}' and chat history? [y/N]", "Удалить контакт '{}' и историю чата? [y/N]";
     contacts_deleted: "Contact deleted: {}", "Контакт удалён: {}";
     contacts_delete_error: "Failed to delete contact: {}", "Не удалось удалить контакт: {}";
@@ -429,6 +443,19 @@ texts! {
     contact_added: "contact added", "контакт добавлен";
     deep_link_error: "Failed to add contact from deep link: {}", "Не удалось добавить контакт из deep link: {}";
     contact_import_error: "Contact import error: {}", "Ошибка импорта контакта: {}";
+    import_title: " Import signed contact ", " Импорт подписанного контакта ";
+    import_intro: "Verify the fingerprint out-of-band before adding this contact.", "Сверьте отпечаток по независимому каналу перед добавлением контакта.";
+    import_nickname: "Nickname: {}", "Имя: {}";
+    import_hash: "Identity hash: {}", "Identity hash: {}";
+    import_fingerprint: "Fingerprint: {}", "Отпечаток: {}";
+    import_x25519: "X25519 key: {}", "Ключ X25519: {}";
+    import_ed25519: "Ed25519 key: {}", "Ключ Ed25519: {}";
+    import_hint: "Enter/y — add · Esc/n — cancel", "Enter/y — добавить · Esc/n — отмена";
+    import_waiting: "verify the invite fingerprint", "сверьте отпечаток инвайта";
+    import_added: "Contact added: {} · fingerprint {}", "Контакт добавлен: {} · отпечаток {}";
+    import_changed_warning: "Warning: X25519 key changed for {} · verify fingerprint {}", "Внимание: X25519-ключ для {} изменился · сверьте отпечаток {}";
+    import_error: "Failed to add contact: {}", "Не удалось добавить контакт: {}";
+    import_cancelled: "invite import cancelled", "импорт инвайта отменён";
     upload_started: "Uploading file: {}", "Загрузка файла: {}";
     upload_started_status: "uploading file...", "загрузка файла...";
     upload_progress: "upload {}% — {}", "загрузка {}% — {}";
@@ -490,9 +517,9 @@ const EN_HELP_SECTIONS: &[HelpSection] = &[
         title: "Navigation and chats",
         rows: &[
             HelpRow { keys: "/help, /h, /?", desc: "Open this help" },
-            HelpRow { keys: "/contacts, /cnt, /ls, /c", desc: "Contact manager: open a chat, rename, info, copy link, delete" },
-            HelpRow { keys: "/join, /jn <link | hash x25519 nick>", desc: "Add a contact and open a chat" },
-            HelpRow { keys: "/join, /jn -f <path>", desc: "Add a contact from an invite file" },
+            HelpRow { keys: "/contacts, /cnt, /ls, /c", desc: "Contact manager: open a chat, rename, info, copy fingerprint, delete" },
+            HelpRow { keys: "/join, /jn <signed-link>", desc: "Verify a signed invite, then add the contact" },
+            HelpRow { keys: "/join, /jn -f <path>", desc: "Verify a signed invite from a file" },
             HelpRow { keys: "/room, /r [hash | nick]", desc: "Show or switch the active room" },
             HelpRow { keys: "/sidebar, /sb", desc: "Hide or show the chat panel" },
             HelpRow { keys: "Alt+Up/Down, Ctrl+P/N", desc: "Switch between chats" },
@@ -505,6 +532,7 @@ const EN_HELP_SECTIONS: &[HelpSection] = &[
             HelpRow { keys: "/messages [limit]", desc: "Recent messages in the active room" },
             HelpRow { keys: "/ttl [duration|off]", desc: "One-way RAM-only TTL for new messages (30s, 5m, 2h); without an argument — status" },
             HelpRow { keys: "/ttl-syn [duration|off]", desc: "Two-way RAM TTL: the peer receives the same timer via an encrypted SetTtl" },
+            HelpRow { keys: "/ratchet-reset", desc: "Reset the Double Ratchet session with the active contact and reinitialize it" },
             HelpRow { keys: "/sendfile, /sf [--force] <path>", desc: "Send a file; path is from the current directory, ~/ or absolute; system folders require --force" },
             HelpRow { keys: "/download, /dl [id | name | hash] [path]", desc: "Download a room file (the latest by default) to ./downloads" },
             HelpRow { keys: "Tab after /dl", desc: "Cycle through files in the active room" },
@@ -560,9 +588,9 @@ const RU_HELP_SECTIONS: &[HelpSection] = &[
         title: "Навигация и чаты",
         rows: &[
             HelpRow { keys: "/help, /h, /?", desc: "Открыть эту справку" },
-            HelpRow { keys: "/contacts, /cnt, /ls, /c", desc: "Менеджер контактов: открыть чат, переименовать, инфо, копировать ссылку, удалить" },
-            HelpRow { keys: "/join, /jn <link | hash x25519 nick>", desc: "Добавить контакт и открыть чат" },
-            HelpRow { keys: "/join, /jn -f <path>", desc: "Добавить контакт из файла-инвайта" },
+            HelpRow { keys: "/contacts, /cnt, /ls, /c", desc: "Менеджер контактов: открыть чат, переименовать, инфо, копировать отпечаток, удалить" },
+            HelpRow { keys: "/join, /jn <подписанная-ссылка>", desc: "Проверить подписанный инвайт и добавить контакт" },
+            HelpRow { keys: "/join, /jn -f <path>", desc: "Проверить подписанный инвайт из файла" },
             HelpRow { keys: "/room, /r [hash | nick]", desc: "Показать или сменить активную комнату" },
             HelpRow { keys: "/sidebar, /sb", desc: "Скрыть или показать панель чатов" },
             HelpRow { keys: "Alt+Up/Down, Ctrl+P/N", desc: "Переключение между чатами" },
@@ -575,6 +603,7 @@ const RU_HELP_SECTIONS: &[HelpSection] = &[
             HelpRow { keys: "/messages [limit]", desc: "Последние сообщения активной комнаты" },
             HelpRow { keys: "/ttl [duration|off]", desc: "Односторонний RAM-TTL для новых сообщений (30s, 5m, 2h); без аргумента — статус" },
             HelpRow { keys: "/ttl-syn [duration|off]", desc: "Двусторонний RAM-TTL: собеседник получает тот же таймер через зашифрованный SetTtl" },
+            HelpRow { keys: "/ratchet-reset", desc: "Сбросить сессию Double Ratchet с активным контактом и инициализировать её заново" },
             HelpRow { keys: "/sendfile, /sf [--force] <path>", desc: "Отправить файл; путь от текущей директории, ~/ и абсолютный; системные папки — только с --force" },
             HelpRow { keys: "/download, /dl [id | name | hash] [path]", desc: "Скачать файл комнаты (по умолчанию последний) в ./downloads" },
             HelpRow { keys: "Tab после /dl", desc: "Перебор файлов активной комнаты" },

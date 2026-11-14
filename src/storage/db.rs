@@ -53,6 +53,17 @@ const MAX_PAYLOAD_LEN: usize = 512 * 1024 * 1024;
 // DATA MODELS
 // ============================================================
 
+/// Контакт ещё не сверен пользователем (обычное состояние TOFU).
+pub const TOFU_PENDING: &str = "pending";
+/// Пользователь сверил отпечаток вне канала.
+pub const TOFU_VERIFIED: &str = "verified";
+/// X25519-ключ изменился после первой встречи.
+pub const TOFU_CHANGED: &str = "changed";
+
+fn default_tofu_state() -> String {
+    TOFU_PENDING.to_string()
+}
+
 #[derive(Debug, Clone)]
 pub struct Contact {
     pub hash: String,
@@ -60,6 +71,10 @@ pub struct Contact {
     /// Ed25519 public key в hex, если он был в ссылке-приглашении.
     /// Старые контакты могут не иметь его: колонка появилась позже.
     pub ed25519: Option<String>,
+    /// Отпечаток связки Ed25519 + X25519, hex.
+    pub fingerprint: Option<String>,
+    /// Состояние TOFU: `pending`, `verified` или `changed`.
+    pub tofu_state: String,
     pub nickname: String,
     pub created_at: DateTime<Utc>,
 }
@@ -108,6 +123,15 @@ struct Snapshot {
     messages: Vec<MessageRow>,
     #[serde(default)]
     files: Vec<FileRow>,
+    /// Сериализованные состояния Double Ratchet. Поле появилось позже,
+    /// поэтому старые снимки читаются с пустым значением.
+    #[serde(default)]
+    ratchet_states: Vec<RatchetRow>,
+    /// `session_id`, которые нельзя принимать после reset/вытеснения.
+    /// Хранятся отдельно от `ratchet_states`, потому что состояние комнаты
+    /// при reset удаляется, а tombstone должны пережить перезапуск.
+    #[serde(default)]
+    retired_ratchet_sessions: Vec<RetiredSessionRow>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -116,9 +140,24 @@ struct ContactRow {
     /// hex-кодированный публичный ключ.
     public_key: String,
     ed25519: Option<String>,
+    #[serde(default)]
+    fingerprint: Option<String>,
+    #[serde(default = "default_tofu_state")]
+    tofu_state: String,
     nickname: String,
     created_at: String,
 }
+
+/// Сырые поля контакта из SQLite (см. `Storage::get_contact`).
+type ContactDbRow = (
+    String,
+    Vec<u8>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+);
 
 #[derive(Debug, Serialize, Deserialize)]
 struct RoomRow {
@@ -151,6 +190,20 @@ struct FileRow {
     file_name: String,
     file_size: i64,
     uploaded_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RatchetRow {
+    room_hash: String,
+    /// hex-кодированное состояние; контейнер `vault.dat` уже зашифрован.
+    state: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RetiredSessionRow {
+    room_hash: String,
+    /// hex-кодированный `session_id` (16 байт).
+    session_id: String,
 }
 
 // ============================================================
@@ -239,6 +292,8 @@ impl Storage {
                 hash TEXT PRIMARY KEY,
                 public_key BLOB NOT NULL,
                 ed25519 TEXT,
+                fingerprint TEXT,
+                tofu_state TEXT NOT NULL DEFAULT 'pending',
                 nickname TEXT NOT NULL,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
@@ -272,6 +327,19 @@ impl Storage {
                 file_size INTEGER NOT NULL,
                 uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(room_hash) REFERENCES contacts(hash)
+            );
+
+            CREATE TABLE IF NOT EXISTS ratchet_states (
+                room_hash TEXT PRIMARY KEY,
+                state BLOB NOT NULL,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS retired_ratchet_sessions (
+                room_hash TEXT NOT NULL,
+                session_id BLOB NOT NULL,
+                retired_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (room_hash, session_id)
             );
 
             CREATE INDEX IF NOT EXISTS idx_messages_contact ON messages(contact_hash);
@@ -422,7 +490,7 @@ impl Storage {
         let contacts = {
             let mut stmt = conn
                 .prepare(
-                    "SELECT hash, public_key, ed25519, nickname, created_at
+                    "SELECT hash, public_key, ed25519, fingerprint, tofu_state, nickname, created_at
                      FROM contacts ORDER BY created_at ASC",
                 )
                 .map_err(|e| anyhow!("failed to prepare contacts dump: {}", e))?;
@@ -432,8 +500,12 @@ impl Storage {
                         hash: row.get(0)?,
                         public_key: hex::encode(row.get::<_, Vec<u8>>(1)?),
                         ed25519: row.get(2)?,
-                        nickname: row.get(3)?,
-                        created_at: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                        fingerprint: row.get(3)?,
+                        tofu_state: row
+                            .get::<_, Option<String>>(4)?
+                            .unwrap_or_else(default_tofu_state),
+                        nickname: row.get(5)?,
+                        created_at: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
                     })
                 })
                 .map_err(|e| anyhow!("failed to dump contacts: {}", e))?
@@ -519,11 +591,50 @@ impl Storage {
             rows
         };
 
+        let ratchet_states = {
+            let mut stmt = conn
+                .prepare("SELECT room_hash, state FROM ratchet_states ORDER BY room_hash ASC")
+                .map_err(|e| anyhow!("failed to prepare ratchet dump: {}", e))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(RatchetRow {
+                        room_hash: row.get(0)?,
+                        state: hex::encode(row.get::<_, Vec<u8>>(1)?),
+                    })
+                })
+                .map_err(|e| anyhow!("failed to dump ratchet states: {}", e))?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| anyhow!("failed to read ratchet states: {}", e))?;
+            rows
+        };
+
+        let retired_ratchet_sessions = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT room_hash, session_id FROM retired_ratchet_sessions
+                     ORDER BY rowid ASC",
+                )
+                .map_err(|e| anyhow!("failed to prepare retired session dump: {}", e))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(RetiredSessionRow {
+                        room_hash: row.get(0)?,
+                        session_id: hex::encode(row.get::<_, Vec<u8>>(1)?),
+                    })
+                })
+                .map_err(|e| anyhow!("failed to dump retired sessions: {}", e))?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| anyhow!("failed to read retired sessions: {}", e))?;
+            rows
+        };
+
         Ok(Snapshot {
             contacts,
             rooms,
             messages,
             files,
+            ratchet_states,
+            retired_ratchet_sessions,
         })
     }
 
@@ -545,12 +656,14 @@ impl Storage {
                     .map_err(|e| anyhow!("corrupted public key for contact in storage: {}", e))?;
                 tx.execute(
                     "INSERT OR REPLACE INTO contacts
-                        (hash, public_key, ed25519, nickname, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                        (hash, public_key, ed25519, fingerprint, tofu_state, nickname, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![
                         contact.hash,
                         public_key,
                         contact.ed25519,
+                        contact.fingerprint,
+                        contact.tofu_state,
                         contact.nickname,
                         contact.created_at
                     ],
@@ -604,6 +717,31 @@ impl Storage {
                 .map_err(|e| anyhow!("failed to restore file record: {}", e))?;
             }
 
+            for ratchet in &snapshot.ratchet_states {
+                let state = hex::decode(&ratchet.state)
+                    .map_err(|e| anyhow!("corrupted ratchet state in storage: {}", e))?;
+                tx.execute(
+                    "INSERT OR REPLACE INTO ratchet_states (room_hash, state)
+                     VALUES (?1, ?2)",
+                    params![ratchet.room_hash, state],
+                )
+                .map_err(|e| anyhow!("failed to restore ratchet state: {}", e))?;
+            }
+
+            for retired in &snapshot.retired_ratchet_sessions {
+                let session_id = hex::decode(&retired.session_id)
+                    .map_err(|e| anyhow!("corrupted retired session in storage: {}", e))?;
+                if session_id.len() != 16 {
+                    return Err(anyhow!("retired session id must be 16 bytes"));
+                }
+                tx.execute(
+                    "INSERT OR REPLACE INTO retired_ratchet_sessions (room_hash, session_id)
+                     VALUES (?1, ?2)",
+                    params![retired.room_hash, session_id],
+                )
+                .map_err(|e| anyhow!("failed to restore retired session: {}", e))?;
+            }
+
             tx.commit()
                 .map_err(|e| anyhow!("failed to commit snapshot restore: {}", e))?;
             Ok(())
@@ -627,14 +765,27 @@ impl Storage {
         let mut snapshot = Snapshot::default();
 
         if table_exists(&conn, "contacts")? {
-            let has_ed25519 = has_column(&conn, "contacts", "ed25519")?;
-            let sql = if has_ed25519 {
-                "SELECT hash, public_key, ed25519, nickname, created_at FROM contacts"
+            let ed25519_col = if has_column(&conn, "contacts", "ed25519")? {
+                "ed25519"
             } else {
-                "SELECT hash, public_key, NULL, nickname, created_at FROM contacts"
+                "NULL"
             };
+            let fingerprint_col = if has_column(&conn, "contacts", "fingerprint")? {
+                "fingerprint"
+            } else {
+                "NULL"
+            };
+            let tofu_col = if has_column(&conn, "contacts", "tofu_state")? {
+                "tofu_state"
+            } else {
+                "NULL"
+            };
+            let sql = format!(
+                "SELECT hash, public_key, {}, nickname, created_at, {}, {} FROM contacts",
+                ed25519_col, fingerprint_col, tofu_col
+            );
             let mut stmt = conn
-                .prepare(sql)
+                .prepare(&sql)
                 .map_err(|e| anyhow!("failed to read legacy contacts: {}", e))?;
             let rows = stmt
                 .query_map([], |row| {
@@ -644,17 +795,24 @@ impl Storage {
                         row.get::<_, Option<String>>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
                     ))
                 })
                 .map_err(|e| anyhow!("failed to query legacy contacts: {}", e))?
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(|e| anyhow!("failed to read legacy contacts: {}", e))?;
 
-            for (hash, public_key, ed25519, nickname, created_at) in rows {
+            for (hash, public_key, ed25519, nickname, created_at, fingerprint, tofu_state) in rows
+            {
                 snapshot.contacts.push(ContactRow {
                     hash,
                     public_key: hex::encode(public_key),
                     ed25519,
+                    fingerprint,
+                    tofu_state: tofu_state
+                        .filter(|state| !state.is_empty())
+                        .unwrap_or_else(default_tofu_state),
                     nickname: self.vault.decrypt_str(&nickname)?,
                     created_at,
                 });
@@ -792,7 +950,7 @@ impl Storage {
         self.add_contact_with_ed25519(hash, public_key, None, nickname)
     }
 
-    /// Сохраняет контакт вместе с Ed25519-ключом (если он был в ссылке).
+    /// Сохраняет контакт вместе с Ed25519-ключом (legacy/тестовый путь).
     ///
     /// Повторный импорт без Ed25519 не должен затирать уже известный ключ,
     /// поэтому используется `COALESCE` в UPSERT-ветке.
@@ -803,16 +961,83 @@ impl Storage {
         ed25519: Option<&str>,
         nickname: &str,
     ) -> Result<()> {
+        self.upsert_contact(
+            hash,
+            public_key,
+            ed25519,
+            nickname,
+            None,
+            None,
+        )
+    }
+
+    /// Сохраняет криптографически проверенный контакт с отпечатком и TOFU.
+    pub fn upsert_verified_contact(
+        &self,
+        hash: &str,
+        public_key: &[u8],
+        ed25519: &str,
+        fingerprint: &str,
+        tofu_state: &str,
+        nickname: &str,
+    ) -> Result<()> {
+        self.upsert_contact(
+            hash,
+            public_key,
+            Some(ed25519),
+            nickname,
+            Some(fingerprint),
+            Some(tofu_state),
+        )
+    }
+
+    fn upsert_contact(
+        &self,
+        hash: &str,
+        public_key: &[u8],
+        ed25519: Option<&str>,
+        nickname: &str,
+        fingerprint: Option<&str>,
+        tofu_state: Option<&str>,
+    ) -> Result<()> {
+        let tofu_state = tofu_state.unwrap_or(TOFU_PENDING);
         let conn = self.conn()?;
         conn.execute(
-            "INSERT INTO contacts (hash, public_key, ed25519, nickname) VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO contacts
+                (hash, public_key, ed25519, fingerprint, tofu_state, nickname)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(hash) DO UPDATE SET
                  public_key = excluded.public_key,
                  nickname = excluded.nickname,
-                 ed25519 = COALESCE(excluded.ed25519, contacts.ed25519)",
-            params![hash, public_key, ed25519, nickname],
+                 ed25519 = COALESCE(excluded.ed25519, contacts.ed25519),
+                 fingerprint = COALESCE(excluded.fingerprint, contacts.fingerprint),
+                 tofu_state = CASE
+                     WHEN ?4 IS NULL THEN contacts.tofu_state
+                     ELSE excluded.tofu_state
+                 END",
+            params![hash, public_key, ed25519, fingerprint, tofu_state, nickname],
         )
         .map_err(|e| anyhow!("failed to add contact: {}", e))?;
+
+        self.persist_locked(&conn)
+    }
+
+    /// Меняет TOFU-состояние контакта после сверки отпечатка.
+    pub fn set_contact_tofu_state(&self, hash: &str, tofu_state: &str) -> Result<()> {
+        let conn = self.conn()?;
+        let affected = conn
+            .execute(
+                "UPDATE contacts SET tofu_state = ?1 WHERE hash = ?2",
+                params![tofu_state, hash],
+            )
+            .map_err(|e| anyhow!("failed to update contact TOFU state: {}", e))?;
+
+        if affected == 0 {
+            return Err(anyhow!(
+                "contact not found: {}",
+                &hash[..hash.len().min(16)]
+            ));
+        }
 
         self.persist_locked(&conn)
     }
@@ -821,18 +1046,13 @@ impl Storage {
         let conn = self.conn()?;
         let mut stmt = conn
             .prepare(
-                "SELECT hash, public_key, ed25519, nickname, created_at
+                "SELECT hash, public_key, ed25519, fingerprint, tofu_state, nickname, created_at
                  FROM contacts WHERE hash = ?1",
             )
             .map_err(|e| anyhow!("failed to prepare query: {}", e))?;
 
-        let (hash_value, public_key, ed25519, nickname, created_at): (
-            String,
-            Vec<u8>,
-            Option<String>,
-            String,
-            String,
-        ) = stmt
+        let (hash_value, public_key, ed25519, fingerprint, tofu_state, nickname, created_at): ContactDbRow =
+            stmt
             .query_row(params![hash], |row| {
                 Ok((
                     row.get(0)?,
@@ -840,6 +1060,8 @@ impl Storage {
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
                 ))
             })
             .map_err(|_e| anyhow!("contact not found: {}", &hash[..hash.len().min(16)]))?;
@@ -848,6 +1070,10 @@ impl Storage {
             hash: hash_value,
             public_key,
             ed25519,
+            fingerprint,
+            tofu_state: tofu_state
+                .filter(|state| !state.is_empty())
+                .unwrap_or_else(default_tofu_state),
             nickname,
             created_at: parse_timestamp(&created_at),
         })
@@ -857,7 +1083,7 @@ impl Storage {
         let conn = self.conn()?;
         let mut stmt = conn
             .prepare(
-                "SELECT hash, public_key, ed25519, nickname, created_at
+                "SELECT hash, public_key, ed25519, fingerprint, tofu_state, nickname, created_at
                  FROM contacts ORDER BY created_at DESC",
             )
             .map_err(|e| anyhow!("failed to prepare query: {}", e))?;
@@ -868,8 +1094,10 @@ impl Storage {
                     row.get::<_, String>(0)?,
                     row.get::<_, Vec<u8>>(1)?,
                     row.get::<_, Option<String>>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
                 ))
             })
             .map_err(|e| anyhow!("failed to query contacts: {}", e))?
@@ -877,11 +1105,15 @@ impl Storage {
             .map_err(|e| anyhow!("failed to read contacts: {}", e))?;
 
         let mut contacts = Vec::with_capacity(rows.len());
-        for (hash, public_key, ed25519, nickname, created_at) in rows {
+        for (hash, public_key, ed25519, fingerprint, tofu_state, nickname, created_at) in rows {
             contacts.push(Contact {
                 hash,
                 public_key,
                 ed25519,
+                fingerprint,
+                tofu_state: tofu_state
+                    .filter(|state| !state.is_empty())
+                    .unwrap_or_else(default_tofu_state),
                 nickname,
                 created_at: parse_timestamp(&created_at),
             });
@@ -1030,6 +1262,11 @@ impl Storage {
             params![contact_hash],
         )
         .map_err(|e| anyhow!("failed to delete files: {}", e))?;
+        tx.execute(
+            "DELETE FROM ratchet_states WHERE room_hash = ?1",
+            params![contact_hash],
+        )
+        .map_err(|e| anyhow!("failed to delete ratchet state: {}", e))?;
         tx.execute(
             "DELETE FROM rooms WHERE contact_hash = ?1",
             params![contact_hash],
@@ -1242,6 +1479,149 @@ impl Storage {
     }
 
     // ============================================================
+    // DOUBLE RATCHET STATE
+    // ============================================================
+
+    /// Сохраняет состояние храповика комнаты в зашифрованный `vault.dat`.
+    ///
+    /// Для комнат с активным RAM-TTL этот метод не вызывается: состояние
+    /// живёт только в памяти `App`.
+    pub fn save_ratchet_state(&self, room_hash: &str, state: &[u8]) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO ratchet_states (room_hash, state, updated_at)
+             VALUES (?1, ?2, CURRENT_TIMESTAMP)",
+            params![room_hash, state],
+        )
+        .map_err(|e| anyhow!("failed to save ratchet state: {}", e))?;
+
+        self.persist_locked(&conn)
+    }
+
+    /// Загружает состояние храповика комнаты, если оно есть в `vault.dat`.
+    pub fn load_ratchet_state(&self, room_hash: &str) -> Result<Option<Vec<u8>>> {
+        let conn = self.conn()?;
+        conn.query_row(
+            "SELECT state FROM ratchet_states WHERE room_hash = ?1",
+            params![room_hash],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()
+        .map_err(|e| anyhow!("failed to load ratchet state: {}", e))
+    }
+
+    /// Удаляет состояние храповика комнаты из памяти и `vault.dat`.
+    pub fn delete_ratchet_state(&self, room_hash: &str) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "DELETE FROM ratchet_states WHERE room_hash = ?1",
+            params![room_hash],
+        )
+        .map_err(|e| anyhow!("failed to delete ratchet state: {}", e))?;
+
+        self.persist_locked(&conn)
+    }
+
+    /// Сохраняет tombstone-и `session_id` комнаты в `vault.dat`.
+    ///
+    /// Вызывается только для обычных комнат: при активном RAM-TTL
+    /// `session_id` на диск не попадают (H-3).
+    pub fn save_retired_ratchet_sessions(
+        &self,
+        room_hash: &str,
+        session_ids: &[[u8; 16]],
+    ) -> Result<()> {
+        let mut conn = self.conn()?;
+        {
+            let tx = conn
+                .transaction()
+                .map_err(|e| anyhow!("failed to start retired session update: {}", e))?;
+            tx.execute(
+                "DELETE FROM retired_ratchet_sessions WHERE room_hash = ?1",
+                params![room_hash],
+            )
+            .map_err(|e| anyhow!("failed to clear retired sessions: {}", e))?;
+
+            for session_id in session_ids {
+                tx.execute(
+                    "INSERT OR IGNORE INTO retired_ratchet_sessions (room_hash, session_id)
+                     VALUES (?1, ?2)",
+                    params![room_hash, session_id.as_slice()],
+                )
+                .map_err(|e| anyhow!("failed to save retired session: {}", e))?;
+            }
+
+            tx.commit()
+                .map_err(|e| anyhow!("failed to commit retired sessions: {}", e))?;
+        }
+
+        self.persist_locked(&conn)
+    }
+
+    /// Загружает все tombstone-и `session_id` из `vault.dat`.
+    ///
+    /// Порядок строк — порядок вставки, чтобы при переполнении реестра
+    /// вытеснялись самые старые записи.
+    pub fn load_retired_ratchet_sessions(&self) -> Result<Vec<(String, [u8; 16])>> {
+        let conn = self.conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT room_hash, session_id FROM retired_ratchet_sessions
+                 ORDER BY rowid ASC",
+            )
+            .map_err(|e| anyhow!("failed to prepare retired session load: {}", e))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(|e| anyhow!("failed to load retired sessions: {}", e))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| anyhow!("failed to read retired sessions: {}", e))?;
+
+        rows.into_iter()
+            .map(|(room_hash, raw)| {
+                let session_id: [u8; 16] = raw
+                    .try_into()
+                    .map_err(|_| anyhow!("retired session id must be 16 bytes"))?;
+                Ok((room_hash, session_id))
+            })
+            .collect()
+    }
+
+    /// Удаляет tombstone-и комнаты (включение RAM-TTL или удаление контакта).
+    pub fn delete_retired_ratchet_sessions(&self, room_hash: &str) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "DELETE FROM retired_ratchet_sessions WHERE room_hash = ?1",
+            params![room_hash],
+        )
+        .map_err(|e| anyhow!("failed to delete retired sessions: {}", e))?;
+
+        self.persist_locked(&conn)
+    }
+
+    /// Снимок состояния храповика из `vault.dat` (только для тестов).
+    #[cfg(test)]
+    pub(crate) fn persisted_ratchet_state_for_test(
+        &self,
+        room_hash: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let key = self.vault.key()?;
+        let data = self.safe_fs.safe_read_file(VAULT_FILE_NAME)?;
+        let snapshot = Self::decode_container(&key, &data)?;
+        snapshot
+            .ratchet_states
+            .iter()
+            .find(|row| row.room_hash == room_hash)
+            .map(|row| {
+                hex::decode(&row.state)
+                    .map_err(|e| anyhow!("corrupted ratchet state in snapshot: {}", e))
+            })
+            .transpose()
+    }
+
+    // ============================================================
     // FILES
     // ============================================================
 
@@ -1251,7 +1631,13 @@ impl Storage {
         room_hash: &str,
         file_name: &str,
         file_size: i64,
+        is_ephemeral: bool,
     ) -> Result<()> {
+        // H-3: имена, размеры и hash файлов TTL-комнат не попадают на диск.
+        if is_ephemeral {
+            return Ok(());
+        }
+
         let conn = self.conn()?;
         conn.execute(
             "INSERT OR REPLACE INTO files (file_hash, room_hash, file_name, file_size, uploaded_at)
@@ -1565,7 +1951,7 @@ mod tests {
         t.storage.ensure_room(nickname, &hash).unwrap();
         t.storage.save_message(&hash, "in", secret_text).unwrap();
         t.storage
-            .save_file_record(&file_hash, &hash, "hidden-file.txt", 42)
+            .save_file_record(&file_hash, &hash, "hidden-file.txt", 42, false)
             .unwrap();
 
         let bytes = read_vault(t.path());
@@ -1598,17 +1984,30 @@ mod tests {
         let base = dir.path().to_str().unwrap();
         let hash = "e".repeat(64);
 
+        let fingerprint = "ef".repeat(32);
         {
             let vault = Vault::create(base, TEST_PASSWORD).unwrap();
             let storage = Storage::new(base, vault).unwrap();
-            storage.add_contact(&hash, &[4u8; 32], "Persisted").unwrap();
+            storage
+                .upsert_verified_contact(
+                    &hash,
+                    &[4u8; 32],
+                    &"ab".repeat(32),
+                    &fingerprint,
+                    TOFU_VERIFIED,
+                    "Persisted",
+                )
+                .unwrap();
             storage.save_message(&hash, "out", "still here").unwrap();
         }
 
         let vault = Vault::unlock(base, TEST_PASSWORD).unwrap();
         let storage = Storage::new(base, vault).unwrap();
 
-        assert_eq!(storage.get_contact(&hash).unwrap().nickname, "Persisted");
+        let contact = storage.get_contact(&hash).unwrap();
+        assert_eq!(contact.nickname, "Persisted");
+        assert_eq!(contact.tofu_state, TOFU_VERIFIED);
+        assert_eq!(contact.fingerprint.as_deref(), Some(fingerprint.as_str()));
         assert_eq!(
             storage.get_room_messages(&hash, 10).unwrap()[0].text,
             "still here"
@@ -1793,6 +2192,41 @@ mod tests {
     }
 
     #[test]
+    fn verified_contact_persists_fingerprint_and_tofu_state() {
+        let t = setup();
+
+        let hash = "4".repeat(64);
+        let fingerprint = "cd".repeat(32);
+        t.storage
+            .upsert_verified_contact(
+                &hash,
+                &[7u8; 32],
+                &"ab".repeat(32),
+                &fingerprint,
+                TOFU_PENDING,
+                "Alice",
+            )
+            .unwrap();
+
+        let contact = t.storage.get_contact(&hash).unwrap();
+        assert_eq!(contact.fingerprint.as_deref(), Some(fingerprint.as_str()));
+        assert_eq!(contact.tofu_state, TOFU_PENDING);
+
+        t.storage
+            .set_contact_tofu_state(&hash, TOFU_VERIFIED)
+            .unwrap();
+        let contact = t.storage.get_contact(&hash).unwrap();
+        assert_eq!(contact.tofu_state, TOFU_VERIFIED);
+        assert_eq!(contact.fingerprint.as_deref(), Some(fingerprint.as_str()));
+
+        // Повторный legacy-upsert без отпечатка не должен стирать TOFU.
+        t.storage.add_contact(&hash, &[7u8; 32], "Alice").unwrap();
+        let contact = t.storage.get_contact(&hash).unwrap();
+        assert_eq!(contact.tofu_state, TOFU_VERIFIED);
+        assert_eq!(contact.fingerprint.as_deref(), Some(fingerprint.as_str()));
+    }
+
+    #[test]
     fn delete_contact_removes_messages_files_and_room() {
         let t = setup();
 
@@ -1807,7 +2241,7 @@ mod tests {
         t.storage.save_message(&hash, "in", "secret one").unwrap();
         t.storage.save_message(&hash, "out", "secret two").unwrap();
         t.storage
-            .save_file_record(&file_hash, &hash, "secret.txt", 10)
+            .save_file_record(&file_hash, &hash, "secret.txt", 10, false)
             .unwrap();
 
         t.storage
@@ -1852,5 +2286,86 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn ephemeral_file_records_are_not_persisted() {
+        // H-3: метаданные файлов TTL-комнаты не должны попадать на диск.
+        let t = setup();
+        let hash = "9".repeat(64);
+        let file_hash = "a".repeat(64);
+
+        t.storage.add_contact(&hash, &[9u8; 32], "Ttl").unwrap();
+        t.storage.ensure_room("Ttl", &hash).unwrap();
+
+        t.storage
+            .save_file_record(&file_hash, &hash, "ephemeral.bin", 7, true)
+            .unwrap();
+
+        // Записи нет ни в памяти, ни в расшифрованном снимке.
+        assert!(t.storage.get_file_record(&file_hash).is_err());
+        let key = t.storage.vault.key().unwrap();
+        let snapshot = Storage::decode_container(&key, &read_vault(t.path())).unwrap();
+        assert!(snapshot.files.is_empty());
+    }
+
+    #[test]
+    fn regular_file_records_are_still_persisted() {
+        // Регрессия: guard не должен срабатывать для обычных комнат.
+        let t = setup();
+        let hash = "b".repeat(64);
+        let file_hash = "c".repeat(64);
+
+        t.storage.add_contact(&hash, &[10u8; 32], "Regular").unwrap();
+        t.storage.ensure_room("Regular", &hash).unwrap();
+
+        t.storage
+            .save_file_record(&file_hash, &hash, "regular.bin", 11, false)
+            .unwrap();
+
+        let record = t.storage.get_file_record(&file_hash).unwrap();
+        assert_eq!(record.file_name, "regular.bin");
+        assert_eq!(record.file_size, 11);
+
+        let key = t.storage.vault.key().unwrap();
+        let snapshot = Storage::decode_container(&key, &read_vault(t.path())).unwrap();
+        assert_eq!(snapshot.files.len(), 1);
+        assert_eq!(snapshot.files[0].file_name, "regular.bin");
+    }
+
+    #[test]
+    fn retired_ratchet_sessions_survive_reopen() {
+        // H-2: tombstone-и сброшенной сессии должны пережить перезапуск,
+        // иначе её запоздавший bootstrap-пакет снова выглядит новым.
+        let TestStorage { storage, dir } = setup();
+        let room = "d".repeat(64);
+        let first = [1u8; 16];
+        let second = [2u8; 16];
+
+        storage
+            .save_retired_ratchet_sessions(&room, &[first, second])
+            .unwrap();
+
+        let key = storage.vault.key().unwrap();
+        let snapshot = Storage::decode_container(&key, &read_vault(dir.path())).unwrap();
+        assert_eq!(snapshot.retired_ratchet_sessions.len(), 2);
+
+        let base = dir.path().to_str().unwrap().to_string();
+        drop(storage);
+
+        let vault = Vault::unlock(&base, TEST_PASSWORD).unwrap();
+        let reopened = Storage::new(&base, vault).unwrap();
+        assert_eq!(
+            reopened.load_retired_ratchet_sessions().unwrap(),
+            vec![(room.clone(), first), (room.clone(), second)]
+        );
+
+        reopened
+            .delete_retired_ratchet_sessions(&room)
+            .unwrap();
+        assert!(reopened
+            .load_retired_ratchet_sessions()
+            .unwrap()
+            .is_empty());
     }
 }
