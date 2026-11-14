@@ -24,9 +24,9 @@ use crossterm::terminal::{
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc;
 use zeroize::Zeroizing;
@@ -34,52 +34,201 @@ use zeroize::Zeroizing;
 use lastchance::network::config::notify_level_label;
 use lastchance::{get_base_dir_with_override, vault, App, AppEvent, Config, Vault};
 
-const HELP: &str = "\
-Команды (алиасы):
-  /help, /h, /?               — этот список
-  /profile, /p                — профиль (nickname, hash, ключи)
-  /seed                       — seed-фраза (никому не показывайте!)
-  /invite, /in [ -f [dir|file] ]
-                              — скопировать ссылку в буфер обмена;
-                                с -f — также сохранить в файл инвайта
-  /export                     — контакт в формате JSON
-  /contacts, /ls, /c          — список контактов
-  /join, /jn <link | hash x25519 nickname>
-                              — добавить контакт и открыть чат
-  /join, /jn -f <path>        — добавить контакт из файла-инвайта
-  /room, /r [hash|nick]       — показать или сменить активную комнату
-  /messages [limit]           — последние сообщения комнаты
-  /sendfile, /sf [--force] <path>
-                              — отправить файл; путь ищется от текущей
-                                директории, поддерживает ~/ и абсолютные
-                                пути; системные папки — только с --force
-  /download, /dl [id|name|hash] [path]
-                              — скачать файл: без аргументов — последний
-                                файл комнаты; id — номер из ленты (#3);
-                                path — файл или папка, иначе ./downloads/<name>
-  /nick <name>                — сменить свой ник
-  /rename <hash> <name>       — переименовать контакт
-  /set, /settings             — интерактивное меню настроек: Text API, File API,
-                                Guard Header Name/Value, Proxy URL, Notify Level,
-                                Stealth Title/Body/Seconds. Стрелки/Tab — выбор,
-                                Enter — редактировать поле, Esc — сохранить
-  /set notify <0|1|2|3>       — быстро задать режим уведомлений:
-                                0 — выкл., 1 — stealth, 2 — отправитель,
-                                3 — полный предпросмотр
-  /set test                   — показать тестовое системное уведомление
-  /passwd                     — сменить мастер-пароль (файлы и база
-                                перешифровываются)
-  /sidebar, /sb               — скрыть/показать панель чатов
-  /quit, /q, /exit            — выход
+/// Строка таблицы справки: слева — команда и её алиасы.
+struct HelpRow {
+    keys: &'static str,
+    desc: &'static str,
+}
 
-Любая строка без ведущего / отправляется в активную комнату.
-Alt+Up/Alt+Down или Ctrl+P/Ctrl+N — переключение чатов.
-Tab — автодополнение команд и контактов (для /room).
-Tab после /dl — перебор файлов активной комнаты.
-Tab после /sf — автодополнение путей от текущей директории.
-Up/Down — история ввода (последние 50 строк).
-PgUp/PgDn или колесо мыши — прокрутка истории.
-Ctrl+V — вставка из системного буфера обмена.";
+/// Секция справки для модального окна (F1).
+struct HelpSection {
+    title: &'static str,
+    rows: &'static [HelpRow],
+}
+
+const HELP_SECTIONS: &[HelpSection] = &[
+    HelpSection {
+        title: "Навигация и чаты",
+        rows: &[
+            HelpRow {
+                keys: "/help, /h, /?",
+                desc: "Открыть эту справку",
+            },
+            HelpRow {
+                keys: "/contacts, /ls, /c",
+                desc: "Список контактов",
+            },
+            HelpRow {
+                keys: "/join, /jn <link | hash x25519 nick>",
+                desc: "Добавить контакт и открыть чат",
+            },
+            HelpRow {
+                keys: "/join, /jn -f <path>",
+                desc: "Добавить контакт из файла-инвайта",
+            },
+            HelpRow {
+                keys: "/room, /r [hash | nick]",
+                desc: "Показать или сменить активную комнату",
+            },
+            HelpRow {
+                keys: "/sidebar, /sb",
+                desc: "Скрыть или показать панель чатов",
+            },
+            HelpRow {
+                keys: "Alt+Up/Down, Ctrl+P/N",
+                desc: "Переключение между чатами",
+            },
+            HelpRow {
+                keys: "Tab",
+                desc: "Автодополнение команд и контактов",
+            },
+        ],
+    },
+    HelpSection {
+        title: "Сообщения и файлы",
+        rows: &[
+            HelpRow {
+                keys: "/messages [limit]",
+                desc: "Последние сообщения активной комнаты",
+            },
+            HelpRow {
+                keys: "/sendfile, /sf [--force] <path>",
+                desc: "Отправить файл; путь от текущей директории, ~/ и абсолютный; системные папки — только с --force",
+            },
+            HelpRow {
+                keys: "/download, /dl [id | name | hash] [path]",
+                desc: "Скачать файл комнаты (по умолчанию последний) в ./downloads",
+            },
+            HelpRow {
+                keys: "Tab после /dl",
+                desc: "Перебор файлов активной комнаты",
+            },
+            HelpRow {
+                keys: "Tab после /sf",
+                desc: "Автодополнение путей от текущей директории",
+            },
+            HelpRow {
+                keys: "Текст без ведущего /",
+                desc: "Отправить сообщение в активную комнату",
+            },
+        ],
+    },
+    HelpSection {
+        title: "Профиль и настройки",
+        rows: &[
+            HelpRow {
+                keys: "/profile, /p",
+                desc: "Профиль: ник, hash и ключи",
+            },
+            HelpRow {
+                keys: "/seed",
+                desc: "Показать seed-фразу (никому не показывайте!)",
+            },
+            HelpRow {
+                keys: "/invite, /in [-f [dir | file]]",
+                desc: "Скопировать ссылку-приглашение в буфер; с -f сохранить в файл",
+            },
+            HelpRow {
+                keys: "/export",
+                desc: "Контакт в формате JSON",
+            },
+            HelpRow {
+                keys: "/nick <name>",
+                desc: "Сменить свой ник",
+            },
+            HelpRow {
+                keys: "/rename <hash> <name>",
+                desc: "Переименовать контакт",
+            },
+            HelpRow {
+                keys: "/set, /settings",
+                desc: "Интерактивное меню настроек: API, Guard Header, Proxy, Notify Level, Stealth",
+            },
+            HelpRow {
+                keys: "/set notify <0|1|2|3>",
+                desc: "Режим уведомлений: выкл. / stealth / отправитель / полный",
+            },
+            HelpRow {
+                keys: "/set test",
+                desc: "Показать тестовое системное уведомление",
+            },
+            HelpRow {
+                keys: "/passwd",
+                desc: "Сменить мастер-пароль (файлы и база перешифровываются)",
+            },
+            HelpRow {
+                keys: "/quit, /q, /exit",
+                desc: "Выйти из клиента",
+            },
+        ],
+    },
+    HelpSection {
+        title: "Редактирование ввода",
+        rows: &[
+            HelpRow {
+                keys: "Ctrl+W, Ctrl+Backspace, Alt+Backspace",
+                desc: "Удалить слово слева от курсора",
+            },
+            HelpRow {
+                keys: "Ctrl+Delete, Alt+D",
+                desc: "Удалить слово справа от курсора",
+            },
+            HelpRow {
+                keys: "Ctrl+U / Ctrl+K",
+                desc: "Удалить до начала / до конца строки",
+            },
+            HelpRow {
+                keys: "Ctrl+Left, Alt+B / Ctrl+Right, Alt+F",
+                desc: "Перемещение по словам",
+            },
+            HelpRow {
+                keys: "Home, Ctrl+A / End, Ctrl+E",
+                desc: "В начало / в конец строки",
+            },
+        ],
+    },
+    HelpSection {
+        title: "Горячие клавиши TUI",
+        rows: &[
+            HelpRow {
+                keys: "F1",
+                desc: "Открыть или закрыть справку",
+            },
+            HelpRow {
+                keys: "Esc, q, Enter",
+                desc: "Закрыть справку",
+            },
+            HelpRow {
+                keys: "Up/Down, j/k",
+                desc: "Прокрутка справки построчно",
+            },
+            HelpRow {
+                keys: "PgUp/PgDn",
+                desc: "Прокрутка справки страницами",
+            },
+            HelpRow {
+                keys: "Up/Down",
+                desc: "История ввода (последние 50 строк)",
+            },
+            HelpRow {
+                keys: "PgUp/PgDn, колесо мыши",
+                desc: "Прокрутка истории чата",
+            },
+            HelpRow {
+                keys: "Ctrl+V",
+                desc: "Вставить из системного буфера обмена",
+            },
+            HelpRow {
+                keys: "Ctrl+S",
+                desc: "Открыть настройки (/set)",
+            },
+            HelpRow {
+                keys: "Ctrl+C",
+                desc: "Скопировать ввод и очистить; на пустой строке — выход",
+            },
+        ],
+    },
+];
 
 // ============================================================
 // МОДЕЛЬ ИНТЕРФЕЙСА
@@ -195,6 +344,8 @@ struct UiState {
     passwd: Option<PasswdFlow>,
     /// Активное меню настроек.
     settings: Option<SettingsFlow>,
+    /// Открытое модальное окно справки (F1, /help).
+    help: Option<HelpFlow>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -268,6 +419,25 @@ impl SettingField {
 
     fn is_masked(self) -> bool {
         matches!(self, SettingField::HeaderValue)
+    }
+}
+
+/// Модальное окно справки.
+/// Содержимое прокручивается внутри рамки, поэтому справка читается
+/// полностью даже в небольшом терминале.
+struct HelpFlow {
+    scroll: u16,
+    max_scroll: u16,
+    viewport: u16,
+}
+
+impl HelpFlow {
+    fn new() -> Self {
+        Self {
+            scroll: 0,
+            max_scroll: 0,
+            viewport: 1,
+        }
     }
 }
 
@@ -452,6 +622,7 @@ impl UiState {
             is_terminal_focused: true,
             passwd: None,
             settings: None,
+            help: None,
         };
         refresh_chats(app, &mut state);
         reload_room(app, &mut state);
@@ -1060,6 +1231,194 @@ fn next_char_boundary(s: &str, idx: usize) -> usize {
         .next()
         .map(|c| idx + c.len_utf8())
         .unwrap_or(idx)
+}
+
+/// Символ слова для навигации и удаления.
+///
+/// Unicode-aware: кириллица, латиница, цифры и `_` считаются одним словом,
+/// а пробелы и пунктуация — разделителями.
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Начало слова слева от `idx`.
+///
+/// Сначала пропускаем разделители (пробелы, пунктуацию), затем — символы слова.
+/// Все позиции остаются на границах UTF-8, поэтому русский текст и эмодзи
+/// не приводят к панике при срезе строки.
+fn word_left_boundary(s: &str, idx: usize) -> usize {
+    let mut idx = idx.min(s.len());
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+
+    while let Some((i, c)) = s[..idx].char_indices().next_back() {
+        if is_word_char(c) {
+            break;
+        }
+        idx = i;
+    }
+    while let Some((i, c)) = s[..idx].char_indices().next_back() {
+        if !is_word_char(c) {
+            break;
+        }
+        idx = i;
+    }
+    idx
+}
+
+/// Конец слова справа от `idx` (позиция сразу после слова).
+///
+/// Сначала пропускаем разделители, затем — символы слова.
+fn word_right_boundary(s: &str, idx: usize) -> usize {
+    let mut idx = idx.min(s.len());
+    while idx < s.len() && !s.is_char_boundary(idx) {
+        idx += 1;
+    }
+
+    while let Some(c) = s[idx..].chars().next() {
+        if is_word_char(c) {
+            break;
+        }
+        idx += c.len_utf8();
+    }
+    while let Some(c) = s[idx..].chars().next() {
+        if !is_word_char(c) {
+            break;
+        }
+        idx += c.len_utf8();
+    }
+    idx
+}
+
+/// Удаляет слово слева от курсора.
+fn delete_word_before(input: &mut String, cursor: &mut usize) {
+    let end = (*cursor).min(input.len());
+    let start = word_left_boundary(input, end);
+    if start < end {
+        input.replace_range(start..end, "");
+    }
+    *cursor = start;
+}
+
+/// Удаляет слово справа от курсора.
+fn delete_word_after(input: &mut String, cursor: &mut usize) {
+    let start = (*cursor).min(input.len());
+    let end = word_right_boundary(input, start);
+    if end > start {
+        input.replace_range(start..end, "");
+    }
+    *cursor = start;
+}
+
+/// Удаляет текст от курсора до начала строки (Ctrl+U).
+fn delete_to_line_start(input: &mut String, cursor: &mut usize) {
+    let end = (*cursor).min(input.len());
+    if end > 0 {
+        input.replace_range(..end, "");
+    }
+    *cursor = 0;
+}
+
+/// Удаляет текст от курсора до конца строки (Ctrl+K).
+fn delete_to_line_end(input: &mut String, cursor: &mut usize) {
+    let at = (*cursor).min(input.len());
+    input.truncate(at);
+    *cursor = at;
+}
+
+fn move_word_left(input: &str, cursor: &mut usize) {
+    *cursor = word_left_boundary(input, (*cursor).min(input.len()));
+}
+
+fn move_word_right(input: &str, cursor: &mut usize) {
+    *cursor = word_right_boundary(input, (*cursor).min(input.len()));
+}
+
+/// Применяет клавишу редактирования к однострочному полю ввода.
+///
+/// Возвращает `true`, если клавиша обработана. Функция используется и
+/// основным полем ввода, и редактором значений в `/set`, поэтому поведение
+/// сочетаний клавиш везде одинаковое.
+fn apply_line_edit_key(state: &mut UiState, key: KeyEvent, ctrl: bool, alt: bool) -> bool {
+    match key.code {
+        // Удаление слова слева. Ctrl+Backspace в разных терминалах приходит
+        // как Backspace+CONTROL, Ctrl+H или Alt+Backspace.
+        KeyCode::Backspace if ctrl || alt => {
+            delete_word_before(&mut state.input, &mut state.cursor);
+        }
+        KeyCode::Char('w') | KeyCode::Char('W') if ctrl => {
+            delete_word_before(&mut state.input, &mut state.cursor);
+        }
+        KeyCode::Char('h') | KeyCode::Char('H') if ctrl => {
+            delete_word_before(&mut state.input, &mut state.cursor);
+        }
+        KeyCode::Backspace => {
+            if state.cursor > 0 {
+                let prev = prev_char_boundary(&state.input, state.cursor);
+                state.input.remove(prev);
+                state.cursor = prev;
+            }
+        }
+
+        // Удаление слова справа.
+        KeyCode::Delete if ctrl || alt => {
+            delete_word_after(&mut state.input, &mut state.cursor);
+        }
+        KeyCode::Char('d') | KeyCode::Char('D') if alt => {
+            delete_word_after(&mut state.input, &mut state.cursor);
+        }
+        KeyCode::Delete => {
+            if state.cursor < state.input.len() {
+                state.input.remove(state.cursor);
+            }
+        }
+
+        // Удаление до начала / до конца строки.
+        KeyCode::Char('u') | KeyCode::Char('U') if ctrl => {
+            delete_to_line_start(&mut state.input, &mut state.cursor);
+        }
+        KeyCode::Char('k') | KeyCode::Char('K') if ctrl => {
+            delete_to_line_end(&mut state.input, &mut state.cursor);
+        }
+
+        // Навигация по словам.
+        KeyCode::Left if ctrl || alt => {
+            move_word_left(&state.input, &mut state.cursor);
+        }
+        KeyCode::Char('b') | KeyCode::Char('B') if alt => {
+            move_word_left(&state.input, &mut state.cursor);
+        }
+        KeyCode::Left => {
+            state.cursor = prev_char_boundary(&state.input, state.cursor);
+        }
+        KeyCode::Right if ctrl || alt => {
+            move_word_right(&state.input, &mut state.cursor);
+        }
+        KeyCode::Char('f') | KeyCode::Char('F') if alt => {
+            move_word_right(&state.input, &mut state.cursor);
+        }
+        KeyCode::Right => {
+            state.cursor = next_char_boundary(&state.input, state.cursor);
+        }
+
+        // Начало / конец строки.
+        KeyCode::Home => state.cursor = 0,
+        KeyCode::End => state.cursor = state.input.len(),
+        KeyCode::Char('a') | KeyCode::Char('A') if ctrl => state.cursor = 0,
+        KeyCode::Char('e') | KeyCode::Char('E') if ctrl => {
+            state.cursor = state.input.len();
+        }
+
+        // Обычный ввод. Alt-сочетания не должны попадать в текст.
+        KeyCode::Char(c) if !ctrl && !alt => {
+            state.input.insert(state.cursor, c);
+            state.cursor += c.len_utf8();
+        }
+        _ => return false,
+    }
+
+    true
 }
 
 // ============================================================
@@ -1673,14 +2032,19 @@ fn draw_ui(frame: &mut Frame, state: &mut UiState) {
 
         let cursor_x = input_inner.x + prefix.len() as u16 + cursor_col as u16;
         let cursor_y = input_inner.y;
-        frame.set_cursor_position(Position::new(
-            cursor_x.min(input_inner.right().saturating_sub(1)),
-            cursor_y,
-        ));
+        if state.help.is_none() {
+            frame.set_cursor_position(Position::new(
+                cursor_x.min(input_inner.right().saturating_sub(1)),
+                cursor_y,
+            ));
+        }
     }
 
     if settings_open {
         draw_settings_modal(frame, state);
+    }
+    if state.help.is_some() {
+        draw_help_modal(frame, state);
     }
 }
 
@@ -1754,6 +2118,192 @@ fn draw_settings_modal(frame: &mut Frame, state: &UiState) {
         let cursor_y = (inner.y + flow.selected as u16).min(inner.bottom().saturating_sub(1));
         frame.set_cursor_position(Position::new(cursor_x, cursor_y));
     }
+}
+
+/// Рисует центрированное модальное окно справки поверх TUI.
+fn draw_help_modal(frame: &mut Frame, state: &mut UiState) {
+    let area = frame.area();
+    let rect = help_modal_rect(area);
+
+    frame.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Line::from(vec![
+            Span::styled(
+                " Справка ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" LastChance ", Style::default().fg(Color::DarkGray)),
+        ]))
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    // Нижняя строка с подсказкой и процентом прокрутки не прокручивается.
+    let footer_height = if inner.height > 3 { 1 } else { 0 };
+    let content_height = inner.height.saturating_sub(footer_height);
+    let content_area = Rect::new(inner.x, inner.y, inner.width, content_height);
+
+    let lines = help_lines(inner.width as usize);
+    let max_scroll = (lines.len() as u16).saturating_sub(content_height);
+
+    let Some(flow) = state.help.as_mut() else {
+        return;
+    };
+    flow.viewport = content_height.max(1);
+    flow.max_scroll = max_scroll;
+    flow.scroll = flow.scroll.min(max_scroll);
+
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).scroll((flow.scroll, 0)),
+        content_area,
+    );
+
+    if footer_height > 0 {
+        let percent = if max_scroll == 0 {
+            100
+        } else {
+            (flow.scroll as u32 * 100 / max_scroll as u32).min(100) as u16
+        };
+        let hint = format!(
+            " Up/Down, j/k · PgUp/PgDn — прокрутка   {:>3}% · Esc, q, Enter — закрыть ",
+            percent
+        );
+        let hint = truncate_chars(&hint, inner.width as usize);
+        let footer_area = Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                hint,
+                Style::default().fg(Color::DarkGray),
+            ))),
+            footer_area,
+        );
+    }
+}
+
+fn help_modal_rect(area: Rect) -> Rect {
+    let width = 92
+        .min(area.width.saturating_sub(2))
+        .max(20)
+        .min(area.width);
+    let height = 36
+        .min(area.height.saturating_sub(2))
+        .max(8)
+        .min(area.height);
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
+}
+
+/// Собирает содержимое справки в две колонки: команда/алиас и описание.
+fn help_lines(width: usize) -> Vec<Line<'static>> {
+    const MAX_KEY_WIDTH: usize = 36;
+    let key_width = (width * 45 / 100).clamp(8, MAX_KEY_WIDTH);
+    let desc_width = width.saturating_sub(key_width + 2).max(1);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let header = format!("{:<key_width$}", "Команда / алиас");
+    lines.push(Line::from(vec![
+        Span::styled(
+            header,
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            "Описание",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    for (index, section) in HELP_SECTIONS.iter().enumerate() {
+        if index > 0 {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(Span::styled(
+            format!(" {} ", section.title),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+
+        for row in section.rows {
+            for (chunk_index, chunk) in wrap_help_text(row.desc, desc_width).iter().enumerate() {
+                let key = if chunk_index == 0 {
+                    truncate_chars(row.keys, key_width)
+                } else {
+                    String::new()
+                };
+                let key_cell = format!("{:<key_width$}", key);
+                lines.push(Line::from(vec![
+                    Span::styled(key_cell, Style::default().fg(Color::Yellow)),
+                    Span::raw("  "),
+                    Span::styled(chunk.clone(), Style::default().fg(Color::Gray)),
+                ]));
+            }
+        }
+    }
+
+    lines
+}
+
+/// Переносит описание по словам, чтобы таблица оставалась читаемой
+/// в узком терминале.
+fn wrap_help_text(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+
+    for word in text.split_whitespace() {
+        let word_len = word.chars().count();
+        if current.is_empty() {
+            if word_len > width {
+                let mut rest = word;
+                while rest.chars().count() > width {
+                    let chunk: String = rest.chars().take(width).collect();
+                    rest = &rest[chunk.len()..];
+                    lines.push(chunk);
+                }
+                current = rest.to_string();
+            } else {
+                current.push_str(word);
+            }
+        } else if current.chars().count() + 1 + word_len <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current.push_str(word);
+        }
+    }
+
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+fn truncate_chars(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    let mut shortened: String = text.chars().take(width.saturating_sub(1)).collect();
+    shortened.push('…');
+    shortened
 }
 
 // ============================================================
@@ -1938,6 +2488,68 @@ fn notify_incoming(app: &Arc<App>, sender: &str, text: &str, unread: usize) {
     });
 }
 
+/// Открывает модальное окно справки.
+fn open_help(state: &mut UiState) {
+    state.help = Some(HelpFlow::new());
+    state.status = "справка · F1/Esc — закрыть, Up/Down — прокрутка".to_string();
+}
+
+/// Переключает модальное окно справки (F1).
+fn toggle_help(state: &mut UiState) {
+    if state.help.is_some() {
+        state.help = None;
+        state.status = "справка закрыта".to_string();
+    } else {
+        open_help(state);
+    }
+}
+
+/// Обрабатывает клавиши внутри открытой справки.
+fn handle_help_key(state: &mut UiState, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+            state.help = None;
+            state.status = "справка закрыта".to_string();
+            return;
+        }
+        _ => {}
+    }
+
+    let Some(flow) = state.help.as_mut() else {
+        return;
+    };
+    let page = flow.viewport.max(1);
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            flow.scroll = flow.scroll.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            flow.scroll = flow.scroll.saturating_add(1).min(flow.max_scroll);
+        }
+        KeyCode::PageUp => {
+            flow.scroll = flow.scroll.saturating_sub(page);
+        }
+        KeyCode::PageDown => {
+            flow.scroll = flow.scroll.saturating_add(page).min(flow.max_scroll);
+        }
+        KeyCode::Home => flow.scroll = 0,
+        KeyCode::End => flow.scroll = flow.max_scroll,
+        _ => {}
+    }
+}
+
+/// Прокрутка справки колесом мыши.
+fn scroll_help(state: &mut UiState, amount: u16, up: bool) {
+    let Some(flow) = state.help.as_mut() else {
+        return;
+    };
+    flow.scroll = if up {
+        flow.scroll.saturating_sub(amount)
+    } else {
+        flow.scroll.saturating_add(amount).min(flow.max_scroll)
+    };
+}
+
 async fn handle_terminal_event(
     app: &Arc<App>,
     state: &mut UiState,
@@ -1959,8 +2571,77 @@ async fn handle_terminal_event(
                 state.sf_cycle = None;
             }
 
+            // Ctrl+C защищён от случайного выхода: пока в поле ввода есть
+            // текст, копируем его в буфер и очищаем строку. Выход — только
+            // по повторному Ctrl+C на пустой строке или по команде /q.
             if ctrl && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C')) {
-                return Ok(true);
+                if state.input.is_empty() {
+                    return Ok(true);
+                }
+
+                // Пароль никогда не копируем в системный буфер.
+                if state.passwd.is_some() {
+                    state.input.clear();
+                    state.cursor = 0;
+                    state.history_index = None;
+                    state.history_draft.clear();
+                    state.status = "ввод пароля сброшен".to_string();
+                    return Ok(false);
+                }
+
+                // Маскируемые поля настроек (Guard Header Value) тоже
+                // не должны попадать в буфер обмена.
+                let masked_settings = state
+                    .settings
+                    .as_ref()
+                    .map(|flow| flow.editing && flow.field().is_masked())
+                    .unwrap_or(false);
+                if masked_settings {
+                    state.status = "секретное поле не копируется в буфер".to_string();
+                    return Ok(false);
+                }
+
+                let text = state.input.clone();
+                match copy_to_clipboard(state, &text) {
+                    Ok(()) => {
+                        state.input.clear();
+                        state.cursor = 0;
+                        state.history_index = None;
+                        state.history_draft.clear();
+                        state.status =
+                            "ввод скопирован; Ctrl+C на пустой строке — выход".to_string();
+                    }
+                    Err(e) => {
+                        state.status = format!("не удалось скопировать ввод: {:#}", e);
+                    }
+                }
+                return Ok(false);
+            }
+
+            // Ctrl+S — быстрый вызов модального окна настроек (/set).
+            if ctrl && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S')) {
+                if state.help.is_some() {
+                    state.help = None;
+                }
+                if state.passwd.is_some() {
+                    state.status = "сначала завершите смену мастер-пароля".to_string();
+                } else if state.settings.is_none() {
+                    start_settings(app, state);
+                }
+                return Ok(false);
+            }
+
+            // F1 открывает/закрывает справку. Одиночный `?` не перехватываем:
+            // он должен попадать в поле ввода как обычный текст.
+            if matches!(key.code, KeyCode::F(1)) {
+                toggle_help(state);
+                return Ok(false);
+            }
+
+            // Модальное окно справки перехватывает прокрутку и закрытие.
+            if state.help.is_some() {
+                handle_help_key(state, key);
+                return Ok(false);
             }
 
             if ctrl && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V')) {
@@ -2032,32 +2713,6 @@ async fn handle_terminal_event(
                 KeyCode::Down if state.passwd.is_none() => {
                     history_next(state)
                 }
-                KeyCode::Char(c) => {
-                    if !ctrl {
-                        state.input.insert(state.cursor, c);
-                        state.cursor += c.len_utf8();
-                    }
-                }
-                KeyCode::Backspace => {
-                    if state.cursor > 0 {
-                        let prev = prev_char_boundary(&state.input, state.cursor);
-                        state.input.remove(prev);
-                        state.cursor = prev;
-                    }
-                }
-                KeyCode::Delete => {
-                    if state.cursor < state.input.len() {
-                        state.input.remove(state.cursor);
-                    }
-                }
-                KeyCode::Left => {
-                    state.cursor = prev_char_boundary(&state.input, state.cursor);
-                }
-                KeyCode::Right => {
-                    state.cursor = next_char_boundary(&state.input, state.cursor);
-                }
-                KeyCode::Home => state.cursor = 0,
-                KeyCode::End => state.cursor = state.input.len(),
                 KeyCode::PageUp => scroll_up(state, state.view_height.max(1)),
                 KeyCode::PageDown => scroll_down(state, state.view_height.max(1)),
                 KeyCode::Esc => {
@@ -2076,14 +2731,26 @@ async fn handle_terminal_event(
                     state.history_index = None;
                     state.history_draft.clear();
                 }
+                _ => {
+                    apply_line_edit_key(state, key, ctrl, alt);
+                }
+            }
+        }
+        Event::Mouse(mouse) => {
+            if state.help.is_some() {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => scroll_help(state, 3, true),
+                    MouseEventKind::ScrollDown => scroll_help(state, 3, false),
+                    _ => {}
+                }
+                return Ok(false);
+            }
+            match mouse.kind {
+                MouseEventKind::ScrollUp => scroll_up(state, 3),
+                MouseEventKind::ScrollDown => scroll_down(state, 3),
                 _ => {}
             }
         }
-        Event::Mouse(mouse) => match mouse.kind {
-            MouseEventKind::ScrollUp => scroll_up(state, 3),
-            MouseEventKind::ScrollDown => scroll_down(state, 3),
-            _ => {}
-        },
         Event::Paste(text) => {
             let can_paste = state
                 .settings
@@ -2208,6 +2875,7 @@ fn handle_settings_key(app: &App, state: &mut UiState, key: KeyEvent) {
         None => return,
     };
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
 
     if editing {
         match key.code {
@@ -2228,31 +2896,9 @@ fn handle_settings_key(app: &App, state: &mut UiState, key: KeyEvent) {
                 state.cursor = 0;
                 state.status = "редактирование отменено".to_string();
             }
-            KeyCode::Char(c) if !ctrl => {
-                state.input.insert(state.cursor, c);
-                state.cursor += c.len_utf8();
+            _ => {
+                apply_line_edit_key(state, key, ctrl, alt);
             }
-            KeyCode::Backspace => {
-                if state.cursor > 0 {
-                    let prev = prev_char_boundary(&state.input, state.cursor);
-                    state.input.remove(prev);
-                    state.cursor = prev;
-                }
-            }
-            KeyCode::Delete => {
-                if state.cursor < state.input.len() {
-                    state.input.remove(state.cursor);
-                }
-            }
-            KeyCode::Left => {
-                state.cursor = prev_char_boundary(&state.input, state.cursor);
-            }
-            KeyCode::Right => {
-                state.cursor = next_char_boundary(&state.input, state.cursor);
-            }
-            KeyCode::Home => state.cursor = 0,
-            KeyCode::End => state.cursor = state.input.len(),
-            _ => {}
         }
         return;
     }
@@ -2398,13 +3044,41 @@ fn validated_invite_link(app: &App) -> Result<String> {
     Ok(link)
 }
 
+/// Приводит вставляемый текст к однострочному виду.
+///
+/// Переносы строк (`\n`, `\r`, `\r\n`) и табуляции заменяются пробелом,
+/// а прочие управляющие символы отбрасываются, чтобы в поле ввода не
+/// попадали последовательности, ломающие отрисовку терминала.
+fn sanitize_pasted_text(text: &str) -> String {
+    let mut cleaned = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                cleaned.push(' ');
+            }
+            '\n' => {
+                if chars.peek() == Some(&'\r') {
+                    chars.next();
+                }
+                cleaned.push(' ');
+            }
+            '\t' => cleaned.push(' '),
+            c if c.is_control() => {}
+            c => cleaned.push(c),
+        }
+    }
+
+    cleaned
+}
+
 /// Вставляет текст в однострочное поле ввода (переводы строк → пробелы).
 fn insert_text(state: &mut UiState, text: &str) {
-    let cleaned: String = text
-        .chars()
-        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
-        .collect();
-
+    let cleaned = sanitize_pasted_text(text);
     state.input.insert_str(state.cursor, &cleaned);
     state.cursor += cleaned.len();
 }
@@ -2547,7 +3221,7 @@ async fn handle_command(
     let cmd = normalize_command(parts.first().copied().unwrap_or(""));
 
     match cmd {
-        "/help" => push_system(state, HELP),
+        "/help" => open_help(state),
 
         "/profile" => match serde_json::to_string_pretty(&app.get_profile()) {
             Ok(text) => push_system(state, &text),
@@ -3235,4 +3909,190 @@ async fn main() -> Result<()> {
 
     drop(tui);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MIXED: &str = "привет мир hello world";
+
+    fn boundary(text: &str, index: usize) {
+        assert!(
+            text.is_char_boundary(index),
+            "индекс {} не на границе UTF-8 в {:?}",
+            index,
+            text
+        );
+    }
+
+    #[test]
+    fn word_left_navigation_handles_mixed_text() {
+        let mut cursor = MIXED.len();
+        boundary(MIXED, cursor);
+
+        move_word_left(MIXED, &mut cursor);
+        assert_eq!(cursor, MIXED.find("world").unwrap());
+        boundary(MIXED, cursor);
+
+        move_word_left(MIXED, &mut cursor);
+        assert_eq!(cursor, MIXED.find("hello").unwrap());
+        boundary(MIXED, cursor);
+
+        move_word_left(MIXED, &mut cursor);
+        assert_eq!(cursor, MIXED.find("мир").unwrap());
+        boundary(MIXED, cursor);
+
+        move_word_left(MIXED, &mut cursor);
+        assert_eq!(cursor, 0);
+
+        // Левее начала строки курсор не уходит.
+        move_word_left(MIXED, &mut cursor);
+        assert_eq!(cursor, 0);
+    }
+
+    #[test]
+    fn word_right_navigation_handles_mixed_text() {
+        let mut cursor = 0;
+
+        move_word_right(MIXED, &mut cursor);
+        assert_eq!(cursor, MIXED.find(' ').unwrap());
+        boundary(MIXED, cursor);
+
+        move_word_right(MIXED, &mut cursor);
+        assert_eq!(cursor, MIXED.find("hello").unwrap() - 1);
+        boundary(MIXED, cursor);
+
+        move_word_right(MIXED, &mut cursor);
+        assert_eq!(cursor, MIXED.find("world").unwrap() - 1);
+        boundary(MIXED, cursor);
+
+        move_word_right(MIXED, &mut cursor);
+        assert_eq!(cursor, MIXED.len());
+
+        // Правее конца строки курсор не уходит.
+        move_word_right(MIXED, &mut cursor);
+        assert_eq!(cursor, MIXED.len());
+    }
+
+    #[test]
+    fn delete_word_before_removes_one_word() {
+        let mut input = MIXED.to_string();
+        let mut cursor = input.len();
+
+        delete_word_before(&mut input, &mut cursor);
+        assert_eq!(input, "привет мир hello ");
+        assert_eq!(cursor, input.len());
+        boundary(&input, cursor);
+
+        delete_word_before(&mut input, &mut cursor);
+        assert_eq!(input, "привет мир ");
+        assert_eq!(cursor, input.len());
+
+        // Разделитель перед словом тоже удаляется.
+        delete_word_before(&mut input, &mut cursor);
+        assert_eq!(input, "привет ");
+        assert_eq!(cursor, input.len());
+
+        delete_word_before(&mut input, &mut cursor);
+        assert_eq!(input, "");
+        assert_eq!(cursor, 0);
+
+        // На пустой строке ничего не происходит.
+        delete_word_before(&mut input, &mut cursor);
+        assert_eq!(input, "");
+        assert_eq!(cursor, 0);
+    }
+
+    #[test]
+    fn delete_word_after_removes_one_word() {
+        let mut input = "привет  мир!".to_string();
+        let mut cursor = 0;
+
+        delete_word_after(&mut input, &mut cursor);
+        assert_eq!(input, "  мир!");
+        assert_eq!(cursor, 0);
+
+        // Следующее удаление справа съедает разделители и слово «мир».
+        delete_word_after(&mut input, &mut cursor);
+        assert_eq!(input, "!");
+        assert_eq!(cursor, 0);
+        boundary(&input, cursor);
+
+        // В конце строки удаление справа безопасно.
+        cursor = input.len();
+        delete_word_after(&mut input, &mut cursor);
+        assert_eq!(input, "!");
+        assert_eq!(cursor, input.len());
+    }
+
+    #[test]
+    fn delete_to_line_start_and_end_keep_utf8_boundaries() {
+        let mut input = "hello мир".to_string();
+        let mut cursor = input.find("мир").unwrap();
+
+        delete_to_line_start(&mut input, &mut cursor);
+        assert_eq!(input, "мир");
+        assert_eq!(cursor, 0);
+        boundary(&input, cursor);
+
+        let mut input = "hello мир".to_string();
+        let mut cursor = input.find(' ').unwrap();
+        delete_to_line_end(&mut input, &mut cursor);
+        assert_eq!(input, "hello");
+        assert_eq!(cursor, input.len());
+        boundary(&input, cursor);
+    }
+
+    #[test]
+    fn utf8_emoji_and_cyrillic_do_not_panic() {
+        let mut input = "🙂 тест".to_string();
+        let mut cursor = input.len();
+
+        move_word_left(&input, &mut cursor);
+        assert_eq!(cursor, input.find("тест").unwrap());
+        boundary(&input, cursor);
+
+        // Курсор стоит в начале слова, поэтому удаление назад захватывает
+        // и разделитель перед ним (эмодзи с пробелом).
+        delete_word_before(&mut input, &mut cursor);
+        assert_eq!(input, "тест");
+        assert_eq!(cursor, 0);
+
+        // Эмодзи — разделитель, а не часть слова; границы остаются
+        // корректными и никакие срезы не паникуют.
+        let emoji = "🙂";
+        assert_eq!(word_left_boundary(emoji, emoji.len()), 0);
+        assert_eq!(word_right_boundary(emoji, 0), emoji.len());
+        assert_eq!(word_left_boundary("", 0), 0);
+        assert_eq!(word_right_boundary("", 0), 0);
+        assert_eq!(word_left_boundary("🙂 тест", 3), 0);
+        assert_eq!(word_right_boundary("🙂 тест", 3), "🙂 тест".len());
+    }
+
+    #[test]
+    fn punctuation_is_a_word_separator() {
+        let text = "abc-деф,ghi";
+        let mut cursor = text.len();
+
+        move_word_left(text, &mut cursor);
+        assert_eq!(cursor, text.find("ghi").unwrap());
+        boundary(text, cursor);
+
+        move_word_left(text, &mut cursor);
+        assert_eq!(cursor, text.find("деф").unwrap());
+        boundary(text, cursor);
+
+        move_word_left(text, &mut cursor);
+        assert_eq!(cursor, 0);
+    }
+
+    #[test]
+    fn paste_normalization_handles_newlines_and_controls() {
+        assert_eq!(sanitize_pasted_text("привет\r\nмир"), "привет мир");
+        assert_eq!(sanitize_pasted_text("hello\nworld\rok"), "hello world ok");
+        assert_eq!(sanitize_pasted_text("a\tb"), "a b");
+        assert_eq!(sanitize_pasted_text("a\u{7}b"), "ab");
+        assert_eq!(sanitize_pasted_text("🙂\nтест"), "🙂 тест");
+    }
 }

@@ -920,8 +920,9 @@ impl App {
     /// возвращаются вызывающему, который для входящих сообщений их игнорирует.
     pub fn send_notification(&self, sender: &str, text: &str, unread: usize) -> Result<()> {
         let config = self.get_config();
+        let appname = notification_appname(&config);
         match config.notification_content(sender, text, unread) {
-            Some((title, body)) => show_system_notification(&title, &body),
+            Some((title, body)) => show_system_notification(&appname, &title, &body),
             None => Ok(()),
         }
     }
@@ -937,7 +938,7 @@ impl App {
             )
             .ok_or_else(|| anyhow!("уведомления отключены (Notify Level: 0)"))?;
 
-        show_system_notification(&title, &body)
+        show_system_notification(&notification_appname(&config), &title, &body)
     }
 
     pub fn get_safe_fs(&self) -> &Arc<SafeFSOps> {
@@ -945,9 +946,26 @@ impl App {
     }
 }
 
-fn show_system_notification(title: &str, body: &str) -> Result<()> {
+/// Имя приложения в шапке системного баннера.
+///
+/// В stealth-режиме (level 1) не раскрываем название мессенджера:
+/// берём `stealth_title`, а если он пуст — нейтральное `System Health`.
+fn notification_appname(config: &Config) -> String {
+    if config.notify_level == 1 {
+        let title = config.stealth_title.trim();
+        if title.is_empty() {
+            "System Health".to_string()
+        } else {
+            title.to_string()
+        }
+    } else {
+        "LastChance".to_string()
+    }
+}
+
+fn show_system_notification(appname: &str, title: &str, body: &str) -> Result<()> {
     notify_rust::Notification::new()
-        .appname("LastChance")
+        .appname(appname)
         .summary(title)
         .body(body)
         .show()
@@ -1001,6 +1019,23 @@ mod tests {
         assert_eq!(contacts.len(), 1);
         assert_eq!(contacts[0].hash, hash);
         assert_eq!(contacts[0].nickname, nickname);
+    }
+
+    #[test]
+    fn test_notification_appname_hides_messenger_in_stealth_mode() {
+        let mut config = Config {
+            notify_level: 1,
+            stealth_title: "Перерыв для глаз".to_string(),
+            ..Config::default()
+        };
+        assert_eq!(notification_appname(&config), "Перерыв для глаз");
+
+        config.stealth_title = "  ".to_string();
+        assert_eq!(notification_appname(&config), "System Health");
+
+        config.notify_level = 2;
+        config.stealth_title = "Перерыв".to_string();
+        assert_eq!(notification_appname(&config), "LastChance");
     }
 
     #[test]
