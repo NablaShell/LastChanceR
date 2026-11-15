@@ -1,4 +1,5 @@
 // src/network/mod.rs
+pub mod auth;
 pub mod config;
 pub mod listener;
 pub mod sender;

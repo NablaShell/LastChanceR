@@ -39,6 +39,7 @@ The crate is split into a reusable core library and a thin TUI binary:
 | `src/network/config.rs` | Encrypted `global.conf`, proxy/notification settings |
 | `src/network/sender.rs` | `POST /push/<hash>`, file upload |
 | `src/network/listener.rs` | Long-poll `GET /pull/<hash>`, multipart parsing, file download |
+| `src/network/auth.rs` | Canonical request signatures, nonce cache and server-side verification |
 | `src/storage/` | Safe filesystem operations and the encrypted local vault |
 | `src/vault.rs` | Master-key derivation and local encryption |
 | `src/app.rs` | Core application logic, events, contacts, sending/receiving |
@@ -84,7 +85,8 @@ lastchance://contact?hash=...&doc=<cbor-hex>&sig=<signature-hex>&x25519=...&ed25
 - Each contact stores its fingerprint and TOFU state (`pending`, `verified` or `changed`). If the X25519 key changes under the same signed Ed25519 identity, the contact is marked `changed` and must be verified again.
 - In the contact manager (`/contacts`, `/cnt`, `/ls`, `/c`), `↑`/`↓` or `j`/`k` select a contact, `Enter` opens the chat, `/` filters, `r` renames, `i` shows the fingerprint and TOFU state, `c` copies the fingerprint, `d` deletes and `q`/`Esc` closes. In the info view, `v` marks the fingerprint as verified after an out-of-band check, while `Esc` or `i` returns to the list.
 
-- `/pull` requests are signed with Ed25519 over `timestamp + identity_hash`; the server receives the public key in `X-Identity-Key`, the timestamp in `X-Timestamp` and the signature in `X-Signature`.
+- Authenticated requests use one canonical envelope: `METHOD\nPATH\nCANONICAL_QUERY\nTIMESTAMP\nNONCE\nSHA256(body)`. `METHOD` is uppercase, `PATH` has no query and no trailing slash (except `/`), `CANONICAL_QUERY` preserves the original percent-encoding and sorts the raw `key=value` pairs by key and then by value (an empty query stays empty), `TIMESTAMP` is Unix seconds and `NONCE` is 24 CSPRNG bytes in unpadded base64url. Ed25519 signs the UTF-8 envelope; the signature is also unpadded base64url.
+- The client sends `X-Auth-Identity`, `X-Auth-Timestamp`, `X-Auth-Nonce` and `X-Auth-Signature` (plus the public key in `X-Identity-Key`). A compatible server must bind the identity hash to a known contact, accept `timestamp` only inside `[now - 60s, now + 30s]`, reject a nonce already seen for that identity, rebuild the envelope from the actual method/path/query/body, and answer every authentication failure with the same `401` body (the reason is written to the internal audit log only). The nonce cache holds at most 1024 entries per identity, expires entries after `60 + 30 + 60 = 150s`, and fails closed with `503` instead of evicting when full.
 
 ### Message encryption
 
@@ -446,6 +448,7 @@ LastChance — мессенджер на Rust с фокусом на прива�
 | `src/network/config.rs` | Зашифрованный `global.conf`, настройки прокси и уведомлений |
 | `src/network/sender.rs` | `POST /push/<hash>`, загрузка файлов |
 | `src/network/listener.rs` | Long-poll `GET /pull/<hash>`, разбор multipart, скачивание файлов |
+| `src/network/auth.rs` | Канонические подписи запросов, nonce-кэш и серверная проверка |
 | `src/storage/` | Безопасная работа с ФС и зашифрованное локальное хранилище |
 | `src/vault.rs` | Вывод мастер-ключа и локальное шифрование |
 | `src/app.rs` | Ядро приложения, события, контакты, отправка и приём |
@@ -489,7 +492,8 @@ lastchance://contact?hash=...&doc=<cbor-hex>&sig=<signature-hex>&x25519=...&ed25
 - Для каждого контакта хранятся отпечаток и состояние TOFU (`pending`, `verified` или `changed`). Если X25519-ключ меняется при той же подписанной Ed25519-идентичности, контакт помечается как `changed` и требует повторной проверки.
 - В менеджере контактов (`/contacts`, `/cnt`, `/ls`, `/c`) клавиши `↑`/`↓` или `j`/`k` выбирают контакт, `Enter` открывает чат, `/` включает фильтр, `r` переименовывает, `i` показывает отпечаток и состояние TOFU, `c` копирует отпечаток, `d` удаляет, `q`/`Esc` закрывает. В окне информации `v` отмечает отпечаток проверенным после сверки вне канала, а `Esc` или `i` возвращают к списку.
 
-- Запросы `/pull` подписываются Ed25519 над строкой `timestamp + identity_hash`. Сервер получает публичный ключ в `X-Identity-Key`, время в `X-Timestamp`, подпись в `X-Signature`.
+- Аутентифицированные запросы используют единый канонический конверт: `METHOD\nPATH\nCANONICAL_QUERY\nTIMESTAMP\nNONCE\nSHA256(body)`. `METHOD` — в верхнем регистре, `PATH` — без query и завершающего `/` (кроме корня), `CANONICAL_QUERY` сохраняет исходный percent-encoding и сортирует необработанные пары `key=value` по ключу, затем по значению (пустой query остаётся пустым), `TIMESTAMP` — Unix-секунды, `NONCE` — 24 байта CSPRNG в base64url без padding. Ed25519 подписывает конверт в UTF-8; подпись также кодируется в base64url без padding.
+- Клиент отправляет `X-Auth-Identity`, `X-Auth-Timestamp`, `X-Auth-Nonce` и `X-Auth-Signature` (а публичный ключ — в `X-Identity-Key`). Совместимый сервер обязан связать identity hash с известным контактом, принимать `timestamp` только в окне `[now - 60s, now + 30s]`, отклонять уже использованный этой identity nonce, собирать конверт из фактических method/path/query/body и отвечать на любой отказ аутентификации одинаковым телом `401` (причина пишется только во внутренний аудит-лог). Nonce-кэш хранит не более 1024 записей на identity, истекает через `60 + 30 + 60 = 150s` и при переполнении отвечает `503` (fail-closed), а не вытесняет старые записи.
 
 ### Шифрование сообщений
 

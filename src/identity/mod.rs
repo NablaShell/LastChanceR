@@ -753,25 +753,6 @@ impl Identity {
     pub fn get_ed25519_public_key_hex(&self) -> String {
         hex::encode(&self.ed25519_public_key)
     }
-
-    pub fn sign_auth(&self, timestamp: i64) -> Result<String> {
-        if self.ed25519_private_key.len() != 32 {
-            return Err(anyhow!(
-                "ed25519 private key invalid size: {}",
-                self.ed25519_private_key.len()
-            ));
-        }
-
-        let mut key_bytes = [0u8; 32];
-        key_bytes.copy_from_slice(&self.ed25519_private_key);
-        let signing_key = SigningKey::from_bytes(&key_bytes);
-
-        use ed25519_dalek::Signer;
-        let message = format!("{}{}", timestamp, self.hash);
-        let signature = signing_key.sign(message.as_bytes());
-
-        Ok(hex::encode(signature.to_bytes()))
-    }
 }
 
 #[cfg(test)]

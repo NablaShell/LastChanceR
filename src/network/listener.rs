@@ -1,12 +1,12 @@
 // src/network/listener.rs
 use anyhow::{anyhow, Result};
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::SigningKey;
 use reqwest::header::CONTENT_TYPE;
 use reqwest::Client;
 use std::sync::RwLock;
 use std::time::Duration;
 use crate::network::{
-    build_http_client, Config, BODY_READ_TIMEOUT, MAX_ERROR_BODY, MAX_FILE_BODY,
+    auth, build_http_client, Config, BODY_READ_TIMEOUT, MAX_ERROR_BODY, MAX_FILE_BODY,
     MAX_MESSAGE_BODY, MAX_MULTIPART_BOUNDARY, MAX_MULTIPART_HEADERS,
     MAX_MULTIPART_HEADER_BYTES, MAX_MULTIPART_PARTS,
 };
@@ -304,24 +304,33 @@ impl Listener {
         let client = self
             .current_client()
             .map_err(|e| PullError::Protocol(e.to_string()))?;
-        let now = chrono::Utc::now().timestamp().to_string();
-        // message = timestamp + target_hash (без разделителя, API.md §4.2)
-        let message = format!("{}{}", now, identity_hash);
-        let signature = signing_key.sign(message.as_bytes());
-        let sig_hex = hex::encode(signature.to_bytes());
+        // Подпись покрывает метод, путь, query, timestamp, одноразовый nonce
+        // и SHA256(body) — см. src/network/auth.rs (H-4).
+        let timestamp = chrono::Utc::now().timestamp();
+        let nonce = auth::generate_nonce();
+        let path = format!("/pull/{}", identity_hash);
+        let query = format!("wait={}", LONG_POLL_WAIT_SECS);
+        let signature = auth::sign_request(
+            signing_key,
+            "GET",
+            &path,
+            &query,
+            timestamp,
+            &nonce,
+            &[],
+        );
 
         // ?wait=25 включает серверный HTTP long-poll: пустая очередь держит
         // соединение до появления сообщения или истечения wait.
-        let url = format!(
-            "{}/pull/{}?wait={}",
-            config.server_url, identity_hash, LONG_POLL_WAIT_SECS
-        );
+        let url = format!("{}{}?{}", config.server_url, path, query);
 
         let response = client
             .get(&url)
             .header("X-Identity-Key", pub_key_hex)
-            .header("X-Timestamp", &now)
-            .header("X-Signature", &sig_hex)
+            .header(auth::HEADER_IDENTITY, identity_hash)
+            .header(auth::HEADER_TIMESTAMP, timestamp.to_string())
+            .header(auth::HEADER_NONCE, &nonce)
+            .header(auth::HEADER_SIGNATURE, &signature)
             .header("X-Requested-With", "XMLHttpRequest")
             .header("Accept", "multipart/form-data")
             .header("User-Agent", "Mozilla/5.0 (X11; Arch Linux; rv:130.0) Gecko/20100101 Firefox/130.0")
@@ -674,6 +683,109 @@ mod tests {
         let ct = r#"multipart/form-data; boundary="abc""#;
         let parts = parse_multipart(ct, body).unwrap();
         assert_eq!(parts, vec![b"X".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn pull_request_carries_canonical_signature_headers() {
+        use crate::identity::hash_ed25519_public;
+        use crate::network::auth::{AuthFailure, AuthRequest, AuthVerifier};
+        use std::collections::HashMap;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::sync::oneshot;
+
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = server.local_addr().unwrap();
+        let (request_sender, request_receiver) = oneshot::channel();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = server.accept().await.unwrap();
+            let mut raw = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                let read = stream.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&chunk[..read]);
+                if raw.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = request_sender.send(String::from_utf8_lossy(&raw).into_owned());
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+            let _ = stream.shutdown().await;
+        });
+
+        let config = Config {
+            server_url: format!("http://{}", addr),
+            ..Config::default()
+        };
+        let signing_key = SigningKey::from_bytes(&[42u8; 32]);
+        let identity_hash =
+            hash_ed25519_public(signing_key.verifying_key().as_bytes());
+        let listener = Listener::new(&config).unwrap();
+
+        let messages = listener
+            .pull_messages_with_auth(
+                &identity_hash,
+                &hex::encode(signing_key.verifying_key().as_bytes()),
+                &signing_key,
+            )
+            .await
+            .unwrap();
+        assert!(messages.is_empty());
+
+        let raw = request_receiver.await.unwrap();
+        let mut lines = raw.split("\r\n");
+        let request_line = lines.next().unwrap();
+        let mut parts = request_line.split(' ');
+        assert_eq!(parts.next(), Some("GET"));
+        let target = parts.next().unwrap();
+        let (path, query) = target.split_once('?').unwrap();
+        assert_eq!(path, format!("/pull/{}", identity_hash));
+        assert_eq!(query, "wait=25");
+
+        let mut headers = HashMap::new();
+        for line in lines {
+            if line.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+            }
+        }
+
+        let nonce = headers.get("x-auth-nonce").unwrap();
+        let signature = headers.get("x-auth-signature").unwrap();
+        let timestamp: i64 = headers.get("x-auth-timestamp").unwrap().parse().unwrap();
+        assert_eq!(headers.get("x-auth-identity").unwrap(), &identity_hash);
+
+        let request = AuthRequest {
+            method: "GET",
+            path,
+            query,
+            timestamp,
+            nonce: nonce.as_str(),
+            signature: signature.as_str(),
+            body: b"",
+        };
+        let now = chrono::Utc::now().timestamp();
+        let verifying_key = signing_key.verifying_key();
+        let mut verifier = AuthVerifier::new();
+        assert_eq!(
+            verifier.verify(&verifying_key, &identity_hash, &request, now),
+            Ok(())
+        );
+        assert_eq!(
+            verifier.verify(&verifying_key, &identity_hash, &request, now),
+            Err(AuthFailure::ReplayedNonce)
+        );
     }
 
     async fn spawn_raw_response(
