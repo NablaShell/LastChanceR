@@ -91,6 +91,22 @@ impl SafeFSOps {
         fs::metadata(&safe_path).map_err(|e| anyhow!("cannot stat file {:?}: {}", safe_path, e))
     }
 
+    /// Выставляет mtime файла (через `futimens`/`SetFileTime`).
+    ///
+    /// Используется для рандомизации mtime `vault.dat`: содержимое уже
+    /// записано атомарно, поэтому ошибка метаданных не откатывает запись.
+    pub fn set_mtime(&self, user_path: &str, modified: SystemTime) -> Result<()> {
+        let safe_path = self.resolve_path(user_path)?;
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&safe_path)
+            .map_err(|e| anyhow!("cannot open {:?} to set mtime: {}", safe_path, e))?;
+
+        let times = fs::FileTimes::new().set_modified(modified);
+        file.set_times(times)
+            .map_err(|e| anyhow!("cannot set mtime on {:?}: {}", safe_path, e))
+    }
+
     pub fn ensure_dir(&self, dir_path: &str) -> Result<()> {
         let safe_path = self.resolve_path(dir_path)?;
         create_private_dir_all(&safe_path)

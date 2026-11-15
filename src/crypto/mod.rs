@@ -324,6 +324,26 @@ pub fn file_aad(
     aad
 }
 
+/// Подбирает размер по bucket-сетке с рандомизацией внутри bucket.
+///
+/// Возвращает `bucket + jitter`, где `bucket` — первый элемент сетки
+/// `>= len`, а `jitter` равномерно распределён в `[0, bucket / 8]`.
+/// Возвращает `None`, если `len` больше последнего bucket’а.
+///
+/// Общий helper для файлового конверта и контейнера `vault.dat`: политика
+/// паддинга не должна расходиться между форматами.
+pub(crate) fn padded_bucket_len(len: usize, buckets: &[usize]) -> Option<usize> {
+    let bucket = buckets.iter().copied().find(|bucket| *bucket >= len)?;
+    let extra_max = bucket / 8;
+    let extra = if extra_max == 0 {
+        0
+    } else {
+        (OsRng.next_u64() % (extra_max as u64 + 1)) as usize
+    };
+
+    Some(bucket + extra)
+}
+
 /// Выбирает `padded_size` по bucket-сетке с рандомизацией внутри bucket.
 ///
 /// `padded_size >= plaintext_len`, но не больше `bucket + bucket / 8`.
@@ -335,23 +355,14 @@ fn padded_file_size(plaintext_len: usize) -> Result<usize> {
         }
         .into());
     }
-    let bucket = FILE_PADDING_BUCKETS
-        .iter()
-        .copied()
-        .find(|bucket| *bucket >= plaintext_len)
-        .ok_or(FileError::TooLarge {
+
+    padded_bucket_len(plaintext_len, &FILE_PADDING_BUCKETS).ok_or_else(|| {
+        FileError::TooLarge {
             size: plaintext_len,
             limit: FILE_MAX_PLAINTEXT,
-        })?;
-
-    let extra_max = bucket / 8;
-    let extra = if extra_max == 0 {
-        0
-    } else {
-        (OsRng.next_u64() % (extra_max as u64 + 1)) as usize
-    };
-
-    Ok(bucket + extra)
+        }
+        .into()
+    })
 }
 
 /// Шифрует файл в конверт v3.
@@ -869,6 +880,24 @@ mod tests {
                 "padded_size does not match payload"
             ))
         ));
+    }
+
+    #[test]
+    fn shared_bucket_helper_randomizes_within_bucket() {
+        let mut sizes = std::collections::BTreeSet::new();
+        for _ in 0..64 {
+            let padded = padded_bucket_len(3000, &FILE_PADDING_BUCKETS).unwrap();
+            assert!((4096..=4096 + 4096 / 8).contains(&padded));
+            sizes.insert(padded);
+        }
+        assert!(
+            sizes.len() > 1,
+            "bucket padding must be randomized: {:?}",
+            sizes
+        );
+
+        // Значение больше последнего bucket’а не должно молча обрезаться.
+        assert!(padded_bucket_len(usize::MAX, &FILE_PADDING_BUCKETS).is_none());
     }
 
     #[test]

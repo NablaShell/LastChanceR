@@ -7,10 +7,12 @@
 //! без магических байтов и открытых заголовков: ни имена контактов, ни
 //! тексты сообщений, ни служебные подписи SQLite на диск не попадают.
 //!
-//! Перед шифрованием дамп базы дополняется случайным паддингом так, чтобы
-//! размер контейнера был кратен 4096 байтам. Внутренний заголовок (версия
+//! Перед шифрованием дамп базы дополняется случайным паддингом по
+//! bucket-сетке (с джиттером внутри bucket). Внутренний заголовок (версия
 //! схемы и длина полезной нагрузки) хранится строго внутри зашифрованного
-//! блока, поэтому по размеру файла нельзя судить о количестве сообщений.
+//! блока, поэтому точное число сообщений по размеру файла не определяется:
+//! наблюдатель видит только bucket. Это mitigation, а не устранение утечки:
+//! рост числа bucket’ов всё ещё коррелирует с объёмом данных.
 //!
 //! При каждом изменении данных состояние базы сериализуется, шифруется
 //! мастер-ключом и атомарно перезаписывается через [`SafeFSOps`] с правами
@@ -25,6 +27,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant, SystemTime};
 use zeroize::Zeroizing;
 
 use crate::crypto::secret::SecretBytes;
@@ -40,8 +43,22 @@ pub const LEGACY_DB_FILE_NAME: &str = "user.db";
 
 /// `nonce (24) + Poly1305 tag (16)`.
 const CONTAINER_OVERHEAD: usize = 40;
-/// Размер блока, к которому выравнивается контейнер.
-const BLOCK_SIZE: usize = 4096;
+/// Bucket-сетка контейнера `vault.dat`. Последний bucket покрывает
+/// [`MAX_PAYLOAD_LEN`]. Та же политика джиттера, что у файловых конвертов
+/// (общий [`crate::crypto::padded_bucket_len`]).
+const VAULT_PADDING_BUCKETS: [usize; 11] = [
+    4 * 1024,
+    16 * 1024,
+    64 * 1024,
+    256 * 1024,
+    1024 * 1024,
+    4 * 1024 * 1024,
+    16 * 1024 * 1024,
+    64 * 1024 * 1024,
+    128 * 1024 * 1024,
+    256 * 1024 * 1024,
+    512 * 1024 * 1024,
+];
 /// Открытый заголовок внутри шифротекста: `LCDB` + версия + длина JSON.
 const INNER_MAGIC: &[u8; 4] = b"LCDB";
 const INNER_VERSION: u8 = 1;
@@ -50,6 +67,13 @@ const INNER_HEADER_LEN: usize = 9;
 const VAULT_AAD: &[u8] = b"lastchance:vault.dat";
 /// Верхняя граница дампа, чтобы повреждённый заголовок не вызвал OOM.
 const MAX_PAYLOAD_LEN: usize = 512 * 1024 * 1024;
+/// Как часто mtime можно «переставлять» на новое случайное значение.
+/// Между обновлениями все записи получают один и тот же mtime, поэтому
+/// отдельная отправка сообщения не оставляет свежего следа.
+const MTIME_REFRESH_MIN_SECS: u64 = 5 * 60;
+const MTIME_REFRESH_MAX_SECS: u64 = 15 * 60;
+/// Насколько назад сдвигается mtime: файл выглядит старше реальной записи.
+const MTIME_MAX_AGE_SECS: u64 = 6 * 60 * 60;
 
 // ============================================================
 // DATA MODELS
@@ -212,10 +236,22 @@ struct RetiredSessionRow {
 // STORAGE
 // ============================================================
 
+/// Состояние рандомизированного mtime `vault.dat`.
+///
+/// `anchor` — значение, которое выставляется при каждой записи, пока не
+/// истёк `next_refresh`. Это не секрет и не влияет на целостность данных,
+/// поэтому poison блокировки восстанавливается через `into_inner`.
+#[derive(Default)]
+struct VaultMtime {
+    anchor: Option<SystemTime>,
+    next_refresh: Option<Instant>,
+}
+
 pub struct Storage {
     db: Arc<Mutex<Connection>>,
     vault: Vault,
     safe_fs: SafeFSOps,
+    mtime: Mutex<VaultMtime>,
 }
 
 impl Storage {
@@ -230,6 +266,7 @@ impl Storage {
             db: Arc::new(Mutex::new(conn)),
             vault,
             safe_fs,
+            mtime: Mutex::new(VaultMtime::default()),
         };
 
         storage.init_tables()?;
@@ -360,21 +397,56 @@ impl Storage {
     // ENCRYPTED CONTAINER
     // ============================================================
 
-    /// Дополняет открытый блок до размера, при котором итоговый контейнер
-    /// (`plaintext + nonce + tag`) кратен [`BLOCK_SIZE`].
+    /// Дополняет открытый блок так, чтобы итоговый контейнер
+    /// (`plaintext + nonce + tag`) попал в bucket-сетку с джиттером.
     fn padded_plaintext_len(payload_len: usize) -> Result<usize> {
-        let unpadded = INNER_HEADER_LEN
+        let with_overhead = INNER_HEADER_LEN
             .checked_add(payload_len)
-            .ok_or_else(|| anyhow!("database dump is too large"))?;
-        let with_overhead = unpadded
-            .checked_add(CONTAINER_OVERHEAD)
+            .and_then(|len| len.checked_add(CONTAINER_OVERHEAD))
             .ok_or_else(|| anyhow!("database dump is too large"))?;
 
-        let blocks = with_overhead.div_ceil(BLOCK_SIZE).max(1);
-        blocks
-            .checked_mul(BLOCK_SIZE)
-            .and_then(|total| total.checked_sub(CONTAINER_OVERHEAD))
+        let padded_total = crate::crypto::padded_bucket_len(with_overhead, &VAULT_PADDING_BUCKETS)
+            .ok_or_else(|| anyhow!("database dump is too large"))?;
+
+        padded_total
+            .checked_sub(CONTAINER_OVERHEAD)
             .ok_or_else(|| anyhow!("database dump is too large"))
+    }
+
+    /// Переставляет mtime `vault.dat` на случайное значение.
+    ///
+    /// Значение обновляется не на каждую запись, а раз в 5–15 минут и
+    /// сдвигается на случайные 1 секунду … 6 часов назад. Так mtime не
+    /// показывает точное время активности, хотя полностью утечку не
+    /// устраняет. Ошибка метаданных не должна терять уже записанные данные:
+    /// она только логируется.
+    fn randomize_vault_mtime(&self) {
+        let now = SystemTime::now();
+        let anchor = {
+            // Простая RAM-структура: poison не означает потерю данных.
+            let mut state = self
+                .mtime
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let refresh = state
+                .next_refresh
+                .map(|deadline| Instant::now() >= deadline)
+                .unwrap_or(true);
+
+            if refresh {
+                let age = 1 + OsRng.next_u64() % MTIME_MAX_AGE_SECS;
+                state.anchor = Some(now.checked_sub(Duration::from_secs(age)).unwrap_or(now));
+                let interval = MTIME_REFRESH_MIN_SECS
+                    + OsRng.next_u64() % (MTIME_REFRESH_MAX_SECS - MTIME_REFRESH_MIN_SECS + 1);
+                state.next_refresh = Some(Instant::now() + Duration::from_secs(interval));
+            }
+
+            state.anchor.unwrap_or(now)
+        };
+
+        if let Err(e) = self.safe_fs.set_mtime(VAULT_FILE_NAME, anchor) {
+            log::warn!("failed to randomize vault.dat mtime: {:#}", e);
+        }
     }
 
     /// Сериализует снимок и шифрует его: `nonce || ciphertext || tag`.
@@ -450,7 +522,9 @@ impl Storage {
         let snapshot = Self::dump_snapshot(conn)?;
         let sealed = Self::encode_container(&key, &snapshot)?;
         self.safe_fs
-            .safe_write_file(VAULT_FILE_NAME, &sealed, 0o600)
+            .safe_write_file(VAULT_FILE_NAME, &sealed, 0o600)?;
+        self.randomize_vault_mtime();
+        Ok(())
     }
 
     /// Перешифровывает контейнер новым ключом, не отпуская блокировку базы.
@@ -460,6 +534,7 @@ impl Storage {
         let sealed = Self::encode_container(new_key, &snapshot)?;
         self.safe_fs
             .safe_write_file(VAULT_FILE_NAME, &sealed, 0o600)?;
+        self.randomize_vault_mtime();
 
         // Ключ меняем только после успешной записи: при ошибке профиль
         // остаётся доступным старым ключом.
@@ -1918,6 +1993,23 @@ mod tests {
         fs::read(path.join(VAULT_FILE_NAME)).expect("read vault.dat")
     }
 
+    fn vault_mtime(path: &Path) -> SystemTime {
+        fs::metadata(path.join(VAULT_FILE_NAME))
+            .expect("stat vault.dat")
+            .modified()
+            .expect("vault.dat mtime")
+    }
+
+    fn assert_bucket_padded(len: usize) {
+        assert!(
+            VAULT_PADDING_BUCKETS
+                .iter()
+                .any(|bucket| len >= *bucket && len <= bucket + bucket / 8),
+            "vault.dat size {} is outside the padding grid",
+            len
+        );
+    }
+
     #[test]
     fn test_add_and_get_contact() {
         let t = setup();
@@ -2000,7 +2092,7 @@ mod tests {
     }
 
     #[test]
-    fn vault_file_hides_metadata_and_is_block_aligned() {
+    fn vault_file_hides_metadata_and_uses_padded_buckets() {
         let t = setup();
 
         let hash = "c".repeat(64);
@@ -2024,9 +2116,10 @@ mod tests {
         assert!(!contains(&bytes, secret_text.as_bytes()));
         assert!(!contains(&bytes, b"hidden-file.txt"));
 
-        // Размер кратен 4096 с учётом 40 байт nonce+tag.
-        assert!(bytes.len() >= BLOCK_SIZE);
-        assert_eq!(bytes.len() % BLOCK_SIZE, 0);
+        // Размер лежит в первом bucket’е с джиттером (а не ровно на границе).
+        assert_bucket_padded(bytes.len());
+        assert!(bytes.len() >= VAULT_PADDING_BUCKETS[0]);
+        assert!(bytes.len() <= VAULT_PADDING_BUCKETS[0] + VAULT_PADDING_BUCKETS[0] / 8);
 
         // Контейнер расшифровывается обратно и содержит исходные данные.
         let key = t.storage.vault.key().unwrap();
@@ -2037,6 +2130,97 @@ mod tests {
         assert_eq!(snapshot.messages[0].text, secret_text);
         assert_eq!(snapshot.files.len(), 1);
         assert_eq!(snapshot.files[0].file_size, 42);
+    }
+
+    #[test]
+    fn vault_size_stays_within_one_bucket_as_messages_grow() {
+        let t = setup();
+
+        let hash = "9".repeat(64);
+        t.storage.add_contact(&hash, &[9u8; 32], "Bucket").unwrap();
+        t.storage.ensure_room("Bucket", &hash).unwrap();
+
+        let mut sizes = Vec::new();
+        for index in 0..5 {
+            t.storage
+                .save_message(&hash, "out", &format!("message-{}", index))
+                .unwrap();
+            let size = read_vault(t.path()).len();
+            assert_bucket_padded(size);
+            sizes.push(size);
+        }
+
+        let min = *sizes.iter().min().unwrap();
+        let max = *sizes.iter().max().unwrap();
+        assert!(min >= VAULT_PADDING_BUCKETS[0]);
+        // Все пять записей остаются в первом bucket’е: размер не растёт
+        // линейно с числом сообщений, виден только bucket + джиттер.
+        assert!(
+            max - min <= VAULT_PADDING_BUCKETS[0] / 8,
+            "sizes leaked message growth: {:?}",
+            sizes
+        );
+    }
+
+    #[test]
+    fn vault_mtime_does_not_change_on_every_write() {
+        let t = setup();
+
+        let hash = "7".repeat(64);
+        t.storage.add_contact(&hash, &[7u8; 32], "Mtime").unwrap();
+        let before = vault_mtime(t.path());
+
+        t.storage.save_message(&hash, "out", "first").unwrap();
+        let after_first = vault_mtime(t.path());
+        t.storage.save_message(&hash, "out", "second").unwrap();
+        let after_second = vault_mtime(t.path());
+
+        // Между обновлениями mtime (5–15 минут) записи не оставляют
+        // свежего временного следа.
+        assert_eq!(before, after_first);
+        assert_eq!(after_first, after_second);
+    }
+
+    #[test]
+    fn vault_mtime_is_shifted_back_from_wall_clock() {
+        let t = setup();
+        let mtime = vault_mtime(t.path());
+
+        let age = SystemTime::now().duration_since(mtime).unwrap_or_default();
+        assert!(
+            age >= Duration::from_secs(1),
+            "mtime must be randomized backwards, age: {:?}",
+            age
+        );
+    }
+
+    #[test]
+    fn ttl_message_does_not_rewrite_vault() {
+        let t = setup();
+
+        let hash = "6".repeat(64);
+        t.storage.add_contact(&hash, &[6u8; 32], "Ttl").unwrap();
+        t.storage.ensure_room("Ttl", &hash).unwrap();
+
+        let before_bytes = read_vault(t.path());
+        let before_mtime = vault_mtime(t.path());
+
+        let expires_at = Utc::now().timestamp().max(0) as u64 + 60;
+        t.storage
+            .save_message_with_room_meta(
+                &hash,
+                "out",
+                &hash,
+                "RAM-only TTL",
+                true,
+                Some(expires_at),
+            )
+            .unwrap();
+
+        // H-3: TTL-сообщение не должно трогать vault.dat вообще — ни размер,
+        // ни mtime.
+        assert_eq!(read_vault(t.path()), before_bytes);
+        assert_eq!(vault_mtime(t.path()), before_mtime);
     }
 
     #[test]
@@ -2180,7 +2364,7 @@ mod tests {
         let bytes = read_vault(dir.path());
         assert!(!contains(&bytes, b"Legacy Name"));
         assert!(!contains(&bytes, b"Legacy message"));
-        assert_eq!(bytes.len() % BLOCK_SIZE, 0);
+        assert_bucket_padded(bytes.len());
     }
 
     #[test]

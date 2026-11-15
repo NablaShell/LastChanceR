@@ -157,8 +157,9 @@ On first launch the client asks for a master password (minimum 8 characters). Th
 - `vault.check` is an encrypted marker used to detect a wrong password.
 - `identity.json` and `global.conf` are sealed as `LCVAULT1 || nonce || ciphertext || tag` with XChaCha20-Poly1305 and associated data.
 - Contacts, rooms, messages, file records and normal Double Ratchet sessions live in an in-memory SQLite database; nothing is ever written to `user.db`, `user.db-wal` or `user.db-shm`.
-- On every change the whole database is serialized, padded with random bytes to a multiple of 4096 and sealed with XChaCha20-Poly1305 into `vault.dat` as `nonce || ciphertext || tag`; no magic bytes or open headers are stored on disk. The schema version and payload length sit inside the encrypted block.
-- Rooms with an active `/ttl` or `/ttl-syn` timer keep the ratchet state strictly in RAM: it is never written to `vault.dat` and is wiped when TTL is disabled or the client exits.
+- On every change the whole database is serialized, padded with random bytes on a bucket grid (4 KiB … 512 MiB) with jitter inside the bucket, and sealed with XChaCha20-Poly1305 into `vault.dat` as `nonce || ciphertext || tag`; no magic bytes or open headers are stored on disk. The schema version and payload length sit inside the encrypted block, so the exact number of messages is not exposed — an observer sees only the bucket.
+- `vault.dat` mtime is not refreshed on every write: it is re-anchored every 5–15 minutes and shifted by a random 1 second … 6 hours into the past. These are mitigations, not elimination: bucket boundaries, file existence and long-term growth still leak coarse activity.
+- Rooms with an active `/ttl` or `/ttl-syn` timer keep the ratchet state strictly in RAM: it is never written to `vault.dat` and is wiped when TTL is disabled or the client exits. Ephemeral messages and TTL file records never rewrite `vault.dat` either (H-3), so TTL traffic does not update its size or mtime.
 - `vault.dat` is replaced atomically through a temporary file and receives mode `0600` on Unix.
 - A legacy plaintext `user.db` is imported on first open, after which `user.db`, `user.db-wal` and `user.db-shm` are overwritten with zeros and deleted.
 - Files created by the client are written with mode `0600` on Unix; a read-only fallback is used where POSIX permissions are unavailable.
@@ -620,8 +621,9 @@ v3 намеренно несовместим с v1/v2. После обновле
 - `vault.check` — зашифрованный маркер для проверки пароля.
 - `identity.json` и `global.conf` целиком шифруются как `LCVAULT1 || nonce || ciphertext || tag` с XChaCha20-Poly1305 и associated data.
 - Контакты, комнаты, сообщения, файловые записи и обычные сессии Double Ratchet живут в SQLite исключительно в оперативной памяти; на диск никогда не пишутся `user.db`, `user.db-wal` или `user.db-shm`.
-- При каждом изменении вся база сериализуется, дополняется случайным паддингом до размера, кратного 4096, и шифруется XChaCha20-Poly1305 в `vault.dat` как `nonce || ciphertext || tag`; магические байты и открытые заголовки на диск не попадают. Версия схемы и длина полезной нагрузки хранятся внутри зашифрованного блока.
-- Комнаты с активным `/ttl` или `/ttl-syn` держат состояние храповика строго в RAM: оно не попадает в `vault.dat` и затирается при отключении TTL или выходе из клиента.
+- При каждом изменении вся база сериализуется, дополняется случайным паддингом по bucket-сетке (4 КиБ … 512 МиБ) с джиттером внутри bucket и шифруется XChaCha20-Poly1305 в `vault.dat` как `nonce || ciphertext || tag`; магические байты и открытые заголовки на диск не попадают. Версия схемы и длина полезной нагрузки хранятся внутри зашифрованного блока, поэтому точное число сообщений не видно — наблюдатель различает только bucket.
+- mtime `vault.dat` не обновляется на каждую запись: значение переставляется раз в 5–15 минут и сдвигается на случайные 1 секунду … 6 часов назад. Это mitigation, а не устранение: границы bucket’ов, факт существования файла и долговременный рост всё равно утекают.
+- Комнаты с активным `/ttl` или `/ttl-syn` держат состояние храповика строго в RAM: оно не попадает в `vault.dat` и затирается при отключении TTL или выходе из клиента. Исчезающие сообщения и файловые записи TTL-комнат тоже не перезаписывают `vault.dat` (H-3), поэтому TTL-активность не меняет его размер и mtime.
 - `vault.dat` заменяется атомарно через временный файл и получает права `0600` на Unix.
 - Старая открытая `user.db` импортируется при первом открытии, после чего `user.db`, `user.db-wal` и `user.db-shm` перезаписываются нулями и удаляются.
 - Созданные клиентом файлы получают права `0600` на Unix; там, где POSIX-права недоступны, используется read-only заглушка.
