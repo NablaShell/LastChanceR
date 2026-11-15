@@ -2,10 +2,12 @@
 pub mod auth;
 pub mod config;
 pub mod listener;
+pub mod routing;
 pub mod sender;
 
 pub use config::Config;
 pub use listener::Listener;
+pub use routing::{InboundRouter, Route, RoutingError, RoutingStats};
 pub use sender::Sender;
 
 use anyhow::{anyhow, Result};

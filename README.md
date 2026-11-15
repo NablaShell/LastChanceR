@@ -108,7 +108,16 @@ lastchance://contact?hash=...&doc=<cbor-hex>&sig=<signature-hex>&x25519=...&ed25
 
 Losing the header key together with the epoch makes the message undecryptable, as in Signal; the UI reports it as an unavailable message instead of guessing. The alias is stable within a session; if that linkability matters, it can be rotated per epoch in a future version (the current policy is documented and tested).
 
-For the M-8 addressing work, `room_id` is defined as the same `session_id_alias` (or a value derived from it), not the raw `session_id`. The alias is deterministic from the session id, so both sides can compute it without enumerating sessions, and `/push` routing by alias does not reveal the ratchet session identifier.
+### Incoming routing by room alias (M-8)
+
+- The client keeps an in-memory `alias -> room` table (rebuilt at startup from persisted ratchet states and tombstones) and selects the room from the open header before touching any key.
+- Incoming checks have a fixed order: version and size → alias lookup → retired alias (`StaleSession`) → `(alias, nonce)` duplicate check → AEAD → ratchet epoch.
+- A non-bootstrap packet with an unknown alias is dropped as `UnknownRoom` with zero decrypt attempts. No contact list is scanned and no packet is tried against several rooms.
+- The only multi-contact path is the first packet of a new session: it carries `bootstrap_nonce`, so the client compares cheap HKDF-derived aliases and runs AEAD for at most the single room that matched. This is bounded alias resolution, not ciphertext fan-out.
+- Retired aliases (after `/ratchet-reset`, TTL reset, session eviction or contact deletion) are rejected before dedup and AEAD, so an old packet cannot create a fresh session.
+- Duplicate delivery is suppressed by `(alias, nonce)` for 300 seconds with a hard cap of 8192 entries. The entry is recorded only after a successful decryption, so junk cannot grow the table.
+- Aliases are deterministic from `session_id`: the same session always maps to the same 16-byte alias. This is a deliberate linkability/retention trade-off. A server or observer that sees the alias can group packets into one session, but cannot recover `session_id`, the ratchet epoch, the contact identity or the plaintext. A new alias appears only when the session is reset; aliases are never derived from the long-term identity and are not persisted outside `vault.dat`.
+- No enumeration: the client never asks the server which rooms it has, and `/push` is addressed only by the recipient identity hash. The alias lives inside the authenticated v3 header and is never sent as a routing parameter.
 
 ### File encryption
 
@@ -135,7 +144,7 @@ v3 is intentionally incompatible with v1/v2. After upgrading, old ratchet state 
 
 ### What the servers can see
 
-The text server sees the recipient hash in the URL, the padding bucket, the timing and the masking headers. It no longer sees `dh_pub`, ratchet counters, epoch boundaries or the raw `session_id`. The file server sees the encrypted blob size bucket and its hash, but not the file name or real size. Message and file contents remain encrypted end to end.
+The text server sees the recipient hash in the URL, the padding bucket, the timing and the masking headers. It no longer sees `dh_pub`, ratchet counters, epoch boundaries or the raw `session_id`. It also cannot enumerate a user's rooms: pulls are addressed by identity hash only, and the room alias travels inside the v3 packet. The alias is stable per session, so packet grouping by alias remains possible (see the M-8 notes above). The file server sees the encrypted blob size bucket and its hash, but not the file name or real size. Message and file contents remain encrypted end to end.
 
 ---
 
@@ -205,7 +214,9 @@ On non-Unix platforms POSIX modes are unavailable; the client falls back to the 
 - `204 No Content` means the queue is empty.
 - A successful pull returns `multipart/form-data`; the client parses the parts and checks that packet sizes are in the allowed grid.
 - `429` means rate limiting. Pull retries use a 1s → 2s → 5s → 15s backoff for retryable failures; `401` and protocol errors are retried slowly to avoid a busy loop.
-- Push retries up to four attempts with exponential backoff on `429` and transport errors.
+- Push uses the same canonical envelope as pull: `X-Auth-Identity`, `X-Auth-Timestamp`, `X-Auth-Nonce`, `X-Auth-Signature`, with `body_hash = SHA256(packet)` bound into the signature. Every retry gets a fresh nonce and a fresh timestamp; the nonce is never reused.
+- `401` from `/push` is not retried (the server will reject the same identity/signature again). `429`, `503` and transport errors are retried with 1s → 2s → 4s exponential backoff, up to 4 attempts total.
+- The client enforces a local token bucket of `PUSH_REQUESTS_PER_SECOND = 8` per contact before signing, so a bug or a malicious UI action cannot turn the client into a push flood; exhausting it is a local error, not a server response.
 
 ### File API
 
@@ -441,7 +452,8 @@ On first launch you will be asked to create a master password. On later launches
 ## Security notes and limitations
 
 - The shared secret is static per contact and seeds every ratchet session. Each session adds fresh `bootstrap_nonce` entropy and ephemeral DH epochs, so session keys are not reused and captured packets cannot be replayed into a new session. Bootstrap keys are nevertheless derived from the long-term shared secret: an attacker who records a session's first packet and later obtains that secret can recompute its bootstrap root. There is no post-compromise security, and true first-message forward secrecy would require an interactive prekey/response handshake. For normal rooms destroyed session ids are persisted in `vault.dat`, so replay of a reset session stays blocked across restarts. For RAM-TTL rooms the list of destroyed session ids lives only in RAM (for the lifetime of the process), so after a client restart a replayed first packet is indistinguishable from first contact (the same TOFU boundary as the very first session). The per-session `dh_pub` registry is bounded to 128 keys: beyond that horizon an ancient key would again look new, but its local DH private key has already left the 5-epoch send window, so the packet still cannot be decrypted. The old v2 header had no epoch counter, so a genuine first-seen `dh_pub` from an older epoch could be accepted as a new epoch and move `remote_pub` back to that authentic key. In v3 the header carries an authenticated `epoch_id` inside the AEAD, and stale epochs are detected before any key agreement, so this limited denial-of-progress no longer applies; v1/v2 packets are rejected outright.
-- The server still learns the recipient identity hash, traffic timing, packet size class and the file blob size. Use Tor/I2P and your own servers if that metadata matters to you.
+- The server still learns the recipient identity hash, traffic timing, packet size class and the file blob size. The per-session alias allows grouping packets that belong to the same ratchet session, but not identifying the contact or the `session_id`. Use Tor/I2P and your own servers if that metadata matters to you.
+- Alias routing leaves no durable server-side trace beyond delivery: the client keeps the alias table only in RAM, rebuilds it from `vault.dat` on startup and forgets retired aliases on contact deletion. Duplicate-delivery keys are held for 300 seconds (maximum 8192) and are not persisted.
 - Local metadata such as contact hashes, public keys and timestamps is not encrypted; message bodies, nicknames and file names are.
 - The seed phrase is the identity. Anyone who obtains it can impersonate you and read your chats. The master password protects local data only; there is no password recovery.
 - The code has not been audited. The protocol and the storage format may change.
@@ -551,7 +563,16 @@ lastchance://contact?hash=...&doc=<cbor-hex>&sig=<signature-hex>&x25519=...&ed25
 
 Потеря ключа заголовка вместе с эпохой делает сообщение нерасшифровываемым (как в Signal); UI показывает его как недоступное, а не угадывает. Alias стабилен внутри сессии; если эта связываемость критична, его можно ротировать по эпохам в следующей версии (текущая политика зафиксирована и покрыта тестами).
 
-Для адресации в M-8 `room_id` определяется как тот же `session_id_alias` (или производное от него), а не сырой `session_id`. Alias детерминированно выводится из session id, поэтому обе стороны вычисляют его без перебора сессий, а маршрутизация `/push` по alias не раскрывает идентификатор ratchet-сессии.
+### Адресация входящих по alias комнаты (M-8)
+
+- Клиент держит в памяти таблицу `alias -> комната` (собирается при старте из сохранённых ratchet-состояний и tombstone-ов) и выбирает комнату по открытому заголовку до обращения к ключам.
+- Порядок проверок входящего пакета фиксирован: версия и размер → поиск alias → retired alias (`StaleSession`) → проверка дубля `(alias, nonce)` → AEAD → эпоха храповика.
+- Не-bootstrap пакет с неизвестным alias отбрасывается как `UnknownRoom` без единой попытки расшифровки. Список контактов не перебирается, пакет не пробуется против нескольких комнат.
+- Единственный путь с несколькими контактами — первый пакет новой сессии: он несёт `bootstrap_nonce`, поэтому клиент сравнивает дешёвые HKDF-alias и запускает AEAD максимум для одной совпавшей комнаты. Это ограниченное разрешение alias, а не перебор шифротекста.
+- Retired alias (после `/ratchet-reset`, сброса TTL, вытеснения сессии или удаления контакта) отклоняется до дедупликации и AEAD, поэтому старый пакет не может создать новую сессию.
+- Повторная доставка подавляется по `(alias, nonce)` в течение 300 секунд с жёстким лимитом в 8192 записи. Запись появляется только после успешной расшифровки, поэтому мусор не раздувает таблицу.
+- Alias детерминированно выводится из `session_id`: одна сессия всегда даёт один и тот же 16-байтный alias. Это осознанный компромисс по связываемости/хранению. Сервер или наблюдатель, видящий alias, может группировать пакеты одной сессии, но не может восстановить `session_id`, эпоху храповика, личность контакта или открытый текст. Новый alias появляется только при сбросе сессии; alias никогда не выводится из долговременной идентичности и не хранится вне `vault.dat`.
+- Перечисления нет: клиент никогда не спрашивает сервер, какие комнаты у него есть, а `/push` адресуется только по identity hash получателя. Alias находится внутри аутентифицированного заголовка v3 и не передаётся как параметр маршрутизации.
 
 ### Шифрование файлов
 
@@ -578,7 +599,7 @@ v3 намеренно несовместим с v1/v2. После обновле
 
 ### Что видят серверы
 
-Текстовый сервер видит хеш получателя в URL, bucket паддинга, тайминг и маскирующие заголовки. Он больше не видит `dh_pub`, счётчики храповика, границы эпох или сырой `session_id`. Файловый сервер видит bucket размера зашифрованного блока и его хеш, но не имя и не реальный размер файла. Содержимое сообщений и файлов остаётся зашифрованным сквозным образом.
+Текстовый сервер видит хеш получателя в URL, bucket паддинга, тайминг и маскирующие заголовки. Он больше не видит `dh_pub`, счётчики храповика, границы эпох или сырой `session_id`. Он также не может перечислить комнаты пользователя: pull адресуется только по identity hash, а alias комнаты едет внутри пакета v3. Alias стабилен в пределах сессии, поэтому группировка пакетов по alias остаётся возможной (см. заметки M-8 выше). Файловый сервер видит bucket размера зашифрованного блока и его хеш, но не имя и не реальный размер файла. Содержимое сообщений и файлов остаётся зашифрованным сквозным образом.
 
 ## Локальное хранилище
 
@@ -644,7 +665,9 @@ v3 намеренно несовместим с v1/v2. После обновле
 - `204 No Content` означает пустую очередь.
 - Успешный ответ приходит как `multipart/form-data`; клиент разбирает части и проверяет, что размеры пакетов входят в допустимую сетку.
 - `429` — rate limit. Повторы pull идут с задержками 1с → 2с → 5с → 15с; `401` и ошибки протокола повторяются медленно, чтобы не крутить busy-loop.
-- Push делает до четырёх попыток с экспоненциальной задержкой при `429` и транспортных ошибках.
+- Push подписывается тем же каноническим конвертом, что и pull: `X-Auth-Identity`, `X-Auth-Timestamp`, `X-Auth-Nonce`, `X-Auth-Signature`, а `body_hash = SHA256(packet)` входит в подпись. Каждый повтор получает свежий nonce и свежий timestamp; nonce не переиспользуется.
+- `401` от `/push` не повторяется (сервер отклонит ту же identity/подпись снова). `429`, `503` и транспортные ошибки повторяются с экспоненциальной задержкой 1с → 2с → 4с, максимум 4 попытки.
+- Клиент применяет локальный token bucket `PUSH_REQUESTS_PER_SECOND = 8` на контакт до подписи, поэтому баг или вредоносное действие UI не превращает клиент в источник push-флуда; исчерпание лимита — локальная ошибка, а не ответ сервера.
 
 ### Файловый API
 
@@ -870,7 +893,8 @@ chmod +x lastchance-linux-x86_64
 ## Безопасность и ограничения
 
 - Общий секрет статический для каждого контакта и инициализирует каждую сессию Double Ratchet. Свежий `bootstrap_nonce` и эфемерные DH-эпохи не дают переиспользовать ключи между сессиями и воспроизводить старые пакеты в новую сессию. Однако bootstrap-ключи по-прежнему выводятся из долговременного общего секрета: перехвативший первый пакет сессии и позже получивший этот секрет сможет восстановить её bootstrap-root. Post-compromise security отсутствует; настоящая forward secrecy на первом сообщении требует интерактивного prekey/ответного хендшейка. Для обычных комнат уничтоженные `session_id` пишутся в `vault.dat`, поэтому replay сброшенной сессии блокируется и после перезапуска. Для RAM-TTL комнат список уничтоженных `session_id` живёт только в RAM (в пределах жизни процесса), поэтому после перезапуска клиента повторно поданный первый пакет неотличим от первого контакта (та же граница TOFU, что и у самой первой сессии). Реестр `dh_pub` ограничен 128 ключами на сессию: за этим горизонтом древний ключ снова выглядит новым, но его локальный DH-приватный ключ уже покинул окно отправки в 5 эпох, поэтому расшифровать пакет всё равно не получится. В старом заголовке v2 не было счётчика эпох, поэтому подлинный впервые увиденный `dh_pub` старой эпохи мог приниматься как новая эпоха и сдвигать `remote_pub` на этот подлинный ключ. В v3 аутентифицированный `epoch_id` едет внутри AEAD, а устаревшие эпохи отсекаются до любого согласования ключей, поэтому этот ограниченный отказ в продвижении больше не применим; пакеты v1/v2 отклоняются целиком.
-- Сервер по-прежнему узнаёт хеш получателя, тайминг, класс размера пакета и размер файлового блока. Если это важно, используйте Tor/I2P и собственные серверы.
+- Сервер по-прежнему узнаёт хеш получателя, тайминг, класс размера пакета и размер файлового блока. Alias в пределах сессии позволяет группировать пакеты одной ratchet-сессии, но не идентифицировать контакт или `session_id`. Если это важно, используйте Tor/I2P и собственные серверы.
+- Адресация по alias не оставляет долговременного следа на сервере сверх факта доставки: таблица alias живёт только в RAM, пересобирается из `vault.dat` при старте, а retired-alias забываются при удалении контакта. Ключи дедупликации хранятся 300 секунд (максимум 8192) и не персистятся.
 - Локальные метаданные (хеши контактов, публичные ключи, время) не шифруются; тела сообщений, ники и имена файлов — шифруются.
 - Seed-фраза — это идентичность. Тот, кто её получил, может выдать себя за вас и читать ваши чаты. Мастер-пароль защищает только локальные данные; восстановления пароля нет.
 - Код не проходил аудит. Протокол и формат хранилища могут меняться.

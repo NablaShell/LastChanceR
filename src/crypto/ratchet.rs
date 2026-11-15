@@ -157,6 +157,10 @@ pub enum RatchetError {
     ReplayedDhPub,
     /// Окно эпох заполнено, а вытеснить можно только активную эпоху.
     EpochOverflow,
+    /// Длина пакета вне сетки bucket + рандомизация (M-8/M-2).
+    InvalidPacketSize,
+    /// Открытый заголовок битый или неизвестные флаги.
+    MalformedHeader,
 }
 
 impl fmt::Display for RatchetError {
@@ -173,6 +177,11 @@ impl fmt::Display for RatchetError {
                 write!(f, "ratchet packet reuses a dh_pub of an evicted epoch")
             }
             Self::EpochOverflow => write!(f, "ratchet epoch window is full"),
+            Self::InvalidPacketSize => write!(
+                f,
+                "ratchet packet size is outside the allowed padding bucket"
+            ),
+            Self::MalformedHeader => write!(f, "malformed ratchet header"),
         }
     }
 }
@@ -338,6 +347,71 @@ impl OpenHeader {
     fn payload_aad<'a>(&self, packet: &'a [u8]) -> &'a [u8] {
         &packet[..self.header_offset + ENCRYPTED_HEADER_SIZE]
     }
+}
+
+/// Открытая часть входящего пакета, доступная до любой криптографии.
+///
+/// Используется клиентом для маршрутизации по alias (M-8): версия, размер,
+/// alias, AEAD nonce и (только для bootstrap-пакета) bootstrap-nonce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PacketRouteInfo {
+    pub version: u8,
+    pub alias: [u8; SESSION_ALIAS_SIZE],
+    pub nonce: [u8; NONCE_SIZE],
+    pub bootstrap_nonce: Option<[u8; BOOTSTRAP_NONCE_SIZE]>,
+}
+
+impl PacketRouteInfo {
+    pub fn is_bootstrap(&self) -> bool {
+        self.bootstrap_nonce.is_some()
+    }
+}
+
+/// Разбирает только открытый заголовок v3 и проверяет версию/размер.
+///
+/// Порядок намеренный (M-8): версия → сетка размеров → флаги/alias.
+/// Никаких секретов и AEAD здесь нет, поэтому вызывать можно до выбора
+/// комнаты. v1/v2 отклоняются как [`RatchetError::UnsupportedVersion`].
+pub fn packet_route_info(packet: &[u8]) -> Result<PacketRouteInfo, RatchetError> {
+    if packet.len() < OPEN_HEADER_MIN {
+        return Err(RatchetError::MalformedHeader);
+    }
+    if packet[0] != PROTOCOL_VERSION {
+        return Err(RatchetError::UnsupportedVersion(packet[0]));
+    }
+    if !is_valid_packet_len(packet.len()) {
+        return Err(RatchetError::InvalidPacketSize);
+    }
+    if packet[1] & !FLAG_BOOTSTRAP != 0 {
+        return Err(RatchetError::MalformedHeader);
+    }
+
+    let mut alias = [0u8; SESSION_ALIAS_SIZE];
+    alias.copy_from_slice(&packet[2..2 + SESSION_ALIAS_SIZE]);
+
+    let mut offset = OPEN_HEADER_FIXED;
+    let bootstrap_nonce = if packet[1] & FLAG_BOOTSTRAP != 0 {
+        let end = offset + BOOTSTRAP_NONCE_SIZE;
+        if packet.len() < end + NONCE_SIZE {
+            return Err(RatchetError::MalformedHeader);
+        }
+        let mut nonce = [0u8; BOOTSTRAP_NONCE_SIZE];
+        nonce.copy_from_slice(&packet[offset..end]);
+        offset = end;
+        Some(nonce)
+    } else {
+        None
+    };
+
+    let mut nonce = [0u8; NONCE_SIZE];
+    nonce.copy_from_slice(&packet[offset..offset + NONCE_SIZE]);
+
+    Ok(PacketRouteInfo {
+        version: packet[0],
+        alias,
+        nonce,
+        bootstrap_nonce,
+    })
 }
 
 /// Заголовок пакета после аутентифицированной расшифровки.
@@ -966,6 +1040,28 @@ impl RatchetState {
         self.active
     }
 
+    /// Alias активной сессии — адрес входящего пакета (M-8).
+    pub fn active_alias(&self) -> Result<[u8; SESSION_ALIAS_SIZE]> {
+        session_alias(&self.active)
+    }
+
+    /// Alias всех живых сессионных контекстов комнаты.
+    pub fn session_aliases(&self) -> Result<Vec<[u8; SESSION_ALIAS_SIZE]>> {
+        self.sessions
+            .iter()
+            .map(|session| session_alias(&session.descriptor.id))
+            .collect()
+    }
+
+    /// Alias уничтоженных/вытесненных сессий: по ним пакет отклоняется
+    /// как [`RatchetError::StaleSession`] без попытки расшифровки.
+    pub fn retired_aliases(&self) -> Result<Vec<[u8; SESSION_ALIAS_SIZE]>> {
+        self.retired
+            .iter()
+            .map(session_alias)
+            .collect()
+    }
+
     /// Все `session_id`, которые уже нельзя принимать: активные контексты
     /// и уничтоженные сессии.
     pub fn session_ids(&self) -> Vec<[u8; SESSION_ID_SIZE]> {
@@ -1312,12 +1408,24 @@ fn derive_session_id(
 }
 
 /// Псевдоним сессии для открытого заголовка: не раскрывает `session_id`.
-fn session_alias(id: &[u8; SESSION_ID_SIZE]) -> Result<[u8; SESSION_ALIAS_SIZE]> {
+pub fn session_alias(id: &[u8; SESSION_ID_SIZE]) -> Result<[u8; SESSION_ALIAS_SIZE]> {
     let hkdf = Hkdf::<Sha256>::new(None, id);
     let mut alias = [0u8; SESSION_ALIAS_SIZE];
     hkdf.expand(b"route-v3", &mut alias)
         .map_err(|e| anyhow!("session alias derivation failed: {}", e))?;
     Ok(alias)
+}
+
+/// Выводит alias сессии из общего секрета и bootstrap-nonce.
+///
+/// Нужен клиенту, чтобы адресно распознать первый пакет новой сессии:
+/// сравнение alias дешевле, чем пробная AEAD-расшифровка у каждого контакта.
+pub fn bootstrap_session_alias(
+    shared_secret: &[u8; 32],
+    nonce: &[u8; BOOTSTRAP_NONCE_SIZE],
+) -> Result<[u8; SESSION_ALIAS_SIZE]> {
+    let descriptor = SessionDescriptor::id_from_nonce(shared_secret, nonce)?;
+    session_alias(&descriptor.id)
 }
 
 /// Ключ заголовка ротируется вместе с `epoch_id`.
@@ -2433,6 +2541,57 @@ mod tests {
         packet[open.header_offset] ^= 0x01;
 
         assert!(bob.decrypt(&packet, &SHARED).is_err());
+    }
+
+    #[test]
+    fn route_info_exposes_only_the_open_header() {
+        let (mut alice, _bob) = pair();
+        let packet = alice.encrypt(b"route").unwrap();
+        let info = packet_route_info(&packet).unwrap();
+
+        assert_eq!(info.version, PROTOCOL_VERSION);
+        assert_eq!(info.alias, alice.active_alias().unwrap());
+        assert!(info.is_bootstrap());
+        assert!(info.bootstrap_nonce.is_some());
+
+        let second = alice.encrypt(b"route-2").unwrap();
+        let info = packet_route_info(&second).unwrap();
+        assert!(!info.is_bootstrap(), "later packets omit bootstrap nonce");
+    }
+
+    #[test]
+    fn route_info_rejects_v2_and_oversized_packets_before_crypto() {
+        let (mut alice, _bob) = pair();
+        let mut packet = alice.encrypt(b"downgrade").unwrap();
+        packet[0] = 2;
+        assert_eq!(
+            packet_route_info(&packet).unwrap_err(),
+            RatchetError::UnsupportedVersion(2)
+        );
+
+        let mut oversized = vec![0u8; crate::crypto::SIZE_MAX + crate::crypto::SIZE_MAX / 8 + 1];
+        oversized[0] = PROTOCOL_VERSION;
+        assert_eq!(
+            packet_route_info(&oversized).unwrap_err(),
+            RatchetError::InvalidPacketSize
+        );
+    }
+
+    #[test]
+    fn alias_relabelling_breaks_header_authentication() {
+        // M-8: alias входит в AAD/заголовок. Пакет нельзя переадресовать
+        // в другую комнату, подменив alias в открытом заголовке.
+        let (mut alice, mut target) = pair();
+        let mut packet = alice.encrypt(b"bound to room").unwrap();
+        let front = OpenHeader::parse(&packet).unwrap();
+
+        let target_alias = target.active_alias().unwrap();
+        assert_ne!(target_alias, front.alias);
+        packet[2..2 + SESSION_ALIAS_SIZE].copy_from_slice(&target_alias);
+
+        // Alias теперь указывает на живую сессию target, но заголовок и
+        // payload зашифрованы ключами исходной комнаты: AEAD не сходится.
+        assert!(target.decrypt(&packet, &SHARED).is_err());
     }
 
     #[test]

@@ -15,7 +15,7 @@ use crate::i18n::{tr, Lang};
 use crate::identity::{
     hash_ed25519_public, Identity, IdentityDoc, IdentityInvite, IdentityManager,
 };
-use crate::network::{Config, Listener, Sender};
+use crate::network::{Config, InboundRouter, Listener, Route, RoutingError, Sender};
 use crate::storage::{
     Contact, Message, SafeFSOps, Storage, TOFU_CHANGED, TOFU_PENDING, TOFU_VERIFIED,
 };
@@ -120,6 +120,11 @@ pub struct App {
     /// восстанавливается при старте. Запоздавший bootstrap-пакет старой
     /// сессии не должен приниматься как новая сессия (H-1/H-2).
     retired_ratchet_sessions: RetiredRatchetSessions,
+
+    /// M-8: адресная таблица `alias -> room` и окно дедупликации доставки.
+    /// Строится из ratchet-состояний; входящий пакет выбирает комнату по
+    /// alias без перебора контактов.
+    inbound_router: Arc<Mutex<InboundRouter>>,
 
     sender: Arc<Sender>,
     listener: Arc<Listener>,
@@ -469,8 +474,13 @@ fn persist_ratchet(
     storage.save_ratchet_state(room_hash, state)
 }
 
-/// Открытый текст и обновлённое состояние храповика после расшифровки.
-type DecryptedRatchet = (Vec<u8>, Option<SecretBytes>);
+/// Открытый текст, обновлённое состояние храповика (если оно подлежит
+/// сохранению) и живые alias сессии для адресной таблицы M-8.
+struct DecryptedRatchet {
+    plaintext: Vec<u8>,
+    serialized: Option<SecretBytes>,
+    aliases: Vec<[u8; ratchet::SESSION_ALIAS_SIZE]>,
+}
 
 /// Расшифровывает пакет и возвращает открытый текст вместе с обновлённым
 /// состоянием храповика (если оно подлежит сохранению).
@@ -490,7 +500,7 @@ fn try_ratchet_decrypt(
 ) -> Option<DecryptedRatchet> {
     let retired = retired_sessions_for(retired_sessions, room_hash);
 
-    let (plaintext, serialized) = {
+    let (plaintext, serialized, aliases) = {
         let mut states = ratchets.lock().ok()?;
         ensure_ratchet_state(
             &mut states,
@@ -511,33 +521,92 @@ fn try_ratchet_decrypt(
                 } else {
                     state.to_bytes().ok()
                 };
-                (plaintext, serialized)
+                let aliases = state.session_aliases().unwrap_or_default();
+                (plaintext, serialized, aliases)
             }
-            Err(_) => return None,
+            Err(error) => {
+                if let Some(typed) = error.downcast_ref::<ratchet::RatchetError>() {
+                    warn!(
+                        "Incoming packet rejected for {}: {}",
+                        truncate_display(room_hash, 16),
+                        typed
+                    );
+                }
+                return None;
+            }
         }
     };
 
-    Some((plaintext, serialized))
+    Some(DecryptedRatchet {
+        plaintext,
+        serialized,
+        aliases,
+    })
+}
+
+/// Достаёт общий секрет комнаты из уже загруженной карты.
+fn shared_secret_for_room(
+    room: &str,
+    shared_secrets: &Arc<Mutex<HashMap<String, [u8; 32]>>>,
+) -> Option<[u8; 32]> {
+    shared_secrets
+        .lock()
+        .ok()
+        .and_then(|secrets| secrets.get(room).copied())
+}
+
+/// Единственный fallback для первого пакета сессии (M-8).
+///
+/// Bootstrap-пакет несёт `bootstrap_nonce`, но alias новой сессии ещё не
+/// известен. Здесь перебираются только HKDF-производные alias по контактам;
+/// AEAD не запускается ни для одного несовпавшего контакта. Обычные пакеты
+/// этот путь не используют.
+fn resolve_bootstrap_room(
+    alias: &[u8; ratchet::SESSION_ALIAS_SIZE],
+    nonce: &[u8; ratchet::BOOTSTRAP_NONCE_SIZE],
+    shared_secrets: &Arc<Mutex<HashMap<String, [u8; 32]>>>,
+) -> Option<(String, [u8; 32])> {
+    let secrets = shared_secrets.lock().ok()?;
+    for (room, secret) in secrets.iter() {
+        if ratchet::bootstrap_session_alias(secret, nonce)
+            .ok()
+            .is_some_and(|candidate| &candidate == alias)
+        {
+            return Some((room.clone(), *secret));
+        }
+    }
+    None
 }
 
 fn clear_ratchet_state(
     ratchets: &Arc<Mutex<HashMap<String, RatchetState>>>,
     storage: &Arc<Storage>,
     retired_sessions: &RetiredRatchetSessions,
+    inbound_router: &Arc<Mutex<InboundRouter>>,
     room_ttls: &Arc<Mutex<HashMap<String, RoomTtl>>>,
     room_hash: &str,
 ) {
     // Удаление из HashMap запускает Drop для Zeroizing-ключей. Перед этим
-    // запоминаем id сессий, чтобы запоздавший пакет не был принят снова.
-    let session_ids = if let Ok(mut states) = ratchets.lock() {
-        states
-            .remove(room_hash)
-            .map(|state| state.session_ids())
-            .unwrap_or_default()
+    // запоминаем id сессий, чтобы запоздавший пакет не был принят снова,
+    // и alias живых сессий для адресной таблицы (M-8).
+    let (session_ids, aliases) = if let Ok(mut states) = ratchets.lock() {
+        match states.remove(room_hash) {
+            Some(state) => {
+                let ids = state.session_ids();
+                let mut aliases = state.session_aliases().unwrap_or_default();
+                aliases.extend(state.retired_aliases().unwrap_or_default());
+                (ids, aliases)
+            }
+            None => (Vec::new(), Vec::new()),
+        }
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
     remember_retired_sessions(retired_sessions, room_hash, session_ids);
+
+    if let Ok(mut router) = inbound_router.lock() {
+        router.retire_room(room_hash, &aliases);
+    }
 
     // Сначала фиксируем tombstone-и, затем удаляем состояние: сбой записи
     // оставляет старую сессию на диске, а не теряет защиту от replay.
@@ -658,6 +727,18 @@ impl App {
                 }
             }
 
+            // Self-chat uses the same X25519 static secret; keep it in the
+            // map so M-8 routing and send paths never special-case the room.
+            match crypto::generate_shared_key(
+                identity.private_key.expose(),
+                &identity.public_key,
+            ) {
+                Ok(secret) => {
+                    secrets.insert(identity.hash.clone(), secret);
+                }
+                Err(e) => warn!("Failed to derive self shared secret: {}", e),
+            }
+
             // Set current room to the first contact whose keys validated.
             if let Some(contact) = contacts
                 .iter()
@@ -668,6 +749,78 @@ impl App {
                 drop(current);
 
                 let _ = storage.ensure_room(&contact.nickname, &contact.hash);
+            }
+        }
+
+        // M-8: восстанавливаем ratchet-состояния до запуска listener-а и
+        // строим таблицу alias -> room. Без этого первый не-bootstrap пакет
+        // после перезапуска выглядел бы как UnknownRoom.
+        let ratchets = Arc::new(Mutex::new(HashMap::new()));
+        let inbound_router = Arc::new(Mutex::new(InboundRouter::new()));
+        {
+            let rooms: Vec<String> = shared_secrets
+                .lock()
+                .map_err(|_| anyhow!("shared secret lock poisoned"))?
+                .keys()
+                .cloned()
+                .collect();
+
+            let mut states = ratchets
+                .lock()
+                .map_err(|_| anyhow!("ratchet lock poisoned"))?;
+
+            for room in &rooms {
+                let retired = retired_sessions_for(&retired_ratchet_sessions, room);
+                match storage.load_ratchet_state(room) {
+                    Ok(Some(bytes)) => match RatchetState::from_bytes(bytes) {
+                        Ok(mut state) => {
+                            state.retire_sessions(retired);
+                            states.insert(room.clone(), state);
+                        }
+                        Err(e) => warn!(
+                            "Ignoring unreadable ratchet state for {}: {:#}",
+                            truncate_display(room, 16),
+                            e
+                        ),
+                    },
+                    Ok(None) => {}
+                    Err(e) => warn!(
+                        "Failed to load ratchet state for {}: {:#}",
+                        truncate_display(room, 16),
+                        e
+                    ),
+                }
+            }
+
+            let routes: Vec<_> = states
+                .iter()
+                .map(|(room, state)| {
+                    (
+                        room.clone(),
+                        state.session_aliases().unwrap_or_default(),
+                        state.retired_aliases().unwrap_or_default(),
+                    )
+                })
+                .collect();
+            drop(states);
+
+            let mut router = inbound_router
+                .lock()
+                .map_err(|_| anyhow!("routing lock poisoned"))?;
+            for (room, active, retired) in routes {
+                router.register_state(&room, &active);
+                router.register_retired(&room, &retired);
+            }
+
+            // Tombstone-и очищенных сессий тоже должны отклоняться адресно.
+            if let Ok(retired) = retired_ratchet_sessions.lock() {
+                for (room, session_ids) in retired.iter() {
+                    let aliases: Vec<_> = session_ids
+                        .iter()
+                        .filter_map(|id| ratchet::session_alias(id).ok())
+                        .collect();
+                    router.register_retired(room, &aliases);
+                }
             }
         }
 
@@ -684,8 +837,9 @@ impl App {
             identity_manager,
             identity,
             shared_secrets,
-            ratchets: Arc::new(Mutex::new(HashMap::new())),
+            ratchets,
             retired_ratchet_sessions,
+            inbound_router,
             sender,
             listener,
             signing_key,
@@ -708,13 +862,6 @@ impl App {
         // Start message listener
         let listener = self.listener.clone();
         let identity_hash = self.identity.hash.clone();
-        let identity_pub_key = self.identity.get_public_key_hex();
-        // Один экземпляр на время жизни listener-таска. `Arc<SecretBytes>`
-        // затирает ключ при последнем drop; исходный буфер остаётся в
-        // `App` и не клонируется на каждой итерации pull-цикла.
-        let identity_priv_key = Arc::new(SecretBytes::from_slice(
-            self.identity.private_key.expose(),
-        ));
         // X-Identity-Key должен содержать hex(ed25519 public key), а не hash:
         // сервер сам считает SHA256(decoded_key) и сравнивает с target_hash.
         let ed25519_pub_key_hex = self.ed25519_pub_key_hex.clone();
@@ -724,6 +871,7 @@ impl App {
         let room_ttls = self.room_ttls.clone();
         let ratchets = self.ratchets.clone();
         let retired_ratchet_sessions = self.retired_ratchet_sessions.clone();
+        let inbound_router = self.inbound_router.clone();
         let event_sender = self.event_sender.clone();
 
         tokio::spawn(async move {
@@ -760,9 +908,8 @@ impl App {
                                 &room_ttls,
                                 &ratchets,
                                 &retired_ratchet_sessions,
+                                &inbound_router,
                                 &identity_hash,
-                                &identity_pub_key,
-                                &identity_priv_key,
                                 &event_sender,
                             )
                             .await;
@@ -800,67 +947,112 @@ impl App {
         room_ttls: &Arc<Mutex<HashMap<String, RoomTtl>>>,
         ratchets: &Arc<Mutex<HashMap<String, RatchetState>>>,
         retired_ratchet_sessions: &RetiredRatchetSessions,
+        inbound_router: &Arc<Mutex<InboundRouter>>,
         identity_hash: &str,
-        identity_pub_key: &str,
-        identity_priv_key: &SecretBytes,
         event_sender: &mpsc::UnboundedSender<AppEvent>,
     ) {
-        // Единственный путь расшифровки — Double Ratchet с replay-защитой.
-        // Legacy-пакеты со статическим секретом (v1) удалены: у них не было
-        // ни счётчика, ни окна, поэтому они допускали бессрочный replay.
-        let mut candidates: Vec<(String, [u8; 32])> = match shared_secrets.lock() {
-            Ok(secrets) => secrets
-                .iter()
-                .map(|(hash, secret)| (hash.clone(), *secret))
-                .collect(),
-            Err(_) => Vec::new(),
-        };
-
-        if !candidates
-            .iter()
-            .any(|(hash, _)| hash.as_str() == identity_hash)
-        {
-            if let Ok(public_key) = hex::decode(identity_pub_key) {
-                if let Ok(self_secret) =
-                    crypto::generate_shared_key(identity_priv_key.expose(), &public_key)
-                {
-                    candidates.push((identity_hash.to_string(), self_secret));
+        // M-8: порядок проверок до криптографии —
+        // version/размер → alias lookup → retired → dedup → AEAD → ratchet.
+        let (info, route) = {
+            let mut router = match inbound_router.lock() {
+                Ok(router) => router,
+                Err(_) => {
+                    warn!("Incoming packet dropped: routing lock poisoned");
+                    return;
+                }
+            };
+            match router.resolve(&packet) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    warn!("Incoming packet rejected: {}", error);
+                    return;
                 }
             }
-        }
+        };
 
-        let mut decrypted_message = None;
-        let mut from_hash = String::new();
-        // Обновлённый ratchet сохраняется только после обработки payload
-        // и только если комната не эфемерна (H-3).
-        let mut ratchet_update = None;
+        let (from_hash, shared_secret) = match route {
+            Route::Active(room) => match shared_secret_for_room(&room, shared_secrets) {
+                Some(secret) => (room, secret),
+                None => {
+                    warn!(
+                        "Incoming packet for {} has no shared secret",
+                        truncate_display(&room, 16)
+                    );
+                    return;
+                }
+            },
+            Route::Retired(room) => {
+                warn!(
+                    "Incoming packet rejected: {} ({})",
+                    RoutingError::StaleSession,
+                    truncate_display(&room, 16)
+                );
+                return;
+            }
+            Route::Unknown => {
+                // Первый пакет сессии: alias ещё никому не известен.
+                // Сравниваем только дешёвые HKDF-alias, без AEAD-перебора.
+                let resolved = info.bootstrap_nonce.and_then(|nonce| {
+                    resolve_bootstrap_room(&info.alias, &nonce, shared_secrets)
+                });
+                match resolved {
+                    Some(room) => room,
+                    None => {
+                        warn!("Incoming packet rejected: {}", RoutingError::UnknownRoom);
+                        return;
+                    }
+                }
+            }
+        };
 
-        for (hash, secret) in &candidates {
-            let ttl_active = room_has_ttl(room_ttls, hash);
-            if let Some((decrypted, serialized)) = try_ratchet_decrypt(
-                &packet,
-                hash,
-                secret,
-                identity_hash,
-                storage,
-                ratchets,
-                retired_ratchet_sessions,
-                ttl_active,
-            ) {
-                decrypted_message = Some(decrypted);
-                from_hash = hash.clone();
-                ratchet_update = serialized;
-                break;
+        let now = std::time::Instant::now();
+        if let Ok(mut router) = inbound_router.lock() {
+            if router.is_duplicate(info.alias, &info.nonce, now) {
+                warn!(
+                    "Incoming packet rejected: {} ({})",
+                    RoutingError::ReplayNonce,
+                    truncate_display(&from_hash, 16)
+                );
+                return;
             }
         }
 
-        let message = match decrypted_message {
-            Some(m) => m,
+        let ttl_active = room_has_ttl(room_ttls, &from_hash);
+        if let Ok(mut router) = inbound_router.lock() {
+            router.note_decrypt_attempt();
+        }
+        let decrypted = match try_ratchet_decrypt(
+            &packet,
+            &from_hash,
+            &shared_secret,
+            identity_hash,
+            storage,
+            ratchets,
+            retired_ratchet_sessions,
+            ttl_active,
+        ) {
+            Some(decrypted) => decrypted,
             None => {
-                warn!("Failed to decrypt incoming packet");
+                warn!(
+                    "Failed to decrypt incoming packet for {}",
+                    truncate_display(&from_hash, 16)
+                );
                 return;
             }
         };
+
+        let DecryptedRatchet {
+            plaintext: message,
+            serialized: mut ratchet_update,
+            aliases,
+        } = decrypted;
+
+        // Индекс обновляется после успешной расшифровки: bootstrap-сессия
+        // получает адрес, а мусорные пакеты не занимают таблицу.
+        if let Ok(mut router) = inbound_router.lock() {
+            router.register_state(&from_hash, &aliases);
+            router.mark_delivered(info.alias, &info.nonce, now);
+        }
 
         // Внутренний конверт: текст с TTL-метаданными или служебные пакеты.
         let (message_text, ttl_seconds) = match crypto::decode_payload(&message) {
@@ -888,6 +1080,7 @@ impl App {
                     ratchets,
                     storage,
                     retired_ratchet_sessions,
+                    inbound_router,
                     room_ttls,
                     &from_hash,
                 );
@@ -904,6 +1097,7 @@ impl App {
                     ratchets,
                     storage,
                     retired_ratchet_sessions,
+                    inbound_router,
                     room_ttls,
                     &from_hash,
                 );
@@ -1202,6 +1396,10 @@ impl App {
             ratchets.remove(contact_hash);
         }
 
+        if let Ok(mut router) = self.inbound_router.lock() {
+            router.remove_room(contact_hash);
+        }
+
         if let Ok(mut current) = self.current_room_hash.lock() {
             if current.as_str() == contact_hash {
                 current.clear();
@@ -1323,7 +1521,7 @@ impl App {
         let identity_hash = self.identity.hash.clone();
         let retired = retired_sessions_for(&self.retired_ratchet_sessions, room_hash);
 
-        let (packet, serialized) = {
+        let (packet, serialized, aliases) = {
             let mut states = self
                 .ratchets
                 .lock()
@@ -1348,8 +1546,13 @@ impl App {
             } else {
                 Some(state.to_bytes()?)
             };
-            (packet, serialized)
+            let aliases = state.session_aliases().unwrap_or_default();
+            (packet, serialized, aliases)
         };
+
+        if let Ok(mut router) = self.inbound_router.lock() {
+            router.register_state(room_hash, &aliases);
+        }
 
         if let Some(bytes) = serialized {
             self.persist_ratchet_if_needed(room_hash, bytes.expose())?;
@@ -1385,15 +1588,26 @@ impl App {
     /// сессии не был принят как новая сессия даже после перезапуска.
     pub fn clear_ratchet(&self, room_hash: &str) -> Result<()> {
         let ttl_active = self.get_room_ttl(room_hash).is_some();
-        let session_ids = if let Ok(mut states) = self.ratchets.lock() {
-            states
-                .remove(room_hash)
-                .map(|state| state.session_ids())
-                .unwrap_or_default()
+        let (session_ids, aliases) = if let Ok(mut states) = self.ratchets.lock() {
+            match states.remove(room_hash) {
+                Some(state) => {
+                    let ids = state.session_ids();
+                    let mut aliases = state.session_aliases().unwrap_or_default();
+                    aliases.extend(state.retired_aliases().unwrap_or_default());
+                    (ids, aliases)
+                }
+                None => (Vec::new(), Vec::new()),
+            }
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
         remember_retired_sessions(&self.retired_ratchet_sessions, room_hash, session_ids);
+
+        // M-8: старый alias больше не маршрутизируется ни в какую сессию,
+        // а отклоняется как StaleSession до AEAD.
+        if let Ok(mut router) = self.inbound_router.lock() {
+            router.retire_room(room_hash, &aliases);
+        }
 
         // Сначала tombstone-и, затем удаление состояния: при ошибке записи
         // старая сессия остаётся на диске, а не теряет replay-защиту.
@@ -1430,6 +1644,18 @@ impl App {
                             warn!("Ignoring unreadable ratchet state: {:#}", e);
                         }
                     }
+                }
+            }
+        }
+
+        // M-8: загруженная в RAM сессия должна остаться адресуемой.
+        if let Ok(states) = self.ratchets.lock() {
+            if let Some(state) = states.get(room_hash) {
+                if let Ok(mut router) = self.inbound_router.lock() {
+                    router.register_state(
+                        room_hash,
+                        &state.session_aliases().unwrap_or_default(),
+                    );
                 }
             }
         }
@@ -2442,7 +2668,7 @@ mod tests {
             .is_none());
 
         let shared_secret = app.get_shared_secret(&hash).unwrap();
-        let (plaintext, serialized) = try_ratchet_decrypt(
+        let decrypted = try_ratchet_decrypt(
             &packet,
             &hash,
             &shared_secret,
@@ -2455,10 +2681,10 @@ mod tests {
         .expect("self-chat packet must decrypt");
 
         assert_eq!(
-            crypto::decode_payload(&plaintext).unwrap(),
+            crypto::decode_payload(&decrypted.plaintext).unwrap(),
             crypto::E2ePayload::SetTtl { seconds: Some(60) }
         );
-        assert!(serialized.is_some());
+        assert!(decrypted.serialized.is_some());
         assert!(
             app.get_storage()
                 .persisted_ratchet_state_for_test(&hash)
@@ -2483,7 +2709,6 @@ mod tests {
             .unwrap()
             .is_some());
 
-        let identity_pub_key = app.identity.get_public_key_hex();
         App::handle_incoming_packet(
             packet,
             &app.shared_secrets,
@@ -2491,9 +2716,8 @@ mod tests {
             &app.room_ttls,
             &app.ratchets,
             &app.retired_ratchet_sessions,
+            &app.inbound_router,
             &app.identity.hash,
-            &identity_pub_key,
-            &app.identity.private_key,
             &app.event_sender,
         )
         .await;
@@ -2542,7 +2766,7 @@ mod tests {
             .unwrap()
             .session_id();
         assert_ne!(fresh_session, old_session);
-        let (plaintext, _) = try_ratchet_decrypt(
+        let decrypted = try_ratchet_decrypt(
             &fresh,
             &hash,
             &shared_secret,
@@ -2553,7 +2777,7 @@ mod tests {
             false,
         )
         .expect("new bootstrap packet must decrypt");
-        assert_eq!(plaintext, b"fresh");
+        assert_eq!(decrypted.plaintext, b"fresh");
 
         // Старый bootstrap-пакет отклоняется как StaleSession.
         assert!(
@@ -2652,7 +2876,6 @@ mod tests {
         let reset = app
             .encrypt_with_ratchet(&hash, &crypto::encode_ratchet_reset())
             .unwrap();
-        let identity_pub_key = app.identity.get_public_key_hex();
 
         App::handle_incoming_packet(
             reset,
@@ -2661,9 +2884,8 @@ mod tests {
             &app.room_ttls,
             &app.ratchets,
             &app.retired_ratchet_sessions,
+            &app.inbound_router,
             &app.identity.hash,
-            &identity_pub_key,
-            &app.identity.private_key,
             &app.event_sender,
         )
         .await;
@@ -2707,7 +2929,6 @@ mod tests {
             .encrypt_with_ratchet(&hash, &crypto::encode_text_payload(text, None))
             .unwrap();
 
-        let identity_pub_key = app.identity.get_public_key_hex();
         App::handle_incoming_packet(
             packet,
             &app.shared_secrets,
@@ -2715,9 +2936,8 @@ mod tests {
             &app.room_ttls,
             &app.ratchets,
             &app.retired_ratchet_sessions,
+            &app.inbound_router,
             &app.identity.hash,
-            &identity_pub_key,
-            &app.identity.private_key,
             &app.event_sender,
         )
         .await;
@@ -2730,6 +2950,181 @@ mod tests {
             receiver.try_recv().is_err(),
             "rejected packet must not be announced to the UI"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // M-8: адресация входящих по alias, без перебора контактов.
+    // -----------------------------------------------------------------
+
+    async fn deliver_packet(app: &App, packet: Vec<u8>) {
+        App::handle_incoming_packet(
+            packet,
+            &app.shared_secrets,
+            &app.storage,
+            &app.room_ttls,
+            &app.ratchets,
+            &app.retired_ratchet_sessions,
+            &app.inbound_router,
+            &app.identity.hash,
+            &app.event_sender,
+        )
+        .await;
+    }
+
+    /// Self-chat проверяет маршрутизацию без второго клиента (`SelfChat`
+    /// умеет открывать собственные пакеты). Контактная запись нужна только
+    /// ради FK `messages.room_hash -> contacts.hash`.
+    fn setup_router_room() -> (
+        App,
+        tempfile::TempDir,
+        mpsc::UnboundedReceiver<AppEvent>,
+        String,
+    ) {
+        let (app, temp_dir, receiver) = setup_test_app();
+        let hash = app.identity.hash.clone();
+        app.get_storage()
+            .add_contact(&hash, &app.identity.public_key, "Self")
+            .unwrap();
+        (app, temp_dir, receiver, hash)
+    }
+
+    #[tokio::test]
+    async fn known_alias_delivers_with_exactly_one_decrypt() {
+        let (app, _temp_dir, _receiver, hash) = setup_router_room();
+
+        app.encrypt_with_ratchet(&hash, b"prime").unwrap();
+        let packet = app
+            .encrypt_with_ratchet(&hash, &crypto::encode_text_payload("routed", None))
+            .unwrap();
+
+        deliver_packet(&app, packet).await;
+
+        let messages = app.get_messages(&hash, 10).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].text, "routed");
+
+        let stats = app.inbound_router.lock().unwrap().stats();
+        assert_eq!(stats.lookups, 1, "exactly one alias lookup per packet");
+        assert_eq!(stats.decrypt_attempts, 1, "exactly one AEAD attempt");
+        assert_eq!(stats.unknown_rooms, 0);
+    }
+
+    #[tokio::test]
+    async fn unknown_alias_is_dropped_before_any_decrypt() {
+        let (app, _temp_dir, _receiver, hash) = setup_router_room();
+
+        app.encrypt_with_ratchet(&hash, b"prime").unwrap();
+        let mut packet = app
+            .encrypt_with_ratchet(&hash, &crypto::encode_text_payload("nobody", None))
+            .unwrap();
+
+        // Alias не принадлежит ни одной комнате и пакет не bootstrap:
+        // маршрутизатор не должен запускать AEAD ни для одного контакта.
+        packet[2] ^= 0xff;
+        packet[1] &= !ratchet::FLAG_BOOTSTRAP;
+
+        deliver_packet(&app, packet).await;
+
+        assert!(app.get_messages(&hash, 10).unwrap().is_empty());
+        let stats = app.inbound_router.lock().unwrap().stats();
+        assert_eq!(stats.decrypt_attempts, 0);
+        assert_eq!(stats.unknown_rooms, 1);
+    }
+
+    #[tokio::test]
+    async fn retired_alias_is_stale_and_creates_no_session() {
+        let (app, _temp_dir, _receiver, hash) = setup_router_room();
+
+        let packet = app.encrypt_with_ratchet(&hash, b"stale").unwrap();
+        app.clear_ratchet(&hash).unwrap();
+        assert!(
+            app.ratchets.lock().unwrap().get(&hash).is_none(),
+            "reset must drop the live session"
+        );
+
+        deliver_packet(&app, packet).await;
+
+        assert!(app.get_messages(&hash, 10).unwrap().is_empty());
+        assert!(
+            app.ratchets.lock().unwrap().get(&hash).is_none(),
+            "stale packet must not create a new session"
+        );
+        let stats = app.inbound_router.lock().unwrap().stats();
+        assert_eq!(stats.stale_sessions, 1);
+        assert_eq!(stats.decrypt_attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn old_alias_is_rejected_after_reset_and_new_session_works() {
+        let (app, _temp_dir, _receiver, hash) = setup_router_room();
+
+        let old = app
+            .encrypt_with_ratchet(&hash, &crypto::encode_text_payload("old", None))
+            .unwrap();
+        app.clear_ratchet(&hash).unwrap();
+        let fresh = app
+            .encrypt_with_ratchet(&hash, &crypto::encode_text_payload("fresh", None))
+            .unwrap();
+
+        deliver_packet(&app, old).await;
+        assert!(app.get_messages(&hash, 10).unwrap().is_empty());
+
+        deliver_packet(&app, fresh).await;
+        let messages = app.get_messages(&hash, 10).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].text, "fresh");
+    }
+
+    #[tokio::test]
+    async fn duplicate_delivery_is_stored_once() {
+        let (app, _temp_dir, _receiver, hash) = setup_router_room();
+
+        app.encrypt_with_ratchet(&hash, b"prime").unwrap();
+        let packet = app
+            .encrypt_with_ratchet(&hash, &crypto::encode_text_payload("once", None))
+            .unwrap();
+
+        deliver_packet(&app, packet.clone()).await;
+        deliver_packet(&app, packet).await;
+
+        let messages = app.get_messages(&hash, 10).unwrap();
+        assert_eq!(messages.len(), 1, "replayed packet must be dropped");
+        let stats = app.inbound_router.lock().unwrap().stats();
+        assert_eq!(stats.replayed_packets, 1);
+        assert_eq!(stats.decrypt_attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn v2_packet_is_rejected_before_alias_lookup() {
+        let (app, _temp_dir, _receiver, hash) = setup_router_room();
+
+        app.encrypt_with_ratchet(&hash, b"prime").unwrap();
+        let mut packet = app
+            .encrypt_with_ratchet(&hash, &crypto::encode_text_payload("v2", None))
+            .unwrap();
+        packet[0] = 2;
+
+        deliver_packet(&app, packet).await;
+
+        assert!(app.get_messages(&hash, 10).unwrap().is_empty());
+        let stats = app.inbound_router.lock().unwrap().stats();
+        assert_eq!(stats.lookups, 0);
+        assert_eq!(stats.decrypt_attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn oversized_packet_is_rejected_before_decrypt() {
+        let (app, _temp_dir, _receiver, hash) = setup_router_room();
+
+        app.encrypt_with_ratchet(&hash, b"prime").unwrap();
+        let mut packet = vec![0u8; crate::crypto::SIZE_MAX + crate::crypto::SIZE_MAX / 8 + 1];
+        packet[0] = ratchet::PROTOCOL_VERSION;
+
+        deliver_packet(&app, packet).await;
+
+        assert!(app.get_messages(&hash, 10).unwrap().is_empty());
+        let stats = app.inbound_router.lock().unwrap().stats();
+        assert_eq!(stats.decrypt_attempts, 0);
     }
 
     #[test]
