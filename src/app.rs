@@ -1306,7 +1306,9 @@ impl App {
 
         let packet = self.encrypt_with_ratchet(room_hash, &payload)?;
 
-        self.sender.send_message(room_hash, &packet).await?;
+        self.sender
+            .send_message(room_hash, &packet, &self.signing_key)
+            .await?;
 
         self.store_outgoing_message(room_hash, text)
     }
@@ -1370,7 +1372,9 @@ impl App {
     pub async fn reset_ratchet_with_peer(&self, room_hash: &str) -> Result<()> {
         let payload = crypto::encode_ratchet_reset();
         let packet = self.encrypt_with_ratchet(room_hash, &payload)?;
-        self.sender.send_message(room_hash, &packet).await?;
+        self.sender
+            .send_message(room_hash, &packet, &self.signing_key)
+            .await?;
         self.clear_ratchet(room_hash)
     }
 
@@ -1507,7 +1511,11 @@ impl App {
             }
 
             let packet = self.encrypt_with_ratchet(room_hash, &payload)?;
-            if let Err(e) = self.sender.send_message(room_hash, &packet).await {
+            if let Err(e) = self
+                .sender
+                .send_message(room_hash, &packet, &self.signing_key)
+                .await
+            {
                 // TTL намеренно не откатываем: сессия уже переключена в RAM,
                 // а на диске ratchet-состояния быть не должно (H-3).
                 return Err(anyhow!("failed to send TTL update: {}", e));
@@ -1527,7 +1535,11 @@ impl App {
                 previous
             };
 
-            if let Err(e) = self.sender.send_message(room_hash, &packet).await {
+            if let Err(e) = self
+                .sender
+                .send_message(room_hash, &packet, &self.signing_key)
+                .await
+            {
                 if let Some(value) = previous {
                     if let Ok(mut ttls) = self.room_ttls.lock() {
                         ttls.insert(room_hash.to_string(), value);
