@@ -53,8 +53,7 @@ impl SafeFSOps {
         let safe_path = self.resolve_path(user_path)?;
 
         if let Some(parent) = safe_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| anyhow!("cannot create directory {:?}: {}", parent, e))?;
+            create_private_dir_all(parent)?;
         }
 
         // Атомарная замена: пишем во временный файл рядом с целевым и
@@ -94,40 +93,144 @@ impl SafeFSOps {
 
     pub fn ensure_dir(&self, dir_path: &str) -> Result<()> {
         let safe_path = self.resolve_path(dir_path)?;
-        fs::create_dir_all(&safe_path)
-            .map_err(|e| anyhow!("cannot create directory {:?}: {}", safe_path, e))
+        create_private_dir_all(&safe_path)
     }
 }
 
-/// Записывает данные во временный файл и атомарно заменяет им целевой.
-fn write_and_replace(tmp_path: &Path, target: &Path, data: &[u8], perm: u32) -> Result<()> {
+/// Создаёт каталог вместе с родителями и гарантирует права `0700`.
+///
+/// `DirBuilder::mode` маскируется процессным umask, поэтому после создания
+/// права проверяются и при расхождении выставляются явно. Если привести
+/// каталог к `0700` не удалось, возвращается ошибка (fail-closed), а не
+/// каталог с более широкими правами.
+fn create_private_dir_all(path: &Path) -> Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+
+    builder
+        .create(path)
+        .map_err(|e| anyhow!("cannot create directory {:?}: {}", path, e))?;
+
+    #[cfg(unix)]
+    force_path_mode(path, 0o700)?;
+
+    Ok(())
+}
+
+/// Создаёт новый файл с правами `0600` (без окна дефолтных прав).
+///
+/// Файл создаётся эксклюзивно (`create_new`). Если umask срезал биты режима,
+/// права доводятся через файловый дескриптор; при неудаче файл удаляется и
+/// возвращается ошибка, чтобы данные не остались на диске с чужими правами.
+pub(crate) fn create_private_file(path: &Path, perm: u32) -> Result<fs::File> {
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
 
-    // На Unix права выставляются уже при создании файла, чтобы данные ни
-    // мгновения не были доступны другим пользователям.
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(perm);
     }
 
-    let mut file = options
-        .open(tmp_path)
-        .map_err(|e| anyhow!("cannot create temp file {:?}: {}", tmp_path, e))?;
+    #[cfg(not(unix))]
+    let _ = perm;
+
+    let file = options
+        .open(path)
+        .map_err(|e| anyhow!("cannot create file {:?}: {}", path, e))?;
+
+    #[cfg(unix)]
+    if let Err(e) = force_file_mode(&file, path, perm) {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(e);
+    }
+
+    Ok(file)
+}
+
+/// Проверяет режим каталога/файла по пути и при необходимости исправляет его.
+#[cfg(unix)]
+fn force_path_mode(path: &Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let current = fs::metadata(path)
+        .map_err(|e| anyhow!("cannot stat {:?}: {}", path, e))?
+        .permissions()
+        .mode()
+        & 0o777;
+    if current == mode {
+        return Ok(());
+    }
+
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .map_err(|e| anyhow!("cannot set mode {:o} on {:?}: {}", mode, path, e))?;
+
+    let after = fs::metadata(path)
+        .map_err(|e| anyhow!("cannot stat {:?}: {}", path, e))?
+        .permissions()
+        .mode()
+        & 0o777;
+    if after != mode {
+        return Err(anyhow!(
+            "cannot enforce mode {:o} on {:?} (got {:o})",
+            mode,
+            path,
+            after
+        ));
+    }
+    Ok(())
+}
+
+/// То же, что [`force_path_mode`], но через уже открытый дескриптор файла.
+#[cfg(unix)]
+fn force_file_mode(file: &fs::File, path: &Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let current = file
+        .metadata()
+        .map_err(|e| anyhow!("cannot stat {:?}: {}", path, e))?
+        .permissions()
+        .mode()
+        & 0o777;
+    if current == mode {
+        return Ok(());
+    }
+
+    file.set_permissions(fs::Permissions::from_mode(mode))
+        .map_err(|e| anyhow!("cannot set mode {:o} on {:?}: {}", mode, path, e))?;
+
+    let after = file
+        .metadata()
+        .map_err(|e| anyhow!("cannot stat {:?}: {}", path, e))?
+        .permissions()
+        .mode()
+        & 0o777;
+    if after != mode {
+        return Err(anyhow!(
+            "cannot enforce mode {:o} on {:?} (got {:o})",
+            mode,
+            path,
+            after
+        ));
+    }
+    Ok(())
+}
+
+/// Записывает данные во временный файл и атомарно заменяет им целевой.
+fn write_and_replace(tmp_path: &Path, target: &Path, data: &[u8], perm: u32) -> Result<()> {
+    let mut file = create_private_file(tmp_path, perm)?;
     file.write_all(data)
         .map_err(|e| anyhow!("cannot write {:?}: {}", tmp_path, e))?;
     file.sync_all()
         .map_err(|e| anyhow!("cannot flush {:?}: {}", tmp_path, e))?;
     drop(file);
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let permissions = fs::Permissions::from_mode(perm);
-        fs::set_permissions(tmp_path, permissions)
-            .map_err(|e| anyhow!("cannot set permissions {:?}: {}", tmp_path, e))?;
-    }
 
     // Windows не поддерживает POSIX-права. Безопасная заглушка:
     // если владелец лишён права записи, помечаем файл как readonly.
@@ -353,6 +456,8 @@ fn migrate_legacy_profile(new_dir: &Path, old_dir: &Path) -> Result<bool> {
     let parent = new_dir
         .parent()
         .ok_or_else(|| anyhow!("profile directory has no parent: {:?}", new_dir))?;
+    // Родитель — пользовательский каталог (например, `~/.config`), его права
+    // не трогаем; приватность обеспечивают staging и сам профиль.
     fs::create_dir_all(parent)
         .map_err(|e| anyhow!("cannot create directory {:?}: {}", parent, e))?;
 
@@ -388,11 +493,20 @@ fn migrate_legacy_profile(new_dir: &Path, old_dir: &Path) -> Result<bool> {
     result
 }
 
+// Тестовый хук: позволяет смоделировать сбой посреди копирования профиля,
+// чтобы проверить очистку staging-каталога. Thread-local, чтобы параллельные
+// тесты не перехватывали флаг друг у друга.
+#[cfg(test)]
+thread_local! {
+    static INJECT_COPY_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Рекурсивно копирует обычные файлы и каталоги. Симлинки и специальные
 /// файлы пропускаются, чтобы не вынести данные за пределы профиля.
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
-    fs::create_dir_all(dst)
-        .map_err(|e| anyhow!("cannot create directory {:?}: {}", dst, e))?;
+    // Каталог назначения создаётся сразу приватным; права источника
+    // (например, 0755) не наследуются.
+    create_private_dir_all(dst)?;
 
     let entries = fs::read_dir(src)
         .map_err(|e| anyhow!("cannot read directory {:?}: {}", src, e))?;
@@ -408,13 +522,25 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         if file_type.is_dir() {
             copy_dir_recursive(&entry.path(), &target)?;
         } else if file_type.is_file() {
-            fs::copy(entry.path(), &target).map_err(|e| {
+            // `fs::copy` сохраняет права источника. Вместо этого копируем
+            // содержимое вручную в новый файл, созданный с 0600.
+            #[cfg(test)]
+            if INJECT_COPY_FAILURE.with(|flag| flag.replace(false)) {
+                return Err(anyhow!("injected copy failure"));
+            }
+            let mut input = fs::File::open(entry.path())
+                .map_err(|e| anyhow!("cannot open {:?}: {}", entry.path(), e))?;
+            let mut output = create_private_file(&target, 0o600)?;
+            std::io::copy(&mut input, &mut output).map_err(|e| {
                 anyhow!(
                     "cannot copy {:?} to {:?}: {}",
                     entry.path(),
                     target,
                     e
                 )
+            })?;
+            output.sync_all().map_err(|e| {
+                anyhow!("cannot flush {:?}: {}", target, e)
             })?;
         }
     }
@@ -423,12 +549,12 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 }
 
 /// Выставляет 0700 на каталоги и 0600 на файлы внутри скопированного профиля.
+///
+/// Идемпотентна: повторный вызов не меняет уже корректные права и не падает.
+/// Симлинки и специальные файлы пропускаются.
 #[cfg(unix)]
 fn harden_tree(root: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    fs::set_permissions(root, fs::Permissions::from_mode(0o700))
-        .map_err(|e| anyhow!("cannot set permissions on {:?}: {}", root, e))?;
+    force_path_mode(root, 0o700)?;
 
     let entries = fs::read_dir(root)
         .map_err(|e| anyhow!("cannot read directory {:?}: {}", root, e))?;
@@ -443,10 +569,7 @@ fn harden_tree(root: &Path) -> Result<()> {
         if file_type.is_dir() {
             harden_tree(&entry.path())?;
         } else if file_type.is_file() {
-            fs::set_permissions(entry.path(), fs::Permissions::from_mode(0o600))
-                .map_err(|e| {
-                    anyhow!("cannot set permissions on {:?}: {}", entry.path(), e)
-                })?;
+            force_path_mode(&entry.path(), 0o600)?;
         }
     }
 
@@ -459,7 +582,7 @@ fn harden_tree(_root: &Path) -> Result<()> {
 }
 
 fn ensure_base_dir(path: PathBuf, source: &str) -> Result<String> {
-    fs::create_dir_all(&path).map_err(|e| {
+    create_private_dir_all(&path).map_err(|e| {
         anyhow!(
             "failed to create profile directory from {} ({:?}): {}",
             source,
@@ -574,6 +697,21 @@ mod tests {
         fs::write(old.join("global.conf"), b"sealed-config").unwrap();
         fs::write(old.join("nested").join("user.db"), b"database").unwrap();
 
+        // Исходные права намеренно широкие: миграция не должна их наследовать.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&old, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::set_permissions(old.join("nested"), fs::Permissions::from_mode(0o755)).unwrap();
+            fs::set_permissions(old.join("global.conf"), fs::Permissions::from_mode(0o644))
+                .unwrap();
+            fs::set_permissions(
+                old.join("nested").join("user.db"),
+                fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
+        }
+
         assert!(migrate_legacy_profile(&new, &old).unwrap());
 
         assert_eq!(
@@ -621,5 +759,174 @@ mod tests {
         assert!(!migrate_legacy_profile(&new, &old).unwrap());
         assert!(!new.join("global.conf").exists());
         assert_eq!(fs::read(new.join("keep.txt")).unwrap(), b"new");
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_dir_and_file_helpers_use_strict_modes() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("vault").join("nested");
+
+        create_private_dir_all(&dir).unwrap();
+        let file = create_private_file(&dir.join("vault.dat"), 0o600).unwrap();
+        drop(file);
+
+        assert_eq!(mode_of(&dir), 0o700);
+        assert_eq!(mode_of(&temp.path().join("vault")), 0o700);
+        assert_eq!(mode_of(&dir.join("vault.dat")), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_helpers_correct_wider_existing_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("wide-dir");
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Каталог уже существует: helper обязан сузить права до 0700.
+        create_private_dir_all(&dir).unwrap();
+        assert_eq!(mode_of(&dir), 0o700);
+
+        let file = dir.join("vault.dat");
+        fs::write(&file, b"data").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+
+        force_path_mode(&file, 0o600).unwrap();
+        assert_eq!(mode_of(&file), 0o600);
+        // Идемпотентность: повторное применение не ломает режим.
+        force_path_mode(&file, 0o600).unwrap();
+        assert_eq!(mode_of(&file), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn harden_tree_is_idempotent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("profile");
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(root.join("global.conf"), b"cfg").unwrap();
+        fs::write(nested.join("user.db"), b"db").unwrap();
+
+        // Широкие права, как у старого профиля.
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(root.join("global.conf"), fs::Permissions::from_mode(0o644))
+            .unwrap();
+        fs::set_permissions(nested.join("user.db"), fs::Permissions::from_mode(0o644))
+            .unwrap();
+
+        harden_tree(&root).unwrap();
+        harden_tree(&root).unwrap();
+
+        assert_eq!(mode_of(&root), 0o700);
+        assert_eq!(mode_of(&nested), 0o700);
+        assert_eq!(mode_of(&root.join("global.conf")), 0o600);
+        assert_eq!(mode_of(&nested.join("user.db")), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_private_file_never_reuses_existing_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("user.db");
+        fs::write(&path, b"existing").unwrap();
+
+        assert!(create_private_file(&path, 0o600).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn failed_migration_leaves_no_staging_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let old = temp.path().join("old-profile");
+        fs::create_dir_all(old.join("nested")).unwrap();
+        fs::write(old.join("global.conf"), b"cfg").unwrap();
+        fs::write(old.join("nested").join("user.db"), b"db").unwrap();
+
+        let new = temp.path().join("new-profile");
+        INJECT_COPY_FAILURE.with(|flag| flag.set(true));
+
+        assert!(migrate_legacy_profile(&new, &old).is_err());
+        assert!(!new.exists());
+
+        let leftovers: Vec<String> = fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".migrate-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "staging directory left behind: {:?}",
+            leftovers
+        );
+        // Исходные данные не тронуты.
+        assert_eq!(fs::read(old.join("global.conf")).unwrap(), b"cfg");
+    }
+
+    #[cfg(target_os = "linux")]
+    extern "C" {
+        fn umask(mask: u32) -> u32;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_modes_hold_under_restrictive_umask() {
+        use std::os::unix::process::CommandExt;
+
+        let exe = std::env::current_exe().unwrap();
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("private_modes_under_restrictive_umask_child")
+            .arg("--nocapture");
+        cmd.env("LASTCHANCE_UMASK_CHILD", "1");
+        unsafe {
+            cmd.pre_exec(|| {
+                umask(0o077);
+                Ok(())
+            });
+        }
+
+        let output = cmd.output().unwrap();
+        assert!(
+            output.status.success(),
+            "umask child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("1 passed"),
+            "umask child did not run the check:\n{}",
+            stdout
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_modes_under_restrictive_umask_child() {
+        if std::env::var_os("LASTCHANCE_UMASK_CHILD").is_none() {
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("vault").join("nested");
+        create_private_dir_all(&dir).unwrap();
+        let file = create_private_file(&dir.join("vault.dat"), 0o600).unwrap();
+        drop(file);
+
+        assert_eq!(mode_of(&dir), 0o700);
+        assert_eq!(mode_of(&temp.path().join("vault")), 0o700);
+        assert_eq!(mode_of(&dir.join("vault.dat")), 0o600);
     }
 }

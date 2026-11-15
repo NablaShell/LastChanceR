@@ -9,20 +9,19 @@
 //! позволяет расшифровать пакеты, которые пришли не по порядку или были
 //! отправлены обеими сторонами до получения обновления партнёра.
 //!
-//! # Bootstrap-эпоха (v2)
+//! # Bootstrap-эпоха (v3)
 //!
 //! Первая эпоха сессии раньше была детерминированной: `shared_secret`
 //! полностью определял bootstrap-ключи. После `clear_ratchet()` следующая
 //! сессия получала те же ключи, поэтому перехваченный bootstrap-пакет
 //! (`n = 0`) можно было проиграть в новую сессию.
 //!
-//! Теперь `RatchetState::new()` генерирует свежие `session_id` (16 байт) и
-//! `bootstrap_nonce` (32 байта). Оба поля едут в открытом заголовке и входят
-//! в AAD, а bootstrap-ключи выводятся как
-//! `HKDF(salt = bootstrap_nonce, ikm = shared_secret, info = label-v2)`.
-//! Получатель выводит те же ключи из nonce, пришедшего в пакете, поэтому
-//! стороны по-прежнему совместимы без предварительного обмена, но каждая
-//! новая сессия имеет собственную энтропию.
+//! Теперь `RatchetState::new()` генерирует свежий `bootstrap_nonce`
+//! (32 байта) и выводит из него `session_id` и bootstrap-ключи:
+//! `HKDF(salt = bootstrap_nonce, ikm = shared_secret, info = label-v3)`.
+//! Nonce едет только в первом пакете сессии, `session_id` не передаётся
+//! вообще, поэтому получатель восстанавливает контекст из nonce и общего
+//! секрета. Каждая новая сессия имеет собственную энтропию.
 //!
 //! Состояние хранит несколько сессионных контекстов (по `session_id`):
 //! это сохраняет корректность, когда обе стороны отправили первое сообщение
@@ -44,29 +43,40 @@
 //!
 //! `remote_pub` — это DH-ключ собеседника, на котором строится следующая
 //! эпоха отправки. Пакет уже известной старой эпохи расшифровывается, но
-//! `remote_pub` не откатывает. Отдельно стоит учитывать first-sight:
-//! в v2-заголовке нет номера эпохи, поэтому впервые увиденный `dh_pub`
-//! неотличим от новой эпохи. Подлинный, но запоздавший пакет старой эпохи
-//! может быть принят как новая эпоха и сдвинуть `remote_pub` на этот
-//! старый ключ. Подделка невозможна (AEAD), эффект ограничен окном
-//! [`MAX_EPOCHS`], а полное решение требует счётчика эпох в wire-format v3.
+//! `remote_pub` не откатывает. В v3 `epoch_id` аутентифицирован внутри
+//! зашифрованного заголовка, поэтому first-sight старого `dh_pub` больше
+//! не выглядит как новая эпоха: заголовок открывается только тем ключом,
+//! который соответствует его `epoch_id`.
 //!
 //! При переполнении окна вытесняется только старейшая неактивная эпоха
 //! (не та, на которую указывает `remote_pub`, и не самая новая). Если
 //! вытеснять нечего, приём завершается [`RatchetError::EpochOverflow`]
 //! с неизменным состоянием, а не молчаливой потерей активной эпохи.
 //!
-//! Формат пакета v2 сохраняет прежнюю сетку паддинга:
+//! Формат пакета v3 (M-7):
 //!
 //! ```text
-//! [ ver 1 ][ session_id 16 ][ bootstrap_nonce 32 ][ dh_pub 32 ][ n u32 ][ pn u32 ]
-//! [ nonce 24 ][ ciphertext ][ tag 16 ]
+//! [ ver 3 ][ flags ][ session_alias 16 ][ bootstrap_nonce 32? ][ nonce 24 ]
+//! [ encrypted header: dh_pub 32 | epoch_id 4 | n 4 | pn 4 | tag 16 ]
+//! [ ciphertext ][ tag 16 ]
 //! ```
 //!
-//! Открытый заголовок нужен, чтобы найти сессию и эпоху до расшифровки, и
-//! целиком передаётся как AAD. Внутри шифротекста лежит
-//! `[len u32][payload][random padding]`; итоговый размер пакета всегда равен
-//! 256, 1024, 4096 или 65536 байтам.
+//! `bootstrap_nonce` присутствует только в первом пакете сессии
+//! (`flags & 1`). `session_id` в открытом виде не передаётся: используется
+//! псевдоним `HKDF(ikm = session_id, info = "route-v3")[..16]`. Открытый заголовок
+//! и зашифрованный header целиком входят в AAD полезной нагрузки, поэтому
+//! подмена `dh_pub`, `n`, `pn` или эпохи ломает AEAD.
+//!
+//! Ключ заголовка — `HKDF(session_header_secret, info = "hdr-v3" || epoch_id)`.
+//! `session_header_secret` выводится из общего секрета и bootstrap-nonce и
+//! живёт вместе с сессией; `epoch_id` ротирует ключ на каждой DH-эпохе.
+//! Получатель перебирает известные id эпох и небольшое окно новых id, пока
+//! заголовок не аутентифицируется.
+//!
+//! Внутри шифротекста лежит `[len u32][payload][random padding]`. Итоговый
+//! размер пакета — `bucket + rand(0..=bucket/8)` для bucket из
+//! [`ALLOWED_TOTAL_SIZES`], поэтому точный размер не коррелирует со
+//! счётчиком `n` или объёмом сообщения.
 
 use anyhow::{anyhow, Result};
 use chacha20poly1305::{
@@ -82,12 +92,15 @@ use std::fmt;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, Zeroizing};
 
+use super::secret::SecretBytes;
 use super::ALLOWED_TOTAL_SIZES;
 
-/// Версия wire-формата пакета. v1 не поддерживается (fail-closed).
-pub const PROTOCOL_VERSION: u8 = 2;
-/// Размер идентификатора сессии.
+/// Версия wire-формата пакета. v1/v2 не поддерживаются (fail-closed).
+pub const PROTOCOL_VERSION: u8 = 3;
+/// Размер идентификатора сессии (в открытом виде не передаётся).
 pub const SESSION_ID_SIZE: usize = 16;
+/// Размер псевдонима сессии в открытом заголовке.
+pub const SESSION_ALIAS_SIZE: usize = 16;
 /// Размер bootstrap-nonce.
 pub const BOOTSTRAP_NONCE_SIZE: usize = 32;
 /// Максимум одновременно хранимых эпох (отправки и приёма по отдельности).
@@ -108,18 +121,24 @@ pub const MAX_SESSIONS: usize = 4;
 /// [`MAX_SESSIONS`] сессий, поэтому легитимный поток не вытеснит нужный
 /// tombstone раньше, чем истечёт окно replay-защиты.
 pub const MAX_RETIRED_SESSIONS: usize = 128;
-/// `version (1) + session_id (16) + nonce (32) + dh_pub (32) + n (4) + pn (4)`.
-pub const HEADER_SIZE: usize =
-    1 + SESSION_ID_SIZE + BOOTSTRAP_NONCE_SIZE + 32 + std::mem::size_of::<u32>() * 2;
+/// Флаг «пакет несёт bootstrap-nonce».
+pub const FLAG_BOOTSTRAP: u8 = 0x01;
+/// `version (1) + flags (1) + alias (16)`.
+pub const OPEN_HEADER_FIXED: usize = 1 + 1 + SESSION_ALIAS_SIZE;
+/// Открытый заголовок без bootstrap-nonce: fixed + AEAD nonce.
+pub const OPEN_HEADER_MIN: usize = OPEN_HEADER_FIXED + NONCE_SIZE;
+/// Зашифрованный header: `dh_pub (32) + epoch_id (4) + n (4) + pn (4)` + tag.
+pub const ENCRYPTED_HEADER_SIZE: usize = 32 + 4 + 4 + 4 + TAG_SIZE;
 pub const NONCE_SIZE: usize = 24;
 pub const TAG_SIZE: usize = 16;
 
-const KDF_SALT: &[u8] = b"lastchance-double-ratchet-v2";
-const STATE_VERSION: u8 = 2;
-const INNER_OVERHEAD: usize = HEADER_SIZE
-    + NONCE_SIZE
-    + TAG_SIZE
-    + std::mem::size_of::<u32>();
+const HEADER_PLAINTEXT_SIZE: usize = 32 + 4 + 4 + 4;
+/// Насколько вперёд искать `epoch_id` нового заголовка. Потеря большего
+/// числа эпох подряд означает, что сессию нужно переустановить.
+const MAX_HEADER_EPOCH_LOOKAHEAD: u32 = 64;
+
+const KDF_SALT: &[u8] = b"lastchance-double-ratchet-v3";
+const STATE_VERSION: u8 = 3;
 
 /// Ошибки, которые вызывающий может отличить от прочих сбоев.
 ///
@@ -190,17 +209,17 @@ impl Role {
 
     fn local_label(self) -> &'static [u8] {
         match self {
-            Self::Initiator => b"bootstrap-initiator-v2",
-            Self::Responder => b"bootstrap-responder-v2",
-            Self::SelfChat => b"bootstrap-self-v2",
+            Self::Initiator => b"bootstrap-initiator-v3",
+            Self::Responder => b"bootstrap-responder-v3",
+            Self::SelfChat => b"bootstrap-self-v3",
         }
     }
 
     fn peer_label(self) -> &'static [u8] {
         match self {
-            Self::Initiator => b"bootstrap-responder-v2",
-            Self::Responder => b"bootstrap-initiator-v2",
-            Self::SelfChat => b"bootstrap-self-v2",
+            Self::Initiator => b"bootstrap-responder-v3",
+            Self::Responder => b"bootstrap-initiator-v3",
+            Self::SelfChat => b"bootstrap-self-v3",
         }
     }
 }
@@ -213,88 +232,165 @@ struct SessionDescriptor {
 }
 
 impl SessionDescriptor {
-    fn generate() -> Self {
-        let mut id = [0u8; SESSION_ID_SIZE];
+    /// Генерирует свежий nonce и выводит из него `session_id`.
+    ///
+    /// `session_id` не передаётся в открытом виде, поэтому получатель должен
+    /// уметь восстановить его из bootstrap-nonce и общего секрета.
+    fn generate(shared_secret: &[u8; 32]) -> Result<Self> {
         let mut nonce = [0u8; BOOTSTRAP_NONCE_SIZE];
-        OsRng.fill_bytes(&mut id);
         OsRng.fill_bytes(&mut nonce);
-        Self { id, nonce }
+        let id = derive_session_id(shared_secret, &nonce)?;
+        Ok(Self { id, nonce })
+    }
+
+    fn id_from_nonce(
+        shared_secret: &[u8; 32],
+        nonce: &[u8; BOOTSTRAP_NONCE_SIZE],
+    ) -> Result<Self> {
+        Ok(Self {
+            id: derive_session_id(shared_secret, nonce)?,
+            nonce: *nonce,
+        })
     }
 }
 
-/// Открытый заголовок пакета.
+/// Открытая часть заголовка v3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RatchetHeader {
-    pub session_id: [u8; SESSION_ID_SIZE],
-    pub bootstrap_nonce: [u8; BOOTSTRAP_NONCE_SIZE],
-    pub dh_pub: [u8; 32],
-    pub n: u32,
-    pub pn: u32,
+struct OpenHeader {
+    alias: [u8; SESSION_ALIAS_SIZE],
+    bootstrap_nonce: Option<[u8; BOOTSTRAP_NONCE_SIZE]>,
+    nonce: [u8; NONCE_SIZE],
+    /// Смещение зашифрованного заголовка (совпадает с длиной open-байтов).
+    header_offset: usize,
 }
 
-impl RatchetHeader {
-    fn to_bytes(self) -> [u8; HEADER_SIZE] {
-        let mut out = [0u8; HEADER_SIZE];
-        out[0] = PROTOCOL_VERSION;
+impl OpenHeader {
+    fn flags(&self) -> u8 {
+        let mut flags = 0;
+        if self.bootstrap_nonce.is_some() {
+            flags |= FLAG_BOOTSTRAP;
+        }
+        flags
+    }
 
-        let id_end = 1 + SESSION_ID_SIZE;
-        out[1..id_end].copy_from_slice(&self.session_id);
-        let nonce_end = id_end + BOOTSTRAP_NONCE_SIZE;
-        out[id_end..nonce_end].copy_from_slice(&self.bootstrap_nonce);
-        let dh_end = nonce_end + 32;
-        out[nonce_end..dh_end].copy_from_slice(&self.dh_pub);
-        let n_end = dh_end + 4;
-        out[dh_end..n_end].copy_from_slice(&self.n.to_le_bytes());
-        let pn_end = n_end + 4;
-        out[n_end..pn_end].copy_from_slice(&self.pn.to_le_bytes());
-        debug_assert_eq!(pn_end, HEADER_SIZE);
+    fn to_bytes(self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.header_offset);
+        out.push(PROTOCOL_VERSION);
+        out.push(self.flags());
+        out.extend_from_slice(&self.alias);
+        if let Some(nonce) = self.bootstrap_nonce {
+            out.extend_from_slice(&nonce);
+        }
+        out.extend_from_slice(&self.nonce);
+        debug_assert_eq!(out.len(), self.header_offset);
         out
     }
 
-    /// Разбирает заголовок из начала пакета.
-    ///
-    /// Неизвестная версия отклоняется сразу: v1-пакеты несовместимы с v2
-    /// (другая сетка заголовка и другое происхождение bootstrap-ключей).
-    pub fn parse(packet: &[u8]) -> Result<Self> {
-        if packet.len() < HEADER_SIZE {
+    /// Разбирает открытую часть и проверяет версию/флаги до криптографии.
+    fn parse(packet: &[u8]) -> Result<Self> {
+        if packet.len() < OPEN_HEADER_MIN {
             return Err(anyhow!(
                 "ratchet packet is too short: {} bytes",
                 packet.len()
             ));
         }
-
         if packet[0] != PROTOCOL_VERSION {
             return Err(RatchetError::UnsupportedVersion(packet[0]).into());
         }
+        let flags = packet[1];
+        if flags & !FLAG_BOOTSTRAP != 0 {
+            return Err(anyhow!("unknown ratchet header flags: 0x{:02x}", flags));
+        }
 
-        let mut session_id = [0u8; SESSION_ID_SIZE];
-        session_id.copy_from_slice(&packet[1..1 + SESSION_ID_SIZE]);
+        let mut alias = [0u8; SESSION_ALIAS_SIZE];
+        alias.copy_from_slice(&packet[2..2 + SESSION_ALIAS_SIZE]);
 
-        let nonce_start = 1 + SESSION_ID_SIZE;
-        let mut bootstrap_nonce = [0u8; BOOTSTRAP_NONCE_SIZE];
-        bootstrap_nonce
-            .copy_from_slice(&packet[nonce_start..nonce_start + BOOTSTRAP_NONCE_SIZE]);
+        let mut offset = OPEN_HEADER_FIXED;
+        let bootstrap_nonce = if flags & FLAG_BOOTSTRAP != 0 {
+            let end = offset + BOOTSTRAP_NONCE_SIZE;
+            if packet.len() < end + NONCE_SIZE {
+                return Err(anyhow!("truncated bootstrap ratchet header"));
+            }
+            let mut nonce = [0u8; BOOTSTRAP_NONCE_SIZE];
+            nonce.copy_from_slice(&packet[offset..end]);
+            offset = end;
+            Some(nonce)
+        } else {
+            None
+        };
 
-        let dh_start = nonce_start + BOOTSTRAP_NONCE_SIZE;
+        let mut nonce = [0u8; NONCE_SIZE];
+        nonce.copy_from_slice(&packet[offset..offset + NONCE_SIZE]);
+        let header_offset = offset + NONCE_SIZE;
+
+        Ok(Self {
+            alias,
+            bootstrap_nonce,
+            nonce,
+            header_offset,
+        })
+    }
+
+    fn aad<'a>(&self, packet: &'a [u8]) -> &'a [u8] {
+        &packet[..self.header_offset]
+    }
+
+    fn payload_aad<'a>(&self, packet: &'a [u8]) -> &'a [u8] {
+        &packet[..self.header_offset + ENCRYPTED_HEADER_SIZE]
+    }
+}
+
+/// Заголовок пакета после аутентифицированной расшифровки.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RatchetHeader {
+    pub session_id: [u8; SESSION_ID_SIZE],
+    pub bootstrap_nonce: Option<[u8; BOOTSTRAP_NONCE_SIZE]>,
+    pub dh_pub: [u8; 32],
+    pub epoch_id: u32,
+    pub n: u32,
+    pub pn: u32,
+}
+
+impl RatchetHeader {
+    fn plaintext(&self) -> [u8; HEADER_PLAINTEXT_SIZE] {
+        let mut out = [0u8; HEADER_PLAINTEXT_SIZE];
+        out[..32].copy_from_slice(&self.dh_pub);
+        out[32..36].copy_from_slice(&self.epoch_id.to_le_bytes());
+        out[36..40].copy_from_slice(&self.n.to_le_bytes());
+        out[40..44].copy_from_slice(&self.pn.to_le_bytes());
+        out
+    }
+
+    fn from_plaintext(
+        session_id: [u8; SESSION_ID_SIZE],
+        bootstrap_nonce: Option<[u8; BOOTSTRAP_NONCE_SIZE]>,
+        plaintext: &[u8],
+    ) -> Result<Self> {
+        if plaintext.len() != HEADER_PLAINTEXT_SIZE {
+            return Err(anyhow!("invalid encrypted header length"));
+        }
         let mut dh_pub = [0u8; 32];
-        dh_pub.copy_from_slice(&packet[dh_start..dh_start + 32]);
-
-        let n_start = dh_start + 32;
+        dh_pub.copy_from_slice(&plaintext[..32]);
+        let epoch_id = u32::from_le_bytes(
+            plaintext[32..36]
+                .try_into()
+                .map_err(|_| anyhow!("invalid ratchet epoch id"))?,
+        );
         let n = u32::from_le_bytes(
-            packet[n_start..n_start + 4]
+            plaintext[36..40]
                 .try_into()
                 .map_err(|_| anyhow!("invalid ratchet message number"))?,
         );
         let pn = u32::from_le_bytes(
-            packet[n_start + 4..n_start + 8]
+            plaintext[40..44]
                 .try_into()
                 .map_err(|_| anyhow!("invalid ratchet previous-chain number"))?,
         );
-
         Ok(Self {
             session_id,
             bootstrap_nonce,
             dh_pub,
+            epoch_id,
             n,
             pn,
         })
@@ -340,6 +436,7 @@ struct SendEpoch {
     peer_pub: [u8; 32],
     root_key: Zeroizing<[u8; 32]>,
     chain_key: Zeroizing<[u8; 32]>,
+    epoch_id: u32,
     index: u32,
     previous_chain_len: u32,
 }
@@ -350,6 +447,7 @@ struct RecvEpoch {
     local_pub: [u8; 32],
     root_key: Zeroizing<[u8; 32]>,
     chain_key: Zeroizing<[u8; 32]>,
+    epoch_id: u32,
     next_index: u32,
     skipped: BTreeMap<u32, Zeroizing<[u8; 32]>>,
 }
@@ -359,12 +457,23 @@ struct RecvEpoch {
 struct Session {
     descriptor: SessionDescriptor,
     root: Zeroizing<[u8; 32]>,
+    /// Секрет для шифрования заголовков. Ротируется вместе с сессией,
+    /// а ключ заголовка — вместе с `epoch_id`.
+    header_secret: Zeroizing<[u8; 32]>,
     local: KeyPair,
     peer_bootstrap_pub: [u8; 32],
     remote_pub: Option<[u8; 32]>,
     received_since_send: bool,
+    /// Следующий `epoch_id` для исходящей эпохи.
+    next_epoch_id: u32,
+    /// Первый пакет сессии уже отправлен: bootstrap-nonce больше не нужен.
+    bootstrap_sent: bool,
     send_epochs: VecDeque<SendEpoch>,
     recv_epochs: VecDeque<RecvEpoch>,
+    /// `epoch_id` вытесненных эпох приёма. Нужны, чтобы открыть заголовок
+    /// запоздавшего пакета и вернуть типизированный `ReplayedDhPub`, а не
+    /// общую ошибку аутентификации.
+    retired_epoch_ids: VecDeque<u32>,
     /// `dh_pub` собеседника, которые уже были приняты аутентифицированным
     /// пакетом. Живёт вместе с сессией и ограничен [`MAX_SEEN_DH_PUBS`].
     seen_dh_pubs: VecDeque<[u8; 32]>,
@@ -377,7 +486,9 @@ impl Session {
     /// контекст без предварительного обмена. Свежий nonce даёт новую
     /// bootstrap-энтропию после каждого reset.
     fn derive(shared_secret: &[u8; 32], role: Role, descriptor: SessionDescriptor) -> Result<Self> {
-        let root = expand_salted(shared_secret, &descriptor.nonce, b"bootstrap-root-v2")?;
+        let root = expand_salted(shared_secret, &descriptor.nonce, b"bootstrap-root-v3")?;
+        let header_secret =
+            expand_salted(shared_secret, &descriptor.nonce, b"header-secret-v3")?;
         let local_private = expand_salted(shared_secret, &descriptor.nonce, role.local_label())?;
         let peer_private = expand_salted(shared_secret, &descriptor.nonce, role.peer_label())?;
 
@@ -387,12 +498,16 @@ impl Session {
         Ok(Self {
             descriptor,
             root,
+            header_secret,
             local,
             peer_bootstrap_pub,
             remote_pub: None,
             received_since_send: false,
+            next_epoch_id: 0,
+            bootstrap_sent: false,
             send_epochs: VecDeque::new(),
             recv_epochs: VecDeque::new(),
+            retired_epoch_ids: VecDeque::new(),
             seen_dh_pubs: VecDeque::new(),
         })
     }
@@ -405,10 +520,16 @@ impl Session {
             .back_mut()
             .ok_or_else(|| anyhow!("ratchet has no send epoch"))?;
 
+        let bootstrap_nonce = if self.bootstrap_sent {
+            None
+        } else {
+            Some(self.descriptor.nonce)
+        };
         let header = RatchetHeader {
             session_id: self.descriptor.id,
-            bootstrap_nonce: self.descriptor.nonce,
+            bootstrap_nonce,
             dh_pub: epoch.keypair.public,
+            epoch_id: epoch.epoch_id,
             n: epoch.index,
             pn: epoch.previous_chain_len,
         };
@@ -421,14 +542,80 @@ impl Session {
             .ok_or_else(|| anyhow!("ratchet message counter overflow"))?;
 
         // Ключ сообщения затирается при drop сразу после шифрования.
-        let packet = seal_packet(&header, &message_key, plaintext)?;
+        let packet = seal_packet(
+            &header,
+            &self.header_secret,
+            &message_key,
+            plaintext,
+        )?;
         drop(message_key);
 
+        self.bootstrap_sent = true;
         self.received_since_send = false;
         Ok(packet)
     }
 
-    fn decrypt(&mut self, header: &RatchetHeader, packet: &[u8]) -> Result<Vec<u8>> {
+    /// Расшифровывает зашифрованный заголовок, перебирая известные эпохи и
+    /// небольшое окно новых `epoch_id`.
+    fn open_header(&self, open: &OpenHeader, packet: &[u8]) -> Result<RatchetHeader> {
+        if packet.len()
+            < open.header_offset + ENCRYPTED_HEADER_SIZE + TAG_SIZE
+        {
+            return Err(anyhow!("ratchet packet is too short for v3 header"));
+        }
+
+        let mut candidates: Vec<u32> = self
+            .recv_epochs
+            .iter()
+            .map(|epoch| epoch.epoch_id)
+            .collect();
+        candidates.extend(self.retired_epoch_ids.iter().copied());
+        let max_known = candidates.iter().copied().max();
+        let start = max_known.map_or(0, |value| value.saturating_add(1));
+        for offset in 0..MAX_HEADER_EPOCH_LOOKAHEAD {
+            candidates.push(start.saturating_add(offset));
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+
+        let aad = open.aad(packet);
+        let encrypted = &packet
+            [open.header_offset..open.header_offset + ENCRYPTED_HEADER_SIZE];
+
+        for epoch_id in candidates {
+            let key = derive_header_key(&self.header_secret, epoch_id)?;
+            let cipher = XChaCha20Poly1305::new_from_slice(key.as_ref())
+                .map_err(|_| anyhow!("invalid ratchet header key"))?;
+            let plaintext = match cipher.decrypt(
+                XNonce::from_slice(&open.nonce),
+                Payload {
+                    msg: encrypted,
+                    aad,
+                },
+            ) {
+                Ok(plaintext) => Zeroizing::new(plaintext),
+                Err(_) => continue,
+            };
+
+            let header = RatchetHeader::from_plaintext(
+                self.descriptor.id,
+                open.bootstrap_nonce,
+                plaintext.as_slice(),
+            )?;
+            if header.epoch_id != epoch_id {
+                // Аутентифицированный заголовок обязан совпадать с ключом,
+                // которым он был открыт.
+                return Err(anyhow!("ratchet header epoch id mismatch"));
+            }
+            return Ok(header);
+        }
+
+        Err(anyhow!("ratchet header authentication failed"))
+    }
+
+    fn decrypt(&mut self, open: &OpenHeader, packet: &[u8]) -> Result<Vec<u8>> {
+        let header = self.open_header(open, packet)?;
+
         let mut order: Vec<usize> = (0..self.recv_epochs.len()).collect();
         let mut known_peer = false;
         if let Some(pos) = self
@@ -443,7 +630,7 @@ impl Session {
 
         for index in order {
             let mut candidate = self.recv_epochs[index].clone();
-            if let Ok(plaintext) = decrypt_with_epoch(&mut candidate, header, packet) {
+            if let Ok(plaintext) = decrypt_with_epoch(&mut candidate, open, &header, packet) {
                 self.recv_epochs[index] = candidate;
                 self.note_accepted_epoch(index);
                 return Ok(plaintext);
@@ -476,11 +663,12 @@ impl Session {
                 local_pub: keypair.public,
                 root_key,
                 chain_key,
+                epoch_id: header.epoch_id,
                 next_index: 0,
                 skipped: BTreeMap::new(),
             };
 
-            if let Ok(plaintext) = decrypt_with_epoch(&mut epoch, header, packet) {
+            if let Ok(plaintext) = decrypt_with_epoch(&mut epoch, open, &header, packet) {
                 // Сначала окно (может отказать с EpochOverflow), затем реестр:
                 // отклонённый ключ не должен блокировать будущий легитимный.
                 self.push_recv_epoch(epoch)?;
@@ -529,7 +717,9 @@ impl Session {
 
             match victim {
                 Some(index) => {
-                    self.recv_epochs.remove(index);
+                    if let Some(removed) = self.recv_epochs.remove(index) {
+                        self.remember_retired_epoch(removed.epoch_id);
+                    }
                 }
                 None => {
                     // Откатываем приём: состояние остаётся таким же, каким
@@ -551,6 +741,16 @@ impl Session {
         self.seen_dh_pubs.push_back(dh_pub);
         while self.seen_dh_pubs.len() > MAX_SEEN_DH_PUBS {
             self.seen_dh_pubs.pop_front();
+        }
+    }
+
+    fn remember_retired_epoch(&mut self, epoch_id: u32) {
+        if self.retired_epoch_ids.contains(&epoch_id) {
+            return;
+        }
+        self.retired_epoch_ids.push_back(epoch_id);
+        while self.retired_epoch_ids.len() > MAX_SEEN_DH_PUBS {
+            self.retired_epoch_ids.pop_front();
         }
     }
 
@@ -577,11 +777,18 @@ impl Session {
         let root_key = derive_epoch_root(&self.root, dh, &keypair.public, &target)?;
         let chain_key = derive_chain_key(&root_key, &keypair.public, &target)?;
 
+        let epoch_id = self.next_epoch_id;
+        self.next_epoch_id = self
+            .next_epoch_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("ratchet epoch id overflow"))?;
+
         self.send_epochs.push_back(SendEpoch {
             keypair,
             peer_pub: target,
             root_key,
             chain_key,
+            epoch_id,
             index: 0,
             previous_chain_len,
         });
@@ -630,7 +837,7 @@ impl RatchetState {
         role: Role,
         retired: Vec<[u8; SESSION_ID_SIZE]>,
     ) -> Result<Self> {
-        let descriptor = SessionDescriptor::generate();
+        let descriptor = SessionDescriptor::generate(shared_secret)?;
         let session = Session::derive(shared_secret, role, descriptor)?;
 
         let mut sessions = VecDeque::new();
@@ -668,47 +875,72 @@ impl RatchetState {
     /// выводится новый контекст. Пакеты уничтоженных сессий отклоняются
     /// как [`RatchetError::StaleSession`].
     pub fn decrypt(&mut self, packet: &[u8], shared_secret: &[u8; 32]) -> Result<Vec<u8>> {
-        if !ALLOWED_TOTAL_SIZES.contains(&packet.len()) {
+        if !is_valid_packet_len(packet.len()) {
             return Err(anyhow!(
-                "invalid ratchet packet size {}: expected one of {:?}",
-                packet.len(),
-                ALLOWED_TOTAL_SIZES
+                "invalid ratchet packet size {}: expected a bucket + randomized padding",
+                packet.len()
             ));
         }
 
-        let header = RatchetHeader::parse(packet)?;
+        let open = OpenHeader::parse(packet)?;
 
-        if self.retired.contains(&header.session_id) {
-            return Err(RatchetError::StaleSession.into());
+        for retired in &self.retired {
+            if session_alias(retired)? == open.alias {
+                return Err(RatchetError::StaleSession.into());
+            }
         }
 
-        if let Some(index) = self
-            .sessions
-            .iter()
-            .position(|session| session.descriptor.id == header.session_id)
-        {
-            let plaintext = self.sessions[index].decrypt(&header, packet)?;
-            self.active = header.session_id;
+        let mut matched = None;
+        for (index, session) in self.sessions.iter().enumerate() {
+            if session_alias(&session.descriptor.id)? == open.alias {
+                matched = Some(index);
+                break;
+            }
+        }
+
+        if let Some(index) = matched {
+            let plaintext = self.sessions[index].decrypt(&open, packet)?;
+            self.active = self.sessions[index].descriptor.id;
             return Ok(plaintext);
         }
 
-        // Незнакомая сессия: контекст выводится из переданного nonce.
-        // Нулевой nonce означает пакет без bootstrap-энтропии.
-        if header.bootstrap_nonce == [0u8; BOOTSTRAP_NONCE_SIZE] {
+        // Незнакомая сессия: без bootstrap-nonce её контекст не вывести.
+        let bootstrap_nonce = open
+            .bootstrap_nonce
+            .ok_or(RatchetError::MissingBootstrapNonce)?;
+        if bootstrap_nonce == [0u8; BOOTSTRAP_NONCE_SIZE] {
             return Err(RatchetError::MissingBootstrapNonce.into());
         }
 
-        let descriptor = SessionDescriptor {
-            id: header.session_id,
-            nonce: header.bootstrap_nonce,
-        };
+        let descriptor =
+            SessionDescriptor::id_from_nonce(shared_secret, &bootstrap_nonce)?;
+        if session_alias(&descriptor.id)? != open.alias {
+            return Err(anyhow!(
+                "bootstrap ratchet alias does not match the derived session"
+            ));
+        }
+
         let mut session = Session::derive(shared_secret, self.role, descriptor)?;
-        let plaintext = session.decrypt(&header, packet)?;
+        let plaintext = session.decrypt(&open, packet)?;
 
         self.active = descriptor.id;
         self.sessions.push_back(session);
         self.evict_sessions();
         Ok(plaintext)
+    }
+
+    /// Тестовый помощник: открывает зашифрованный заголовок пакета.
+    ///
+    /// В продакшн-коде открытый заголовок доступен только внутри ratchet.
+    #[cfg(test)]
+    pub(crate) fn header_for_test(&self, packet: &[u8]) -> Result<RatchetHeader> {
+        let open = OpenHeader::parse(packet)?;
+        for session in &self.sessions {
+            if session_alias(&session.descriptor.id)? == open.alias {
+                return session.open_header(&open, packet);
+            }
+        }
+        Err(anyhow!("no session matches the packet alias"))
     }
 
     /// Помечает сессии уничтоженными и убирает их контексты.
@@ -788,11 +1020,16 @@ impl RatchetState {
             .map(|epoch| epoch.keypair.public)
     }
 
-    /// Корневой ключ текущей эпохи отправки (для проверки смены эпох).
-    pub fn current_root_key(&self) -> Option<[u8; 32]> {
+    /// Доступ к корневому ключу текущей эпохи отправки без копирования
+    /// наружу.
+    ///
+    /// Замыкание получает срез живого корневого ключа; скопировать его
+    /// вызывающий может только явно (`*root`), что видно при аудите.
+    /// Возвращает `None`, если эпохи отправки ещё нет.
+    pub fn with_root_key<R>(&self, f: impl FnOnce(&[u8; 32]) -> R) -> Option<R> {
         self.active_session()
             .and_then(|session| session.send_epochs.back())
-            .map(|epoch| *epoch.root_key)
+            .map(|epoch| f(&epoch.root_key))
     }
 
     pub fn send_epoch_count(&self) -> usize {
@@ -827,8 +1064,10 @@ impl RatchetState {
 
     /// Сериализует состояние для зашифрованного `vault.dat`.
     ///
-    /// Буфер сериализации и промежуточные hex-строки затираются.
-    pub fn to_bytes(&self) -> Result<Zeroizing<Vec<u8>>> {
+    /// Буфер сериализации и промежуточные hex-строки затираются. Результат
+    /// обёрнут в [`SecretBytes`], чтобы вызывающий не мог забыть затереть
+    /// снапшот: это делается автоматически при `drop`.
+    pub fn to_bytes(&self) -> Result<SecretBytes> {
         let mut raw = RawState {
             version: STATE_VERSION,
             role: self.role.byte(),
@@ -841,11 +1080,15 @@ impl RatchetState {
                     id: hex::encode(session.descriptor.id),
                     nonce: hex::encode(session.descriptor.nonce),
                     root: hex::encode(*session.root),
+                    header_secret: hex::encode(*session.header_secret),
+                    next_epoch_id: session.next_epoch_id,
+                    bootstrap_sent: session.bootstrap_sent,
                     local_private: hex::encode(*session.local.private),
                     local_public: hex::encode(session.local.public),
                     peer_bootstrap_pub: hex::encode(session.peer_bootstrap_pub),
                     remote_pub: session.remote_pub.map(hex::encode),
                     received_since_send: session.received_since_send,
+                    retired_epoch_ids: session.retired_epoch_ids.iter().copied().collect(),
                     seen_dh_pubs: session
                         .seen_dh_pubs
                         .iter()
@@ -860,6 +1103,7 @@ impl RatchetState {
                             peer_pub: hex::encode(epoch.peer_pub),
                             root_key: hex::encode(*epoch.root_key),
                             chain_key: hex::encode(*epoch.chain_key),
+                            epoch_id: epoch.epoch_id,
                             index: epoch.index,
                             previous_chain_len: epoch.previous_chain_len,
                         })
@@ -872,6 +1116,7 @@ impl RatchetState {
                             local_pub: hex::encode(epoch.local_pub),
                             root_key: hex::encode(*epoch.root_key),
                             chain_key: hex::encode(*epoch.chain_key),
+                            epoch_id: epoch.epoch_id,
                             next_index: epoch.next_index,
                             skipped: epoch
                                 .skipped
@@ -890,12 +1135,15 @@ impl RatchetState {
         let bytes = serde_json::to_vec(&raw)
             .map_err(|e| anyhow!("failed to serialize ratchet state: {}", e))?;
         raw.wipe();
-        Ok(Zeroizing::new(bytes))
+        Ok(SecretBytes::new(bytes))
     }
 
     /// Восстанавливает состояние из `vault.dat`.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let mut raw: RawState = serde_json::from_slice(bytes)
+    ///
+    /// Принимает владение секретным буфером: после `from_bytes` он больше
+    /// не нужен и затирается при `drop` (в том числе на пути ошибки).
+    pub fn from_bytes(bytes: SecretBytes) -> Result<Self> {
+        let mut raw: RawState = serde_json::from_slice(bytes.expose())
             .map_err(|e| anyhow!("failed to parse ratchet state: {}", e))?;
 
         let result = Self::from_raw(&raw);
@@ -925,6 +1173,7 @@ impl RatchetState {
                     peer_pub: decode32(&epoch.peer_pub)?,
                     root_key: Zeroizing::new(decode32(&epoch.root_key)?),
                     chain_key: Zeroizing::new(decode32(&epoch.chain_key)?),
+                    epoch_id: epoch.epoch_id,
                     index: epoch.index,
                     previous_chain_len: epoch.previous_chain_len,
                 });
@@ -941,6 +1190,7 @@ impl RatchetState {
                     local_pub: decode32(&epoch.local_pub)?,
                     root_key: Zeroizing::new(decode32(&epoch.root_key)?),
                     chain_key: Zeroizing::new(decode32(&epoch.chain_key)?),
+                    epoch_id: epoch.epoch_id,
                     next_index: epoch.next_index,
                     skipped,
                 });
@@ -977,6 +1227,9 @@ impl RatchetState {
                     nonce: decode32(&session.nonce)?,
                 },
                 root: Zeroizing::new(decode32(&session.root)?),
+                header_secret: Zeroizing::new(decode32(&session.header_secret)?),
+                next_epoch_id: session.next_epoch_id,
+                bootstrap_sent: session.bootstrap_sent,
                 local: KeyPair {
                     private: Zeroizing::new(decode32(&session.local_private)?),
                     public: decode32(&session.local_public)?,
@@ -990,6 +1243,7 @@ impl RatchetState {
                 received_since_send: session.received_since_send,
                 send_epochs,
                 recv_epochs,
+                retired_epoch_ids: session.retired_epoch_ids.iter().copied().collect(),
                 seen_dh_pubs,
             });
         }
@@ -1044,6 +1298,37 @@ fn expand_salted(ikm: &[u8], salt: &[u8], info: &[u8]) -> Result<Zeroizing<[u8; 
     hkdf.expand(info, out.as_mut())
         .map_err(|e| anyhow!("HKDF expansion failed: {}", e))?;
     Ok(out)
+}
+
+/// `session_id` выводится из bootstrap-nonce: в открытом виде он не едет.
+fn derive_session_id(
+    shared_secret: &[u8; 32],
+    nonce: &[u8; BOOTSTRAP_NONCE_SIZE],
+) -> Result<[u8; SESSION_ID_SIZE]> {
+    let bytes = expand_salted(shared_secret, nonce, b"session-id-v3")?;
+    let mut id = [0u8; SESSION_ID_SIZE];
+    id.copy_from_slice(&bytes[..SESSION_ID_SIZE]);
+    Ok(id)
+}
+
+/// Псевдоним сессии для открытого заголовка: не раскрывает `session_id`.
+fn session_alias(id: &[u8; SESSION_ID_SIZE]) -> Result<[u8; SESSION_ALIAS_SIZE]> {
+    let hkdf = Hkdf::<Sha256>::new(None, id);
+    let mut alias = [0u8; SESSION_ALIAS_SIZE];
+    hkdf.expand(b"route-v3", &mut alias)
+        .map_err(|e| anyhow!("session alias derivation failed: {}", e))?;
+    Ok(alias)
+}
+
+/// Ключ заголовка ротируется вместе с `epoch_id`.
+fn derive_header_key(
+    header_secret: &[u8; 32],
+    epoch_id: u32,
+) -> Result<Zeroizing<[u8; 32]>> {
+    let mut info = Vec::with_capacity(6 + 4);
+    info.extend_from_slice(b"hdr-v3");
+    info.extend_from_slice(&epoch_id.to_le_bytes());
+    expand(header_secret, &info)
 }
 
 fn derive_epoch_root(
@@ -1105,6 +1390,7 @@ fn store_skipped(epoch: &mut RecvEpoch, n: u32, key: Zeroizing<[u8; 32]>) {
 
 fn decrypt_with_epoch(
     epoch: &mut RecvEpoch,
+    open: &OpenHeader,
     header: &RatchetHeader,
     packet: &[u8],
 ) -> Result<Vec<u8>> {
@@ -1113,7 +1399,7 @@ fn decrypt_with_epoch(
             .skipped
             .remove(&header.n)
             .ok_or_else(|| anyhow!("ratchet message key is no longer available"))?;
-        return open_packet(packet, &key);
+        return open_packet(open, packet, &key);
     }
 
     let distance = header.n - epoch.next_index;
@@ -1142,22 +1428,49 @@ fn decrypt_with_epoch(
     }
 
     let key = message_key.ok_or_else(|| anyhow!("ratchet message key was not derived"))?;
-    open_packet(packet, &key)
+    open_packet(open, packet, &key)
+}
+
+/// Проверяет, что длина пакета лежит в `bucket + rand(0..=bucket/8)`.
+pub fn is_valid_packet_len(len: usize) -> bool {
+    ALLOWED_TOTAL_SIZES
+        .iter()
+        .any(|bucket| len >= *bucket && len <= bucket + bucket / 8)
 }
 
 fn seal_packet(
     header: &RatchetHeader,
+    header_secret: &[u8; 32],
     message_key: &[u8; 32],
     plaintext: &[u8],
 ) -> Result<Vec<u8>> {
     let plaintext_len = u32::try_from(plaintext.len())
         .map_err(|_| anyhow!("ratchet plaintext is too large"))?;
 
-    let min_total = INNER_OVERHEAD
-        .checked_add(plaintext.len())
+    let mut nonce_bytes = [0u8; NONCE_SIZE];
+    OsRng.fill_bytes(&mut nonce_bytes);
+
+    let open = OpenHeader {
+        alias: session_alias(&header.session_id)?,
+        bootstrap_nonce: header.bootstrap_nonce,
+        nonce: nonce_bytes,
+        header_offset: OPEN_HEADER_MIN
+            + if header.bootstrap_nonce.is_some() {
+                BOOTSTRAP_NONCE_SIZE
+            } else {
+                0
+            },
+    };
+
+    let min_total = open
+        .header_offset
+        .checked_add(ENCRYPTED_HEADER_SIZE)
+        .and_then(|value| value.checked_add(std::mem::size_of::<u32>()))
+        .and_then(|value| value.checked_add(plaintext.len()))
+        .and_then(|value| value.checked_add(TAG_SIZE))
         .ok_or_else(|| anyhow!("ratchet plaintext is too large"))?;
 
-    let total_size = ALLOWED_TOTAL_SIZES
+    let bucket = ALLOWED_TOTAL_SIZES
         .iter()
         .copied()
         .find(|size| *size >= min_total)
@@ -1167,8 +1480,17 @@ fn seal_packet(
                 super::SIZE_MAX
             )
         })?;
+    let extra_max = bucket / 8;
+    let extra = if extra_max == 0 {
+        0
+    } else {
+        (OsRng.next_u64() % (extra_max as u64 + 1)) as usize
+    };
+    let total_size = bucket + extra;
 
-    let inner_len = total_size - HEADER_SIZE - NONCE_SIZE - TAG_SIZE;
+    let inner_len = total_size
+        .checked_sub(open.header_offset + ENCRYPTED_HEADER_SIZE + TAG_SIZE)
+        .ok_or_else(|| anyhow!("ratchet packet size underflow"))?;
     let mut inner = Zeroizing::new(vec![0u8; inner_len]);
     inner[..4].copy_from_slice(&plaintext_len.to_le_bytes());
     inner[4..4 + plaintext.len()].copy_from_slice(plaintext);
@@ -1176,10 +1498,28 @@ fn seal_packet(
         OsRng.fill_bytes(&mut inner[4 + plaintext.len()..]);
     }
 
-    let mut nonce_bytes = [0u8; NONCE_SIZE];
-    OsRng.fill_bytes(&mut nonce_bytes);
+    let open_bytes = open.to_bytes();
+    let header_key = derive_header_key(header_secret, header.epoch_id)?;
+    let header_cipher = XChaCha20Poly1305::new_from_slice(header_key.as_ref())
+        .map_err(|_| anyhow!("invalid ratchet header key"))?;
+    let header_plaintext = header.plaintext();
+    let encrypted_header = header_cipher
+        .encrypt(
+            XNonce::from_slice(&nonce_bytes),
+            Payload {
+                msg: &header_plaintext,
+                aad: &open_bytes,
+            },
+        )
+        .map_err(|_| anyhow!("ratchet header encryption failed"))?;
+    if encrypted_header.len() != ENCRYPTED_HEADER_SIZE {
+        return Err(anyhow!("ratchet header size mismatch"));
+    }
 
-    let header_bytes = header.to_bytes();
+    let mut payload_aad = Vec::with_capacity(open_bytes.len() + encrypted_header.len());
+    payload_aad.extend_from_slice(&open_bytes);
+    payload_aad.extend_from_slice(&encrypted_header);
+
     let cipher = XChaCha20Poly1305::new_from_slice(message_key)
         .map_err(|_| anyhow!("invalid ratchet message key"))?;
     let ciphertext = cipher
@@ -1187,31 +1527,36 @@ fn seal_packet(
             XNonce::from_slice(&nonce_bytes),
             Payload {
                 msg: inner.as_slice(),
-                aad: &header_bytes,
+                aad: &payload_aad,
             },
         )
         .map_err(|_| anyhow!("ratchet encryption failed"))?;
 
     let mut packet = Vec::with_capacity(total_size);
-    packet.extend_from_slice(&header_bytes);
-    packet.extend_from_slice(&nonce_bytes);
+    packet.extend_from_slice(&open_bytes);
+    packet.extend_from_slice(&encrypted_header);
     packet.extend_from_slice(&ciphertext);
 
     if packet.len() != total_size {
         return Err(anyhow!("ratchet packet size mismatch"));
     }
+    debug_assert!(is_valid_packet_len(packet.len()));
 
     Ok(packet)
 }
 
-fn open_packet(packet: &[u8], message_key: &[u8; 32]) -> Result<Vec<u8>> {
-    if packet.len() < HEADER_SIZE + NONCE_SIZE + TAG_SIZE {
+fn open_packet(
+    open: &OpenHeader,
+    packet: &[u8],
+    message_key: &[u8; 32],
+) -> Result<Vec<u8>> {
+    if packet.len() < open.header_offset + ENCRYPTED_HEADER_SIZE + TAG_SIZE {
         return Err(anyhow!("ratchet packet is too short"));
     }
 
-    let header_bytes = &packet[..HEADER_SIZE];
-    let nonce = XNonce::from_slice(&packet[HEADER_SIZE..HEADER_SIZE + NONCE_SIZE]);
-    let ciphertext = &packet[HEADER_SIZE + NONCE_SIZE..];
+    let aad = open.payload_aad(packet);
+    let nonce = XNonce::from_slice(&open.nonce);
+    let ciphertext = &packet[open.header_offset + ENCRYPTED_HEADER_SIZE..];
 
     let cipher = XChaCha20Poly1305::new_from_slice(message_key)
         .map_err(|_| anyhow!("invalid ratchet message key"))?;
@@ -1221,7 +1566,7 @@ fn open_packet(packet: &[u8], message_key: &[u8; 32]) -> Result<Vec<u8>> {
                 nonce,
                 Payload {
                     msg: ciphertext,
-                    aad: header_bytes,
+                    aad,
                 },
             )
             .map_err(|_| anyhow!("ratchet authentication failed"))?,
@@ -1277,11 +1622,17 @@ struct RawSession {
     id: String,
     nonce: String,
     root: String,
+    header_secret: String,
+    next_epoch_id: u32,
+    bootstrap_sent: bool,
     local_private: String,
     local_public: String,
     peer_bootstrap_pub: String,
     remote_pub: Option<String>,
     received_since_send: bool,
+    /// `epoch_id` вытесненных эпох приёма.
+    #[serde(default)]
+    retired_epoch_ids: Vec<u32>,
     /// `dh_pub` собеседника, уже принятые в этой сессии (порядок приёма).
     #[serde(default)]
     seen_dh_pubs: Vec<String>,
@@ -1296,6 +1647,7 @@ impl RawSession {
         self.id.zeroize();
         self.nonce.zeroize();
         self.root.zeroize();
+        self.header_secret.zeroize();
         self.local_private.zeroize();
         self.local_public.zeroize();
         self.peer_bootstrap_pub.zeroize();
@@ -1321,6 +1673,7 @@ struct RawSendEpoch {
     peer_pub: String,
     root_key: String,
     chain_key: String,
+    epoch_id: u32,
     index: u32,
     previous_chain_len: u32,
 }
@@ -1341,6 +1694,7 @@ struct RawRecvEpoch {
     local_pub: String,
     root_key: String,
     chain_key: String,
+    epoch_id: u32,
     next_index: u32,
     #[serde(default)]
     skipped: Vec<RawSkipped>,
@@ -1402,13 +1756,13 @@ mod tests {
         for round in 0..6 {
             let alice_text = format!("alice-{}", round);
             let alice_packet = alice.encrypt(alice_text.as_bytes()).unwrap();
-            let alice_header = RatchetHeader::parse(&alice_packet).unwrap();
+            let alice_header = alice.header_for_test(&alice_packet).unwrap();
             if round == 0 {
                 assert_eq!(alice_header.n, 0);
                 assert_eq!(alice_header.pn, 0);
             }
 
-            let root = alice.current_root_key().unwrap();
+            let root = alice.with_root_key(|root| *root).unwrap();
             let dh = alice.current_dh_public().unwrap();
             if let Some(previous) = previous_root {
                 assert_ne!(root, previous, "RootKey must change between epochs");
@@ -1426,7 +1780,7 @@ mod tests {
 
             let bob_text = format!("bob-{}", round);
             let bob_packet = bob.encrypt(bob_text.as_bytes()).unwrap();
-            let bob_header = RatchetHeader::parse(&bob_packet).unwrap();
+            let bob_header = bob.header_for_test(&bob_packet).unwrap();
             if round == 0 {
                 assert_eq!(bob_header.pn, 0);
             }
@@ -1502,11 +1856,12 @@ mod tests {
             plaintext[..6].copy_from_slice(b"SECRET");
 
             let packet = alice.encrypt(&plaintext).unwrap();
-            assert_eq!(
-                packet.len(),
+            assert!(
+                packet.len() >= expected_size
+                    && packet.len() <= expected_size + expected_size / 8,
+                "packet must use the {} byte bucket (got {})",
                 expected_size,
-                "packet must use the {} byte padding step",
-                expected_size
+                packet.len()
             );
             assert!(
                 !packet.windows(6).any(|window| window == b"SECRET"),
@@ -1554,7 +1909,7 @@ mod tests {
 
         let session_id = bob.session_id();
         let bytes = bob.to_bytes().unwrap();
-        let mut restored = RatchetState::from_bytes(&bytes).unwrap();
+        let mut restored = RatchetState::from_bytes(bytes).unwrap();
         assert_eq!(restored.role(), Role::Responder);
         assert_eq!(restored.session_id(), session_id);
 
@@ -1563,6 +1918,37 @@ mod tests {
             restored.decrypt(&packet, &SHARED).unwrap(),
             b"after-save"
         );
+    }
+
+    #[test]
+    fn serialized_state_is_wrapped_in_secret_bytes() {
+        let (mut alice, mut bob) = pair();
+        let packet = alice.encrypt(b"hello").unwrap();
+        assert_eq!(bob.decrypt(&packet, &SHARED).unwrap(), b"hello");
+
+        let bytes = bob.to_bytes().unwrap();
+        assert!(!bytes.expose().is_empty());
+        assert_eq!(format!("{:?}", bytes), "<secret>");
+        assert!(
+            !format!("{:?}", bytes).contains("root_key"),
+            "Debug must not expose the serialized state structure"
+        );
+    }
+
+    #[test]
+    fn with_root_key_scopes_root_key_access() {
+        let (mut alice, _bob) = pair();
+        alice.encrypt(b"hello").unwrap();
+
+        let root_hex = alice.with_root_key(|root| hex::encode(root)).unwrap();
+        assert_eq!(root_hex.len(), 64);
+
+        // Замыкание работает с живым ключом: скопировать его наружу можно
+        // только явно, что видно при аудите.
+        let all_zero = alice
+            .with_root_key(|root| root.iter().all(|byte| *byte == 0))
+            .unwrap();
+        assert!(!all_zero);
     }
 
     #[test]
@@ -1639,9 +2025,9 @@ mod tests {
         let mut alice = RatchetState::new(&SHARED, Role::Initiator).unwrap();
         let mut packet = alice.encrypt(b"no-nonce").unwrap();
 
-        // Обнуляем bootstrap_nonce в заголовке: пакет перестаёт нести
-        // bootstrap-энтропию и не должен приниматься как новая сессия.
-        let nonce_start = 1 + SESSION_ID_SIZE;
+        // Обнуляем bootstrap_nonce в открытом заголовке v3: пакет
+        // перестаёт нести bootstrap-энтропию и не должен приниматься.
+        let nonce_start = OPEN_HEADER_FIXED;
         packet[nonce_start..nonce_start + BOOTSTRAP_NONCE_SIZE].fill(0);
 
         let mut bob = RatchetState::new(&SHARED, Role::Responder).unwrap();
@@ -1668,7 +2054,9 @@ mod tests {
 
     #[test]
     fn legacy_state_version_is_rejected() {
-        let error = match RatchetState::from_bytes(br#"{"version":1,"role":0}"#) {
+        let error = match RatchetState::from_bytes(SecretBytes::from_slice(
+            br#"{"version":1,"role":0}"#,
+        )) {
             Ok(_) => panic!("v1 state must not be accepted"),
             Err(error) => error,
         };
@@ -1687,8 +2075,8 @@ mod tests {
 
         let alice_first = alice.encrypt(b"alice-first").unwrap();
         let bob_first = bob.encrypt(b"bob-first").unwrap();
-        let alice_session = RatchetHeader::parse(&alice_first).unwrap().session_id;
-        let bob_session = RatchetHeader::parse(&bob_first).unwrap().session_id;
+        let alice_session = alice.header_for_test(&alice_first).unwrap().session_id;
+        let bob_session = bob.header_for_test(&bob_first).unwrap().session_id;
         assert_ne!(alice_session, bob_session);
 
         assert_eq!(
@@ -1700,7 +2088,7 @@ mod tests {
         // Ответ идёт в сессии собеседника, и обе стороны это переживают.
         let bob_reply = bob.encrypt(b"bob-reply").unwrap();
         assert_eq!(
-            RatchetHeader::parse(&bob_reply).unwrap().session_id,
+            bob.header_for_test(&bob_reply).unwrap().session_id,
             alice_session
         );
         assert_eq!(alice.decrypt(&bob_reply, &SHARED).unwrap(), b"bob-reply");
@@ -1710,7 +2098,7 @@ mod tests {
         // Alice отвечает в сессии только что принятого пакета.
         let alice_reply = alice.encrypt(b"alice-reply").unwrap();
         assert_eq!(
-            RatchetHeader::parse(&alice_reply).unwrap().session_id,
+            alice.header_for_test(&alice_reply).unwrap().session_id,
             alice_session
         );
         assert_eq!(bob.decrypt(&alice_reply, &SHARED).unwrap(), b"alice-reply");
@@ -1722,7 +2110,7 @@ mod tests {
 
         // Первая эпоха: её пакет сохраняем для повторной подачи.
         let stale = alice.encrypt(b"stale-epoch").unwrap();
-        let stale_dh = RatchetHeader::parse(&stale).unwrap().dh_pub;
+        let stale_dh = alice.header_for_test(&stale).unwrap().dh_pub;
         assert_eq!(bob.decrypt(&stale, &SHARED).unwrap(), b"stale-epoch");
 
         // Проворачиваем больше окна эпох, чтобы dh_pub вышел из него.
@@ -1787,7 +2175,7 @@ mod tests {
         let (mut alice, mut bob) = pair();
 
         let first = alice.encrypt(b"first").unwrap();
-        let first_dh = RatchetHeader::parse(&first).unwrap().dh_pub;
+        let first_dh = alice.header_for_test(&first).unwrap().dh_pub;
         assert_eq!(bob.decrypt(&first, &SHARED).unwrap(), b"first");
         assert!(bob
             .active_session()
@@ -1799,7 +2187,7 @@ mod tests {
         assert_eq!(alice.decrypt(&reply, &SHARED).unwrap(), b"reply");
 
         let second = alice.encrypt(b"second").unwrap();
-        let second_dh = RatchetHeader::parse(&second).unwrap().dh_pub;
+        let second_dh = alice.header_for_test(&second).unwrap().dh_pub;
         assert_ne!(first_dh, second_dh);
         assert_eq!(bob.decrypt(&second, &SHARED).unwrap(), b"second");
 
@@ -1815,9 +2203,9 @@ mod tests {
 
         let first = alice.encrypt(b"epoch-1-first").unwrap();
         let late = alice.encrypt(b"epoch-1-late").unwrap();
-        let first_dh = RatchetHeader::parse(&first).unwrap().dh_pub;
+        let first_dh = alice.header_for_test(&first).unwrap().dh_pub;
         assert_eq!(
-            RatchetHeader::parse(&late).unwrap().dh_pub,
+            alice.header_for_test(&late).unwrap().dh_pub,
             first_dh,
             "both packets must belong to the same epoch"
         );
@@ -1827,7 +2215,7 @@ mod tests {
         assert_eq!(alice.decrypt(&reply, &SHARED).unwrap(), b"reply");
 
         let second = alice.encrypt(b"epoch-2").unwrap();
-        let second_dh = RatchetHeader::parse(&second).unwrap().dh_pub;
+        let second_dh = alice.header_for_test(&second).unwrap().dh_pub;
         assert_ne!(first_dh, second_dh);
 
         // Более новая эпоха приходит раньше, чем запоздавший пакет старой.
@@ -1852,6 +2240,7 @@ mod tests {
             local_pub: [1u8; 32],
             root_key: Zeroizing::new([0u8; 32]),
             chain_key: Zeroizing::new([0u8; 32]),
+            epoch_id: 0,
             next_index: 0,
             skipped: BTreeMap::new(),
         }
@@ -1860,7 +2249,7 @@ mod tests {
     #[test]
     fn epoch_window_evicts_the_oldest_inactive_epoch() {
         let mut session =
-            Session::derive(&SHARED, Role::Responder, SessionDescriptor::generate()).unwrap();
+            Session::derive(&SHARED, Role::Responder, SessionDescriptor::generate(&SHARED).unwrap()).unwrap();
         for value in 1..=MAX_EPOCHS as u8 {
             session.recv_epochs.push_back(test_recv_epoch([value; 32]));
         }
@@ -1884,7 +2273,7 @@ mod tests {
     #[test]
     fn epoch_overflow_is_reported_without_mutating_state() {
         let mut session =
-            Session::derive(&SHARED, Role::Responder, SessionDescriptor::generate()).unwrap();
+            Session::derive(&SHARED, Role::Responder, SessionDescriptor::generate(&SHARED).unwrap()).unwrap();
         for _ in 0..MAX_EPOCHS {
             session.recv_epochs.push_back(test_recv_epoch([9u8; 32]));
         }
@@ -1907,7 +2296,7 @@ mod tests {
     fn new_session_starts_with_empty_dh_pub_registry() {
         let (mut alice, mut bob) = pair();
         let packet = alice.encrypt(b"first").unwrap();
-        let dh_pub = RatchetHeader::parse(&packet).unwrap().dh_pub;
+        let dh_pub = alice.header_for_test(&packet).unwrap().dh_pub;
         assert_eq!(bob.decrypt(&packet, &SHARED).unwrap(), b"first");
         assert!(bob
             .active_session()
@@ -1928,10 +2317,10 @@ mod tests {
     fn dh_pub_registry_survives_serialization() {
         let (mut alice, mut bob) = pair();
         let packet = alice.encrypt(b"hello").unwrap();
-        let dh_pub = RatchetHeader::parse(&packet).unwrap().dh_pub;
+        let dh_pub = alice.header_for_test(&packet).unwrap().dh_pub;
         assert_eq!(bob.decrypt(&packet, &SHARED).unwrap(), b"hello");
 
-        let mut restored = RatchetState::from_bytes(&bob.to_bytes().unwrap()).unwrap();
+        let mut restored = RatchetState::from_bytes(bob.to_bytes().unwrap()).unwrap();
         assert!(restored
             .active_session()
             .unwrap()
@@ -1972,4 +2361,163 @@ mod tests {
         assert!(state.retired.contains(&ids[ids.len() - 1]));
         assert!(!state.retired.contains(&ids[0]));
     }
+
+    // -----------------------------------------------------------------
+    // M-7: header encryption, alias and randomized padding
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn v3_header_hides_dh_pub_counters_and_session_id() {
+        let (mut alice, _bob) = pair();
+        let mut packet = alice.encrypt(b"hidden header 0").unwrap();
+        for index in 1..6 {
+            packet = alice
+                .encrypt(format!("hidden header {}", index).as_bytes())
+                .unwrap();
+        }
+        let header = alice.header_for_test(&packet).unwrap();
+        assert_eq!(header.n, 5);
+
+        let open = OpenHeader::parse(&packet).unwrap();
+        let clear = &packet[..open.header_offset];
+        assert!(
+            !packet.windows(32).any(|window| window == header.dh_pub),
+            "dh_pub must not appear in the clear header"
+        );
+        assert!(
+            !packet
+                .windows(SESSION_ID_SIZE)
+                .any(|window| window == alice.session_id()),
+            "session_id must not appear in the clear header"
+        );
+        assert!(
+            !clear.windows(4).any(|window| window == header.n.to_le_bytes()),
+            "message counter n must be encrypted"
+        );
+    }
+
+    #[test]
+    fn bootstrap_nonce_is_only_in_the_bootstrap_packet() {
+        let (mut alice, mut bob) = pair();
+        let first = alice.encrypt(b"first").unwrap();
+        let open = OpenHeader::parse(&first).unwrap();
+        assert!(
+            open.bootstrap_nonce.is_some(),
+            "first session packet must carry the bootstrap nonce"
+        );
+        assert_eq!(bob.decrypt(&first, &SHARED).unwrap(), b"first");
+
+        let reply = bob.encrypt(b"reply").unwrap();
+        assert_eq!(alice.decrypt(&reply, &SHARED).unwrap(), b"reply");
+
+        let second = alice.encrypt(b"second").unwrap();
+        let open = OpenHeader::parse(&second).unwrap();
+        assert!(
+            open.bootstrap_nonce.is_none(),
+            "non-bootstrap packets must not repeat the bootstrap nonce"
+        );
+        let session_nonce = alice.sessions[0].descriptor.nonce;
+        assert!(
+            !second
+                .windows(BOOTSTRAP_NONCE_SIZE)
+                .any(|window| window == session_nonce),
+            "bootstrap nonce bytes must be absent from later packets"
+        );
+    }
+
+    #[test]
+    fn tampered_encrypted_header_fails_authentication() {
+        let (mut alice, mut bob) = pair();
+        let mut packet = alice.encrypt(b"header auth").unwrap();
+        let open = OpenHeader::parse(&packet).unwrap();
+        packet[open.header_offset] ^= 0x01;
+
+        assert!(bob.decrypt(&packet, &SHARED).is_err());
+    }
+
+    #[test]
+    fn header_key_rotates_with_epoch() {
+        let (mut alice, mut bob) = pair();
+        let first = alice.encrypt(b"epoch-0").unwrap();
+        assert_eq!(bob.decrypt(&first, &SHARED).unwrap(), b"epoch-0");
+        let reply = bob.encrypt(b"reply").unwrap();
+        assert_eq!(alice.decrypt(&reply, &SHARED).unwrap(), b"reply");
+
+        let second = alice.encrypt(b"epoch-1").unwrap();
+        let first_header = alice.header_for_test(&first).unwrap();
+        let second_header = alice.header_for_test(&second).unwrap();
+        assert_ne!(first_header.epoch_id, second_header.epoch_id);
+
+        let secret = &alice.sessions[0].header_secret;
+        let key0 = derive_header_key(secret, first_header.epoch_id).unwrap();
+        let key1 = derive_header_key(secret, second_header.epoch_id).unwrap();
+        assert_ne!(*key0, *key1, "header key must rotate with the epoch");
+    }
+
+    #[test]
+    fn randomized_padding_is_not_correlated_with_counter() {
+        let (mut alice, _bob) = pair();
+        let mut lengths = Vec::new();
+        for index in 0..24u32 {
+            let packet = alice.encrypt(b"same plaintext").unwrap();
+            let header = alice.header_for_test(&packet).unwrap();
+            assert_eq!(header.n, index);
+            assert!(
+                packet.len() >= crate::crypto::SIZE_TINY && packet.len() <= crate::crypto::SIZE_TINY + crate::crypto::SIZE_TINY / 8,
+                "unexpected bucket size {}",
+                packet.len()
+            );
+            lengths.push(packet.len());
+        }
+
+        assert!(
+            lengths.windows(2).any(|pair| pair[0] != pair[1]),
+            "randomized padding must vary inside the bucket: {:?}",
+            lengths
+        );
+    }
+
+    #[test]
+    fn v2_packet_is_rejected_with_unsupported_version() {
+        let (mut alice, mut bob) = pair();
+        let mut packet = alice.encrypt(b"v2 downgrade").unwrap();
+        packet[0] = 2;
+
+        let error = bob.decrypt(&packet, &SHARED).unwrap_err();
+        assert_error(&error, RatchetError::UnsupportedVersion(2));
+    }
+
+    #[test]
+    fn session_alias_is_stable_hides_session_id_and_is_not_the_nonce() {
+        let (mut alice, mut bob) = pair();
+        let first = alice.encrypt(b"one").unwrap();
+        let alias = OpenHeader::parse(&first).unwrap().alias;
+        assert_eq!(alias, session_alias(&alice.session_id()).unwrap());
+        assert_ne!(alias, alice.session_id());
+
+        assert_eq!(bob.decrypt(&first, &SHARED).unwrap(), b"one");
+        let reply = bob.encrypt(b"reply").unwrap();
+        assert_eq!(alice.decrypt(&reply, &SHARED).unwrap(), b"reply");
+
+        // Серия пакетов одной сессии: открытый стабильный идентификатор —
+        // только alias, и он не равен session_id.
+        for index in 0..5 {
+            let packet = alice
+                .encrypt(format!("series-{}", index).as_bytes())
+                .unwrap();
+            let open = OpenHeader::parse(&packet).unwrap();
+            assert_eq!(open.alias, alias);
+            assert_ne!(open.alias, alice.session_id());
+        }
+    }
+
+    #[test]
+    fn packet_size_validation_accepts_randomized_buckets_only() {
+        assert!(is_valid_packet_len(256));
+        assert!(is_valid_packet_len(256 + 256 / 8));
+        assert!(!is_valid_packet_len(255));
+        assert!(!is_valid_packet_len(256 + 256 / 8 + 1));
+        assert!(is_valid_packet_len(65536 + 65536 / 8));
+    }
+
 }

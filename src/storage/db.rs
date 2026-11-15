@@ -27,6 +27,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use zeroize::Zeroizing;
 
+use crate::crypto::secret::SecretBytes;
 use crate::storage::SafeFSOps;
 use crate::types::{truncate_display, FileHash, IdentityHash};
 use crate::vault::{MasterKey, Vault};
@@ -924,22 +925,15 @@ impl Storage {
         Ok(snapshot)
     }
 
-    /// Затирает `user.db`, `user.db-wal` и `user.db-shm` нулями и удаляет их.
+    /// Затирает `user.db` вместе с `-journal`, `-wal` и `-shm` нулями и
+    /// удаляет их.
     fn purge_legacy_files(db_path: &Path) {
-        let file_name = db_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(LEGACY_DB_FILE_NAME);
-
-        for suffix in ["", "-wal", "-shm"] {
-            let path = db_path.with_file_name(format!("{}{}", file_name, suffix));
-            if let Err(e) = secure_remove_file(&path) {
-                log::warn!(
-                    "failed to securely remove legacy database file {:?}: {:#}",
-                    path,
-                    e
-                );
-            }
+        if let Err(e) = secure_remove_file(db_path) {
+            log::warn!(
+                "failed to securely remove legacy database file {:?}: {:#}",
+                db_path,
+                e
+            );
         }
     }
 
@@ -1511,7 +1505,11 @@ impl Storage {
     }
 
     /// Загружает состояние храповика комнаты, если оно есть в `vault.dat`.
-    pub fn load_ratchet_state(&self, room_hash: &str) -> Result<Option<Vec<u8>>> {
+    ///
+    /// Возвращает `SecretBytes`: снапшот содержит корневые/цепные ключи и
+    /// приватные DH-ключи, поэтому он затирается при `drop` и не может
+    /// случайно утечь как обычный `Vec<u8>`.
+    pub fn load_ratchet_state(&self, room_hash: &str) -> Result<Option<SecretBytes>> {
         let conn = self.conn()?;
         conn.query_row(
             "SELECT state FROM ratchet_states WHERE room_hash = ?1",
@@ -1519,6 +1517,7 @@ impl Storage {
             |row| row.get::<_, Vec<u8>>(0),
         )
         .optional()
+        .map(|state| state.map(SecretBytes::new))
         .map_err(|e| anyhow!("failed to load ratchet state: {}", e))
     }
 
@@ -1823,7 +1822,37 @@ fn legacy_value_as_string(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Re
 }
 
 /// Перезаписывает файл нулями и удаляет его.
+///
+/// Для основного файла также удаляются SQLite-сателлиты `-journal`, `-wal`
+/// и `-shm`: они могут содержать данные и переживают удаление основного
+/// файла. Отсутствие сателлита считается нормой, остальные ошибки
+/// накапливаются и возвращаются как ошибка.
 fn secure_remove_file(path: &Path) -> Result<()> {
+    let mut targets = Vec::with_capacity(4);
+    targets.push(path.to_path_buf());
+
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        targets.push(std::path::PathBuf::from(sidecar));
+    }
+
+    let mut first_error = None;
+    for target in targets {
+        if let Err(e) = secure_remove_one(&target) {
+            if first_error.is_none() {
+                first_error = Some(e);
+            }
+        }
+    }
+
+    match first_error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+fn secure_remove_one(path: &Path) -> Result<()> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -2318,6 +2347,50 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn secure_remove_file_removes_sqlite_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join(LEGACY_DB_FILE_NAME);
+
+        for suffix in ["", "-journal", "-wal", "-shm"] {
+            let path = dir
+                .path()
+                .join(format!("{}{}", LEGACY_DB_FILE_NAME, suffix));
+            fs::write(&path, b"secret").unwrap();
+        }
+
+        secure_remove_file(&db_path).unwrap();
+
+        for suffix in ["", "-journal", "-wal", "-shm"] {
+            let path = dir
+                .path()
+                .join(format!("{}{}", LEGACY_DB_FILE_NAME, suffix));
+            assert!(!path.exists(), "file still exists: {:?}", path);
+        }
+
+        // Повторный вызов на отсутствующих файлах — не ошибка.
+        secure_remove_file(&db_path).unwrap();
+    }
+
+    #[test]
+    fn secure_remove_file_reports_non_notfound_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join(LEGACY_DB_FILE_NAME);
+        fs::write(&db_path, b"main").unwrap();
+
+        // Каталог на месте `-journal`: remove_file вернёт ошибку, которую
+        // нельзя молча игнорировать.
+        let journal = dir
+            .path()
+            .join(format!("{}-journal", LEGACY_DB_FILE_NAME));
+        fs::create_dir(&journal).unwrap();
+        fs::write(journal.join("keep"), b"x").unwrap();
+
+        assert!(secure_remove_file(&db_path).is_err());
+        // Основной файл всё равно удалён: ошибка сателлита не блокирует wipe.
+        assert!(!db_path.exists());
     }
 
     #[test]

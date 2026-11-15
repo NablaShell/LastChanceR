@@ -6,9 +6,8 @@ use std::time::Duration;
 use crate::network::{build_http_client, Config};
 use crate::types::{truncate_display, FileHash};
 
-const MAX_UPLOAD_SIZE: usize = 100 * 1024 * 1024; // 100 MB
-const ALLOWED_PACKET_SIZES: [usize; 4] = [256, 1024, 4096, 65536];
-// Один клиент на всё; таймаут 120s покрывает upload до 100 MB.
+const MAX_UPLOAD_SIZE: usize = crate::crypto::FILE_MAX_ENVELOPE;
+// Один клиент на всё; таймаут 120s покрывает upload до 128 MiB.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub struct Sender {
@@ -59,11 +58,10 @@ impl Sender {
     }
 
     pub async fn send_message(&self, target_hash: &str, packet: &[u8]) -> Result<()> {
-        if !ALLOWED_PACKET_SIZES.contains(&packet.len()) {
+        if !crate::crypto::ratchet::is_valid_packet_len(packet.len()) {
             return Err(anyhow!(
-                "invalid packet size {} (allowed: {:?})",
-                packet.len(),
-                ALLOWED_PACKET_SIZES
+                "invalid packet size {} (expected a v3 bucket with randomized padding)",
+                packet.len()
             ));
         }
 
@@ -133,14 +131,15 @@ impl Sender {
         ))
     }
 
-    pub async fn upload_file(&self, payload: &[u8], file_name: &str) -> Result<String> {
+    pub async fn upload_file(&self, payload: &[u8]) -> Result<String> {
         if payload.is_empty() {
             return Err(anyhow!("empty payload"));
         }
         if payload.len() > MAX_UPLOAD_SIZE {
             return Err(anyhow!(
-                "file too large: {} bytes (max 100MB)",
-                payload.len()
+                "file too large: {} bytes (max {} bytes)",
+                payload.len(),
+                MAX_UPLOAD_SIZE
             ));
         }
 
@@ -154,7 +153,8 @@ impl Sender {
             // Content-Length обязателен (API.md §5.1). body(Bytes) его ставит сам,
             // но явный заголовок защищает от регрессий.
             .header("Content-Length", payload.len().to_string())
-            .header("X-File-Name", file_name)
+            // Имя файла больше не передаётся открытым заголовком (M-4):
+            // оно лежит внутри AEAD-конверта v3.
             .header("X-Requested-With", "XMLHttpRequest")
             .header("User-Agent", "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:149.0) Gecko/20100101 Firefox/149.0")
             .header(&config.mask_header_name, &config.mask_header_value)
@@ -193,5 +193,81 @@ impl Sender {
                 Err(anyhow!("upload failed: {} - {}", code, body))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn upload_file_does_not_send_file_name_header() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("server address");
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+
+            loop {
+                let read = stream.read(&mut chunk).await.expect("read request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+
+            let headers_end = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|position| position + 4)
+                .unwrap_or(request.len());
+            let headers = String::from_utf8_lossy(&request[..headers_end]).to_ascii_lowercase();
+
+            let declared = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            while request.len() < headers_end + declared {
+                let read = stream.read(&mut chunk).await.expect("read body");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+            }
+
+            let body = "a".repeat(64);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+            stream.flush().await.ok();
+            headers
+        });
+
+        let config = Config {
+            file_server_url: format!("http://{}", addr),
+            ..Config::default()
+        };
+        let sender = Sender::new(&config).expect("sender");
+        let hash = sender.upload_file(b"encrypted envelope").await.expect("upload");
+        assert_eq!(hash.len(), 64);
+
+        let headers = server.await.expect("server task");
+        let forbidden = format!("x-{}-name", "file");
+        assert!(!headers.contains(&forbidden), "headers: {}", headers);
     }
 }

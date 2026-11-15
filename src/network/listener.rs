@@ -12,9 +12,6 @@ use crate::network::{
 };
 use crate::types::{truncate_display, FileHash};
 
-/// Один из допустимых размеров пакета (см. API.md §4.1).
-const ALLOWED_PACKET_SIZES: [usize; 4] = [256, 1024, 4096, 65536];
-
 /// Сколько секунд сервер держит входящий long-poll запрос.
 const LONG_POLL_WAIT_SECS: u64 = 25;
 /// Таймаут клиента должен быть больше `wait` с запасом на анонимные сети.
@@ -389,13 +386,13 @@ impl Listener {
         let messages = parse_multipart(&content_type, &bytes)
             .map_err(|e| PullError::Body(BodyError::Multipart(e)))?;
 
-        // Валидация размеров (API.md §4.1: ровно 256/1024/4096/65536)
+        // Валидация размеров: v3 использует bucket + рандомизацию внутри
+        // bucket, поэтому проверяем диапазон, а не точное значение.
         for m in &messages {
-            if !ALLOWED_PACKET_SIZES.contains(&m.len()) {
+            if !crate::crypto::ratchet::is_valid_packet_len(m.len()) {
                 log::warn!(
-                    "[LISTENER] packet size {} is not in allowed grid {:?}",
-                    m.len(),
-                    ALLOWED_PACKET_SIZES
+                    "[LISTENER] packet size {} is outside the v3 padding grid",
+                    m.len()
                 );
             }
         }

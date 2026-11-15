@@ -1,4 +1,5 @@
 // src/identity/mod.rs
+use crate::crypto::secret::{Ed25519Seed, SecretBytes, SecretString, X25519Priv};
 use crate::storage::SafeFSOps;
 use crate::types::{truncate_display, IdentityHash};
 use crate::vault::{self, MasterKey, Vault};
@@ -11,7 +12,9 @@ use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::Zeroizing;
 
 pub const IDENTITY_FILE_NAME: &str = "identity.json";
 
@@ -408,17 +411,61 @@ pub fn fingerprint_hex(ed25519_pub: &[u8; 32], x25519_pub: &[u8; 32]) -> String 
     hex::encode(hasher.finalize())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Личность пользователя.
+///
+/// Секретные поля (`seed_phrase`, `private_key`, `ed25519_private_key`)
+/// хранятся в затираемых обёртках и никогда не печатаются через `Debug`.
+/// `Clone` реализован вручную: единственное место, где секреты
+/// дублируются, — [`Clone::clone`] менеджера личности (кэш и возврат
+/// владельцу), и это явно помечено.
+#[derive(Serialize, Deserialize)]
 pub struct Identity {
     pub nickname: String,
-    pub seed_phrase: String,
+    pub seed_phrase: SecretString,
     pub public_key: Vec<u8>,
-    pub private_key: Vec<u8>,
+    pub private_key: SecretBytes,
     pub ed25519_public_key: Vec<u8>,
-    pub ed25519_private_key: Vec<u8>,
+    pub ed25519_private_key: SecretBytes,
     pub hash: String,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+impl fmt::Debug for Identity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Печатаем только публичные части и координаты. Секреты остаются
+        // скрытыми даже при `{:?}`/`{:#?}` в логах и panic-сообщениях.
+        f.debug_struct("Identity")
+            .field("nickname", &self.nickname)
+            .field("public_key", &hex::encode(&self.public_key))
+            .field("ed25519_public_key", &hex::encode(&self.ed25519_public_key))
+            .field("hash", &self.hash)
+            .field("seed_phrase", &self.seed_phrase)
+            .field("private_key", &self.private_key)
+            .field("ed25519_private_key", &self.ed25519_private_key)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
+}
+
+impl Clone for Identity {
+    fn clone(&self) -> Self {
+        // SECURITY(M-5): единственная точка копирования секретов Identity.
+        // Вызывается при кэшировании в IdentityManager. Новые вызовы
+        // `Identity::clone()` должны быть обоснованы при ревью.
+        Self {
+            nickname: self.nickname.clone(),
+            seed_phrase: self.seed_phrase.duplicate(),
+            public_key: self.public_key.clone(),
+            private_key: self.private_key.duplicate(),
+            ed25519_public_key: self.ed25519_public_key.clone(),
+            ed25519_private_key: self.ed25519_private_key.duplicate(),
+            hash: self.hash.clone(),
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+    }
 }
 
 pub struct IdentityManager {
@@ -446,15 +493,15 @@ impl IdentityManager {
     }
 
     pub fn generate_new_identity(&mut self, nickname: &str) -> Result<Identity> {
-        let mut entropy = [0u8; 32];
-        OsRng.fill_bytes(&mut entropy);
+        let mut entropy = Zeroizing::new([0u8; 32]);
+        OsRng.fill_bytes(entropy.as_mut());
 
-        let mnemonic = Mnemonic::from_entropy(&entropy)
+        let mnemonic = Mnemonic::from_entropy(entropy.as_ref())
             .map_err(|e| anyhow!("failed to generate mnemonic: {}", e))?;
-        let seed_phrase = mnemonic.to_string();
+        let seed_phrase = SecretString::new(mnemonic.to_string());
 
-        let seed = mnemonic.to_seed("");
-        let keys = derive_keys_from_seed(&seed)?;
+        let seed = Zeroizing::new(mnemonic.to_seed(""));
+        let keys = derive_keys_from_seed(seed.as_ref())?;
 
         let nickname = if nickname.is_empty() {
             format!("user_{}", &keys.identity_hash[..8])
@@ -589,11 +636,15 @@ impl IdentityManager {
             self.load_or_create(nickname)?;
         }
 
-        if let Some(identity) = self.cached_id.as_mut() {
+        // Забираем личность из кэша, чтобы не дублировать секреты ради
+        // изменения одного ника. `save` вернёт копию в кэш.
+        if let Some(mut identity) = self.cached_id.take() {
             identity.nickname = nickname.to_string();
             identity.updated_at = chrono::Utc::now().timestamp();
-            let identity_clone = identity.clone();
-            self.save(&identity_clone)?;
+            if let Err(e) = self.save(&identity) {
+                self.cached_id = Some(identity);
+                return Err(e);
+            }
         }
 
         Ok(())
@@ -607,12 +658,12 @@ impl Identity {
     /// пользователя приводится к каноническому виду до проверки контрольной
     /// суммы. Невалидная фраза возвращает ошибку.
     pub fn from_mnemonic(seed_phrase: &str, nickname: &str) -> Result<Identity> {
-        let normalized = normalize_seed_phrase(seed_phrase);
-        let mnemonic = Mnemonic::parse(&normalized)
+        let normalized = SecretString::new(normalize_seed_phrase(seed_phrase));
+        let mnemonic = Mnemonic::parse(normalized.expose())
             .map_err(|e| anyhow!("некорректная мнемоническая фраза: {}", e))?;
 
-        let seed = mnemonic.to_seed("");
-        let keys = derive_keys_from_seed(&seed)?;
+        let seed = Zeroizing::new(mnemonic.to_seed(""));
+        let keys = derive_keys_from_seed(seed.as_ref())?;
 
         let nickname = if nickname.trim().is_empty() {
             format!("user_{}", &keys.identity_hash[..8])
@@ -647,50 +698,62 @@ fn normalize_seed_phrase(raw: &str) -> String {
 
 struct DerivedKeys {
     x25519_public: Vec<u8>,
-    x25519_private: Vec<u8>,
+    x25519_private: SecretBytes,
     ed25519_public: Vec<u8>,
-    ed25519_private: Vec<u8>,
+    ed25519_private: SecretBytes,
     identity_hash: String,
 }
 
+/// Выводит ключи личности из BIP-39 seed.
+///
+/// Промежуточные значения (`x_priv_raw`, `ed_seed`) живут в обёртках с
+/// `ZeroizeOnDrop`, а `SigningKey`/`StaticSecret` затираются самими
+/// библиотеками. Входной seed не копируется: вызывающий хранит его в
+/// `Zeroizing` и затирает сразу после вызова (см. [`Zeroizing`]).
 fn derive_keys_from_seed(seed: &[u8]) -> Result<DerivedKeys> {
     // X25519 via HKDF
     let hkdf_x = Hkdf::<Sha256>::new(None, seed);
-    let mut x_priv_raw = [0u8; 32];
+    let mut x_priv_raw = X25519Priv::from_bytes([0u8; 32]);
     hkdf_x
-        .expand(b"X25519_E2EE_Key_v1", &mut x_priv_raw)
+        .expand(b"X25519_E2EE_Key_v1", x_priv_raw.expose_mut())
         .map_err(|e| anyhow!("hkdf x25519: {}", e))?;
 
-    let private_key = StaticSecret::from(x_priv_raw);
+    let private_key = StaticSecret::from(*x_priv_raw.expose());
     let public_key = PublicKey::from(&private_key);
 
-    let x25519_priv = private_key.to_bytes().to_vec();
+    let x25519_private = SecretBytes::from_slice(private_key.as_bytes());
     let x25519_pub = public_key.as_bytes().to_vec();
 
     // Ed25519 via HKDF
     let hkdf_e = Hkdf::<Sha256>::new(None, seed);
-    let mut ed_seed = [0u8; 32];
+    let mut ed_seed = Ed25519Seed::from_bytes([0u8; 32]);
     hkdf_e
-        .expand(b"Ed25519_Auth_Key_v1", &mut ed_seed)
+        .expand(b"Ed25519_Auth_Key_v1", ed_seed.expose_mut())
         .map_err(|e| anyhow!("hkdf ed25519: {}", e))?;
 
-    let signing_key = SigningKey::from_bytes(&ed_seed);
+    let signing_key = SigningKey::from_bytes(ed_seed.expose());
     let verifying_key = signing_key.verifying_key();
 
     let ed25519_pub = verifying_key.as_bytes().to_vec();
-    let ed25519_priv = signing_key.to_bytes().to_vec();
+    let ed25519_private = {
+        let bytes = Zeroizing::new(signing_key.to_bytes());
+        SecretBytes::from_slice(bytes.as_ref())
+    };
 
-    // Hash = SHA256(Ed25519PublicKey)
+    // Промежуточные буферы не должны доживать до выхода из функции.
+    drop(x_priv_raw);
+    drop(ed_seed);
+
+    // Hash = SHA256(Ed25519PublicKey) — публичное значение, не секрет.
     let mut hasher = Sha256::new();
     hasher.update(&ed25519_pub);
-    let hash_result = hasher.finalize();
-    let hash = hex::encode(hash_result);
+    let hash = hex::encode(hasher.finalize());
 
     Ok(DerivedKeys {
         x25519_public: x25519_pub,
-        x25519_private: x25519_priv,
+        x25519_private,
         ed25519_public: ed25519_pub,
-        ed25519_private: ed25519_priv,
+        ed25519_private,
         identity_hash: hash,
     })
 }
@@ -704,7 +767,7 @@ impl Identity {
     pub fn validate(&self) -> Result<()> {
         let ed25519_private: [u8; 32] = self
             .ed25519_private_key
-            .as_slice()
+            .expose()
             .try_into()
             .map_err(|_| anyhow!("identity has invalid ed25519 private key length"))?;
         let ed25519_public: [u8; 32] = self
@@ -714,7 +777,7 @@ impl Identity {
             .map_err(|_| anyhow!("identity has invalid ed25519 public key length"))?;
         let x25519_private: [u8; 32] = self
             .private_key
-            .as_slice()
+            .expose()
             .try_into()
             .map_err(|_| anyhow!("identity has invalid x25519 private key length"))?;
         let x25519_public: [u8; 32] = self
@@ -768,12 +831,15 @@ mod tests {
         let first = Identity::from_mnemonic(VALID_PHRASE, "").unwrap();
         let second = Identity::from_mnemonic(VALID_PHRASE, "").unwrap();
 
-        assert_eq!(first.seed_phrase, VALID_PHRASE);
+        assert_eq!(first.seed_phrase.expose(), VALID_PHRASE);
         assert_eq!(first.hash, second.hash);
         assert_eq!(first.public_key, second.public_key);
-        assert_eq!(first.private_key, second.private_key);
+        assert_eq!(first.private_key.expose(), second.private_key.expose());
         assert_eq!(first.ed25519_public_key, second.ed25519_public_key);
-        assert_eq!(first.ed25519_private_key, second.ed25519_private_key);
+        assert_eq!(
+            first.ed25519_private_key.expose(),
+            second.ed25519_private_key.expose()
+        );
         assert_eq!(first.nickname, second.nickname);
         assert!(first.nickname.starts_with("user_"));
     }
@@ -783,7 +849,7 @@ mod tests {
         let messy = format!("  {}  ", VALID_PHRASE.to_uppercase().replace(' ', " \t\n "));
         let identity = Identity::from_mnemonic(&messy, "alice").unwrap();
 
-        assert_eq!(identity.seed_phrase, VALID_PHRASE);
+        assert_eq!(identity.seed_phrase.expose(), VALID_PHRASE);
         assert_eq!(identity.nickname, "alice");
         assert_eq!(identity.hash, Identity::from_mnemonic(VALID_PHRASE, "bob").unwrap().hash);
     }
@@ -944,6 +1010,69 @@ mod tests {
         identity.validate().unwrap();
         identity.hash = "00".repeat(32);
         assert!(identity.validate().is_err());
+    }
+
+    #[test]
+    fn identity_debug_redacts_all_secret_material() {
+        let identity = Identity::from_mnemonic(VALID_PHRASE, "alice").unwrap();
+
+        let x_private = hex::encode(identity.private_key.expose());
+        let ed_private = hex::encode(identity.ed25519_private_key.expose());
+        let debug = format!("{:#?}", identity);
+
+        assert!(!debug.contains(&x_private), "x25519 private key leaked");
+        assert!(!debug.contains(&ed_private), "ed25519 private key leaked");
+        assert!(!debug.contains("abandon"), "seed phrase leaked");
+        assert!(debug.contains("<secret>"));
+        assert_eq!(format!("{:?}", identity.private_key), "<secret>");
+        assert_eq!(format!("{:?}", identity.seed_phrase), "<secret>");
+    }
+
+    #[test]
+    fn identity_json_format_is_unchanged_by_secret_wrappers() {
+        let identity = Identity::from_mnemonic(VALID_PHRASE, "alice").unwrap();
+        let json = serde_json::to_string(&identity).unwrap();
+
+        // Секреты по-прежнему сериализуются как строка/массив чисел:
+        // этот формат читают существующие `identity.json`.
+        assert!(json.contains("\"seed_phrase\":\"abandon abandon"));
+        assert!(json.contains("\"private_key\":["));
+
+        let restored: Identity = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.seed_phrase.expose(), identity.seed_phrase.expose());
+        assert_eq!(
+            restored.private_key.expose(),
+            identity.private_key.expose()
+        );
+        restored.validate().unwrap();
+    }
+
+    #[test]
+    fn derive_keys_from_seed_leaves_no_seed_in_results() {
+        let mut seed = Zeroizing::new([0x42u8; 64]);
+        let keys = derive_keys_from_seed(seed.as_ref()).unwrap();
+
+        // Промежуточные буферы живут в ZeroizeOnDrop-обёртках. Исходный
+        // seed вызывающий может затереть сразу после вывода ключей.
+        zeroize::Zeroize::zeroize(&mut *seed);
+        assert!(seed.iter().all(|byte| *byte == 0));
+
+        assert_eq!(keys.x25519_private.expose().len(), 32);
+        assert_eq!(keys.ed25519_private.expose().len(), 32);
+        assert_eq!(keys.x25519_public.len(), 32);
+        assert_eq!(keys.ed25519_public.len(), 32);
+    }
+
+    #[test]
+    fn cloned_identity_keeps_independent_secret_copies() {
+        // Копия нужна кэшу менеджера; проверяем, что она не разделяет
+        // изменяемый буфер с оригиналом.
+        let identity = Identity::from_mnemonic(VALID_PHRASE, "alice").unwrap();
+        let mut cloned = identity.clone();
+        cloned.private_key.expose_mut()[0] ^= 0xFF;
+
+        assert_ne!(cloned.private_key.expose(), identity.private_key.expose());
+        assert_eq!(cloned.hash, identity.hash);
     }
 
     #[test]

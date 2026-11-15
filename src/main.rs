@@ -5639,7 +5639,7 @@ fn run_recovery(base_dir: &str) -> Result<Vault> {
     };
 
     let mut manager = IdentityManager::new(base_dir.to_string(), vault.clone());
-    let restored = manager.restore_from_mnemonic(&identity.seed_phrase, &identity.nickname)?;
+    let restored = manager.restore_from_mnemonic(identity.seed_phrase.expose(), &identity.nickname)?;
     manager.save(&restored)?;
 
     println!("Идентичность восстановлена.");

@@ -7,10 +7,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
-use zeroize::Zeroizing;
 
 use crate::crypto;
 use crate::crypto::ratchet::{self, RatchetState, Role as RatchetRole};
+use crate::crypto::secret::SecretBytes;
 use crate::i18n::{tr, Lang};
 use crate::identity::{
     hash_ed25519_public, Identity, IdentityDoc, IdentityInvite, IdentityManager,
@@ -19,6 +19,7 @@ use crate::network::{Config, Listener, Sender};
 use crate::storage::{
     Contact, Message, SafeFSOps, Storage, TOFU_CHANGED, TOFU_PENDING, TOFU_VERIFIED,
 };
+use crate::storage::paths::create_private_file;
 use crate::types::{parse_file_notification_checked, truncate_display, FileHash};
 use crate::vault::{self, MasterKey, Vault};
 
@@ -178,16 +179,7 @@ fn write_file_atomically(path: &Path, data: &[u8]) -> Result<()> {
         rand::random::<u64>()
     ));
 
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-
-    let mut file = options
-        .open(&temp_path)
+    let mut file = create_private_file(&temp_path, 0o600)
         .map_err(|e| anyhow!("create temporary file {}: {}", temp_path.display(), e))?;
 
     let write_result = (|| -> Result<()> {
@@ -221,11 +213,8 @@ fn write_file_atomically(path: &Path, data: &[u8]) -> Result<()> {
         }
     }
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
+    // Права 0600 уже выставлены на временном файле до записи данных и
+    // сохраняются при rename.
 
     Ok(())
 }
@@ -447,7 +436,7 @@ fn ensure_ratchet_state(
 
     let role = ratchet_role_for(identity_hash, room_hash);
     let state = match restored {
-        Some(bytes) => match RatchetState::from_bytes(&bytes) {
+        Some(bytes) => match RatchetState::from_bytes(bytes) {
             Ok(mut state) => {
                 state.retire_sessions(retired.iter().copied());
                 state
@@ -481,7 +470,7 @@ fn persist_ratchet(
 }
 
 /// Открытый текст и обновлённое состояние храповика после расшифровки.
-type DecryptedRatchet = (Vec<u8>, Option<Zeroizing<Vec<u8>>>);
+type DecryptedRatchet = (Vec<u8>, Option<SecretBytes>);
 
 /// Расшифровывает пакет и возвращает открытый текст вместе с обновлённым
 /// состоянием храповика (если оно подлежит сохранению).
@@ -618,7 +607,7 @@ impl App {
         }
 
         let mut signing_key_bytes = [0u8; 32];
-        signing_key_bytes.copy_from_slice(&identity.ed25519_private_key);
+        signing_key_bytes.copy_from_slice(identity.ed25519_private_key.expose());
         let signing_key = SigningKey::from_bytes(&signing_key_bytes);
         let ed25519_pub_key_hex = identity.get_ed25519_public_key_hex();
 
@@ -652,7 +641,10 @@ impl App {
                     }
                 }
 
-                match crypto::generate_shared_key(&identity.private_key, &contact.public_key) {
+                match crypto::generate_shared_key(
+                    identity.private_key.expose(),
+                    &contact.public_key,
+                ) {
                     Ok(secret) => {
                         secrets.insert(contact.hash.clone(), secret);
                     }
@@ -717,7 +709,12 @@ impl App {
         let listener = self.listener.clone();
         let identity_hash = self.identity.hash.clone();
         let identity_pub_key = self.identity.get_public_key_hex();
-        let identity_priv_key = self.identity.private_key.clone();
+        // Один экземпляр на время жизни listener-таска. `Arc<SecretBytes>`
+        // затирает ключ при последнем drop; исходный буфер остаётся в
+        // `App` и не клонируется на каждой итерации pull-цикла.
+        let identity_priv_key = Arc::new(SecretBytes::from_slice(
+            self.identity.private_key.expose(),
+        ));
         // X-Identity-Key должен содержать hex(ed25519 public key), а не hash:
         // сервер сам считает SHA256(decoded_key) и сравнивает с target_hash.
         let ed25519_pub_key_hex = self.ed25519_pub_key_hex.clone();
@@ -805,11 +802,12 @@ impl App {
         retired_ratchet_sessions: &RetiredRatchetSessions,
         identity_hash: &str,
         identity_pub_key: &str,
-        identity_priv_key: &[u8],
+        identity_priv_key: &SecretBytes,
         event_sender: &mpsc::UnboundedSender<AppEvent>,
     ) {
-        // Сначала Double Ratchet, затем legacy-пакеты со статическим
-        // секретом: это позволяет принимать сообщения от старых клиентов.
+        // Единственный путь расшифровки — Double Ratchet с replay-защитой.
+        // Legacy-пакеты со статическим секретом (v1) удалены: у них не было
+        // ни счётчика, ни окна, поэтому они допускали бессрочный replay.
         let mut candidates: Vec<(String, [u8; 32])> = match shared_secrets.lock() {
             Ok(secrets) => secrets
                 .iter()
@@ -824,7 +822,7 @@ impl App {
         {
             if let Ok(public_key) = hex::decode(identity_pub_key) {
                 if let Ok(self_secret) =
-                    crypto::generate_shared_key(identity_priv_key, &public_key)
+                    crypto::generate_shared_key(identity_priv_key.expose(), &public_key)
                 {
                     candidates.push((identity_hash.to_string(), self_secret));
                 }
@@ -853,16 +851,6 @@ impl App {
                 from_hash = hash.clone();
                 ratchet_update = serialized;
                 break;
-            }
-        }
-
-        if decrypted_message.is_none() {
-            for (hash, secret) in &candidates {
-                if let Ok((decrypted, _)) = crypto::decrypt_message(&packet, secret) {
-                    decrypted_message = Some(decrypted);
-                    from_hash = hash.clone();
-                    break;
-                }
             }
         }
 
@@ -942,7 +930,7 @@ impl App {
                         room_has_ttl(room_ttls, &from_hash),
                         storage.as_ref(),
                         &from_hash,
-                        &bytes,
+                        bytes.expose(),
                     ) {
                         warn!("Failed to persist ratchet state: {:#}", e);
                     }
@@ -1014,6 +1002,9 @@ impl App {
 
     /// Seed-фраза вынесена из `/profile` в модальное окно `/recovery`,
     /// которое требует текущий мастер-пароль.
+    ///
+    /// Возвращается обычная `String` только для отображения в UI; хранимый
+    /// оригинал остаётся в `SecretString` и затирается при `drop`.
     pub fn get_seed_phrase(&self) -> String {
         self.identity_manager
             .lock()
@@ -1021,9 +1012,9 @@ impl App {
             .and_then(|manager| {
                 manager
                     .current()
-                    .map(|identity| identity.seed_phrase.clone())
+                    .map(|identity| identity.seed_phrase.expose().to_string())
             })
-            .unwrap_or_else(|| self.identity.seed_phrase.clone())
+            .unwrap_or_else(|| self.identity.seed_phrase.expose().to_string())
     }
 
     /// Публичный геттер актуального ника (используется TUI-статус-баром).
@@ -1145,7 +1136,8 @@ impl App {
             }
         };
 
-        let shared_secret = crypto::generate_shared_key(&self.identity.private_key, &pub_key)?;
+        let shared_secret =
+            crypto::generate_shared_key(self.identity.private_key.expose(), &pub_key)?;
 
         let nickname = invite.display_nickname();
         self.storage.upsert_verified_contact(
@@ -1358,7 +1350,7 @@ impl App {
         };
 
         if let Some(bytes) = serialized {
-            self.persist_ratchet_if_needed(room_hash, &bytes)?;
+            self.persist_ratchet_if_needed(room_hash, bytes.expose())?;
         }
 
         Ok(packet)
@@ -1425,7 +1417,7 @@ impl App {
 
             if !states.contains_key(room_hash) {
                 if let Some(bytes) = self.storage.load_ratchet_state(room_hash)? {
-                    match RatchetState::from_bytes(&bytes) {
+                    match RatchetState::from_bytes(bytes) {
                         Ok(mut state) => {
                             state.retire_sessions(retired);
                             states.insert(room_hash.to_string(), state);
@@ -1634,8 +1626,16 @@ impl App {
         // Get shared secret
         let shared_secret = self.get_shared_secret(room_hash)?;
 
-        // Encrypt file
-        let encrypted_data = crypto::encrypt_file(&file_data, &shared_secret)?;
+        // Encrypt file in the v3 envelope: name and real size are inside
+        // AEAD, and AAD binds file_id/room/sender/recipient.
+        let encrypted_data = crypto::encrypt_file_v3(
+            &file_data,
+            file_name,
+            &shared_secret,
+            room_hash,
+            &self.identity.hash,
+            room_hash,
+        )?;
 
         // Emit progress event
         self.emit_event(AppEvent::UploadProgress {
@@ -1644,7 +1644,7 @@ impl App {
         });
 
         // Upload file
-        let file_hash = match self.sender.upload_file(&encrypted_data, file_name).await {
+        let file_hash = match self.sender.upload_file(&encrypted_data).await {
             Ok(hash) => hash,
             Err(e) => {
                 self.emit_event(AppEvent::UploadError {
@@ -1723,9 +1723,16 @@ impl App {
         // среди полученных за сессию, не переключая активную комнату.
         let shared_secret = self.get_shared_secret(room_hash)?;
 
-        // Decrypt file
-        let file_data = match crypto::decrypt_file(&encrypted_data, &shared_secret) {
-            Ok(data) => data,
+        // Decrypt file. AAD canonicalises the identity pair, so the same
+        // call works for sent and received files in this room.
+        let file = match crypto::decrypt_file_v3(
+            &encrypted_data,
+            &shared_secret,
+            room_hash,
+            &self.identity.hash,
+            room_hash,
+        ) {
+            Ok(file) => file,
             Err(e) => {
                 self.emit_event(AppEvent::DownloadError {
                     error: e.to_string(),
@@ -1733,6 +1740,7 @@ impl App {
                 return Err(anyhow!("decryption failed: {}", e));
             }
         };
+        let file_data = file.data;
 
         // Save file. Путь выбирает пользователь (например, ./downloads/...),
         // поэтому пишем напрямую: SafeFSOps ограничивает запись каталогом данных.
@@ -1772,7 +1780,7 @@ impl App {
         // Check if self
         if room_hash == self.identity.hash {
             let secret =
-                crypto::generate_shared_key(&self.identity.private_key, &self.identity.public_key)?;
+                crypto::generate_shared_key(self.identity.private_key.expose(), &self.identity.public_key)?;
 
             let mut secrets = self.shared_secrets.lock().unwrap();
             secrets.insert(room_hash.to_string(), secret);
@@ -1781,7 +1789,10 @@ impl App {
 
         // Load from storage
         let contact = self.storage.get_contact(room_hash)?;
-        let secret = crypto::generate_shared_key(&self.identity.private_key, &contact.public_key)?;
+        let secret = crypto::generate_shared_key(
+            self.identity.private_key.expose(),
+            &contact.public_key,
+        )?;
 
         let mut secrets = self.shared_secrets.lock().unwrap();
         secrets.insert(room_hash.to_string(), secret);
@@ -2498,19 +2509,27 @@ mod tests {
         let hash = app.identity.hash.clone();
 
         let bootstrap = app.encrypt_with_ratchet(&hash, b"old-bootstrap").unwrap();
-        let old_session = ratchet::RatchetHeader::parse(&bootstrap)
+        let old_session = app
+            .ratchets
+            .lock()
             .unwrap()
-            .session_id;
+            .get(&hash)
+            .unwrap()
+            .session_id();
         let shared_secret = app.get_shared_secret(&hash).unwrap();
 
         app.clear_ratchet(&hash).unwrap();
 
         // Новая сессия получает свежий session_id и принимается.
         let fresh = app.encrypt_with_ratchet(&hash, b"fresh").unwrap();
-        assert_ne!(
-            ratchet::RatchetHeader::parse(&fresh).unwrap().session_id,
-            old_session
-        );
+        let fresh_session = app
+            .ratchets
+            .lock()
+            .unwrap()
+            .get(&hash)
+            .unwrap()
+            .session_id();
+        assert_ne!(fresh_session, old_session);
         let (plaintext, _) = try_ratchet_decrypt(
             &fresh,
             &hash,
@@ -2562,9 +2581,13 @@ mod tests {
         app.add_contact_with_ed25519(&invite).unwrap();
 
         let bootstrap = app.encrypt_with_ratchet(&hash, b"old-bootstrap").unwrap();
-        let old_session = ratchet::RatchetHeader::parse(&bootstrap)
+        let old_session = app
+            .ratchets
+            .lock()
             .unwrap()
-            .session_id;
+            .get(&hash)
+            .unwrap()
+            .session_id();
         let shared_secret = app.get_shared_secret(&hash).unwrap();
 
         app.clear_ratchet(&hash).unwrap();
@@ -2606,10 +2629,14 @@ mod tests {
         let (app, _temp_dir, _receiver) = setup_test_app();
         let hash = app.identity.hash.clone();
 
-        let bootstrap = app.encrypt_with_ratchet(&hash, b"prime").unwrap();
-        let old_session = ratchet::RatchetHeader::parse(&bootstrap)
+        let _bootstrap = app.encrypt_with_ratchet(&hash, b"prime").unwrap();
+        let old_session = app
+            .ratchets
+            .lock()
             .unwrap()
-            .session_id;
+            .get(&hash)
+            .unwrap()
+            .session_id();
         let reset = app
             .encrypt_with_ratchet(&hash, &crypto::encode_ratchet_reset())
             .unwrap();
@@ -2713,5 +2740,31 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().contains(".part-"))
             .collect();
         assert!(leftovers.is_empty(), "temporary file must be renamed/removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_file_write_failure_removes_temporary_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        // rename(2) не заменит файлом существующий непустой каталог.
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("keep"), b"keep").unwrap();
+
+        assert!(write_file_atomically(&target, b"payload").is_err());
+
+        assert!(target.is_dir());
+        assert_eq!(std::fs::read(target.join("keep")).unwrap(), b"keep");
+
+        for entry in std::fs::read_dir(dir.path()).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            assert!(!name.contains(".part-"), "temporary file left: {}", name);
+            if entry.path().is_file() {
+                let mode = entry.metadata().unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "unexpected mode for {}", name);
+            }
+        }
     }
 }
