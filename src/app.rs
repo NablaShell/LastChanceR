@@ -19,6 +19,7 @@ use crate::network::{Config, Listener, Sender};
 use crate::storage::{
     Contact, Message, SafeFSOps, Storage, TOFU_CHANGED, TOFU_PENDING, TOFU_VERIFIED,
 };
+use crate::types::{parse_file_notification_checked, truncate_display, FileHash};
 use crate::vault::{self, MasterKey, Vault};
 
 // ============================================================
@@ -571,7 +572,7 @@ impl App {
                     if !valid_hash {
                         warn!(
                             "Skipping contact {}: stored ed25519 key contradicts identity hash",
-                            &contact.hash[..16.min(contact.hash.len())]
+                            truncate_display(&contact.hash, 16)
                         );
                         continue;
                     }
@@ -584,7 +585,7 @@ impl App {
                     Err(e) => {
                         warn!(
                             "Failed to generate shared secret for {}: {}",
-                            &contact.hash[..16.min(contact.hash.len())],
+                            truncate_display(&contact.hash, 16),
                             e
                         );
                     }
@@ -607,7 +608,7 @@ impl App {
         info!(
             "App initialized: nickname={}, hash={}...",
             identity.nickname,
-            &identity.hash[..16.min(identity.hash.len())]
+            truncate_display(&identity.hash, 16)
         );
 
         Ok(Self {
@@ -844,10 +845,24 @@ impl App {
                     room_ttls,
                     &from_hash,
                 );
-                info!("Ratchet session reset by peer for {}", &from_hash[..16.min(from_hash.len())]);
+                info!(
+                    "Ratchet session reset by peer for {}",
+                    truncate_display(&from_hash, 16)
+                );
                 return;
             }
             Ok(crypto::E2ePayload::Text { text, ttl_seconds }) => {
+                // Файловое уведомление приходит внутри расшифрованного
+                // текста, но hash всё равно недоверенный. Проверяем до
+                // сохранения ratchet/message, чтобы отбросить пакет целиком.
+                if let Err(e) = parse_file_notification_checked(&text) {
+                    warn!(
+                        "Rejected file notification from {}: invalid file hash: {}",
+                        truncate_display(&from_hash, 16),
+                        e
+                    );
+                    return;
+                }
                 if let Some(bytes) = ratchet_update.take() {
                     if let Err(e) = persist_ratchet(
                         room_has_ttl(room_ttls, &from_hash),
@@ -861,18 +876,22 @@ impl App {
                 (text, ttl_seconds)
             }
             Err(e) => {
-                warn!("Malformed E2E payload from {}: {:#}", from_hash, e);
+                warn!(
+                    "Malformed E2E payload from {}: {:#}",
+                    truncate_display(&from_hash, 16),
+                    e
+                );
                 return;
             }
         };
 
         // Get sender name
         let from_name = if from_hash == identity_hash {
-            format!("{} (self)", &identity_hash[..8.min(identity_hash.len())])
+            format!("{} (self)", truncate_display(identity_hash, 8))
         } else {
             match storage.get_contact(&from_hash) {
                 Ok(contact) => contact.nickname,
-                Err(_) => from_hash[..8.min(from_hash.len())].to_string(),
+                Err(_) => truncate_display(&from_hash, 8),
             }
         };
 
@@ -1602,6 +1621,16 @@ impl App {
         file_hash: &str,
         save_path: &str,
     ) -> Result<()> {
+        // Хеш приходит из сообщения/UI и уходит в URL: валидируем до сети.
+        let bare_hash = file_hash.strip_prefix("sha256:").unwrap_or(file_hash);
+        FileHash::from_hex(bare_hash).map_err(|e| {
+            anyhow!(
+                "invalid file hash ({}…): {}",
+                truncate_display(file_hash, 16),
+                e
+            )
+        })?;
+
         // Emit download started event
         self.emit_event(AppEvent::DownloadStarted);
 

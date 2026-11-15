@@ -8,6 +8,7 @@ pub mod i18n;
 pub mod identity;
 pub mod network;
 pub mod storage;
+pub mod types;
 pub mod vault;
 
 pub use app::{App, AppEvent};

@@ -40,6 +40,7 @@ use lastchance::network::config::notify_level_label;
 use lastchance::storage::{
     Storage, LEGACY_DB_FILE_NAME, TOFU_CHANGED, TOFU_PENDING, TOFU_VERIFIED, VAULT_FILE_NAME,
 };
+use lastchance::types::{parse_file_notification, short_hash};
 use lastchance::{get_base_dir_with_override, vault, App, AppEvent, Config, Vault};
 
 // ============================================================
@@ -732,15 +733,6 @@ fn install_panic_hook() {
 // ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 // ============================================================
 
-fn short_hash(h: &str) -> String {
-    if h.len() > 12 {
-        let (head, tail) = h.split_at(6);
-        format!("{}…{}", head, &tail[tail.len() - 6..])
-    } else {
-        h.to_string()
-    }
-}
-
 fn now_time() -> String {
     chrono::Local::now().format("%H:%M:%S").to_string()
 }
@@ -916,39 +908,6 @@ fn load_room_feed(app: &App, state: &mut UiState) -> Vec<FeedEntry> {
             expires_at: None,
         }],
     }
-}
-
-/// Разбирает служебное сообщение о файле, которое отправляет `send_file_native`.
-fn parse_file_notification(text: &str) -> Option<(String, String)> {
-    if !text.contains('📎') {
-        return None;
-    }
-
-    let mut file_name = None;
-    let mut file_hash = None;
-
-    for line in text.lines() {
-        let line = line.trim();
-        if let Some(rest) = line
-            .strip_prefix("📎 Файл:")
-            .or_else(|| line.strip_prefix("📎 File:"))
-        {
-            file_name = Some(rest.trim().to_string());
-        } else if let Some(rest) = line
-            .strip_prefix("Хеш:")
-            .or_else(|| line.strip_prefix("Hash:"))
-        {
-            file_hash = Some(rest.trim().to_string());
-        }
-    }
-
-    let file_hash = file_hash.filter(|hash| !hash.is_empty())?;
-    let file_name = file_name.filter(|name| !name.is_empty()).unwrap_or_else(|| {
-        let raw = file_hash.strip_prefix("sha256:").unwrap_or(&file_hash);
-        format!("file_{}", raw.chars().take(8).collect::<String>())
-    });
-
-    Some((file_name, file_hash))
 }
 
 /// Регистрирует файл в состоянии сессии и возвращает его короткий номер.

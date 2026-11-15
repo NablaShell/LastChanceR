@@ -28,6 +28,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use zeroize::Zeroizing;
 
 use crate::storage::SafeFSOps;
+use crate::types::{truncate_display, FileHash, IdentityHash};
 use crate::vault::{MasterKey, Vault};
 
 /// Новый зашифрованный контейнер локальной базы.
@@ -1000,6 +1001,17 @@ impl Storage {
         fingerprint: Option<&str>,
         tofu_state: Option<&str>,
     ) -> Result<()> {
+        // Недоверенный identity hash (из invite/сервера) проверяется здесь,
+        // до записи в БД и до любых дальнейших срезов.
+        IdentityHash::from_hex(hash).map_err(|e| {
+            anyhow!(
+                "invalid contact hash ({}…, {} chars): {}",
+                truncate_display(hash, 16),
+                hash.chars().count(),
+                e
+            )
+        })?;
+
         let tofu_state = tofu_state.unwrap_or(TOFU_PENDING);
         let conn = self.conn()?;
         conn.execute(
@@ -1035,7 +1047,7 @@ impl Storage {
         if affected == 0 {
             return Err(anyhow!(
                 "contact not found: {}",
-                &hash[..hash.len().min(16)]
+                truncate_display(hash, 16)
             ));
         }
 
@@ -1064,7 +1076,7 @@ impl Storage {
                     row.get(6)?,
                 ))
             })
-            .map_err(|_e| anyhow!("contact not found: {}", &hash[..hash.len().min(16)]))?;
+            .map_err(|_e| anyhow!("contact not found: {}", truncate_display(hash, 16)))?;
 
         Ok(Contact {
             hash: hash_value,
@@ -1195,7 +1207,7 @@ impl Storage {
         if affected == 0 {
             return Err(anyhow!(
                 "contact not found: {}",
-                &contact_hash[..contact_hash.len().min(16)]
+                truncate_display(contact_hash, 16)
             ));
         }
 
@@ -1248,7 +1260,7 @@ impl Storage {
         if exists.is_none() {
             return Err(anyhow!(
                 "contact not found: {}",
-                &contact_hash[..contact_hash.len().min(16)]
+                truncate_display(contact_hash, 16)
             ));
         }
 
@@ -1633,6 +1645,26 @@ impl Storage {
         file_size: i64,
         is_ephemeral: bool,
     ) -> Result<()> {
+        // file_hash приходит от файлового сервера, room_hash — из сети.
+        // Оба должны быть валидным hex до записи в БД.
+        let bare_hash = file_hash.strip_prefix("sha256:").unwrap_or(file_hash);
+        FileHash::from_hex(bare_hash).map_err(|e| {
+            anyhow!(
+                "invalid file hash ({}…, {} chars): {}",
+                truncate_display(file_hash, 16),
+                file_hash.chars().count(),
+                e
+            )
+        })?;
+        IdentityHash::from_hex(room_hash).map_err(|e| {
+            anyhow!(
+                "invalid room hash ({}…, {} chars): {}",
+                truncate_display(room_hash, 16),
+                room_hash.chars().count(),
+                e
+            )
+        })?;
+
         // H-3: имена, размеры и hash файлов TTL-комнат не попадают на диск.
         if is_ephemeral {
             return Ok(());
@@ -1677,7 +1709,7 @@ impl Storage {
             .map_err(|_e| {
                 anyhow!(
                     "file record not found: {}",
-                    &file_hash[..file_hash.len().min(16)]
+                    truncate_display(file_hash, 16)
                 )
             })?;
 
@@ -2367,5 +2399,30 @@ mod tests {
             .load_retired_ratchet_sessions()
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn invalid_identifiers_are_rejected_before_db_write() {
+        let t = setup();
+        let room = "a".repeat(64);
+
+        for bad_hash in ["", "abc", &"я".repeat(64), &"😀".repeat(32)] {
+            assert!(
+                t.storage.add_contact(bad_hash, &[1u8; 32], "Bad").is_err(),
+                "invalid contact hash must be rejected"
+            );
+        }
+        assert!(t.storage.get_all_contacts().unwrap().is_empty());
+
+        assert!(t
+            .storage
+            .save_file_record("not-a-hash", &room, "file.bin", 1, false)
+            .is_err());
+        assert!(t.storage.get_room_files(&room).unwrap().is_empty());
+
+        assert!(t
+            .storage
+            .save_file_record(&"b".repeat(64), "short-room", "file.bin", 1, false)
+            .is_err());
     }
 }

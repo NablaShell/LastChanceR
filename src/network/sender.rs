@@ -4,6 +4,7 @@ use reqwest::Client;
 use std::sync::RwLock;
 use std::time::Duration;
 use crate::network::{build_http_client, Config};
+use crate::types::{truncate_display, FileHash};
 
 const MAX_UPLOAD_SIZE: usize = 100 * 1024 * 1024; // 100 MB
 const ALLOWED_PACKET_SIZES: [usize; 4] = [256, 1024, 4096, 65536];
@@ -168,11 +169,21 @@ impl Sender {
                     .text()
                     .await
                     .map_err(|e| anyhow!("read response: {}", e))?;
-                let file_hash = file_hash.trim().to_string();
+                let file_hash = file_hash.trim();
                 if file_hash.is_empty() {
                     return Err(anyhow!("server returned empty file hash"));
                 }
-                Ok(file_hash)
+                // Хеш от сервера — недоверенный ввод. Приводим к
+                // каноническому lower-case hex до использования в UI/URL.
+                let file_hash = FileHash::from_hex(file_hash).map_err(|e| {
+                    anyhow!(
+                        "server returned invalid file hash ({}…, {} chars): {}",
+                        truncate_display(file_hash, 16),
+                        file_hash.chars().count(),
+                        e
+                    )
+                })?;
+                Ok(file_hash.to_string())
             }
             411 => Err(anyhow!("missing Content-Length")),
             413 => Err(anyhow!("file too large (413)")),

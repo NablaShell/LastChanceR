@@ -1,5 +1,6 @@
 // src/identity/mod.rs
 use crate::storage::SafeFSOps;
+use crate::types::{truncate_display, IdentityHash};
 use crate::vault::{self, MasterKey, Vault};
 use anyhow::{anyhow, Result};
 use bip39::Mnemonic;
@@ -290,6 +291,16 @@ impl IdentityInvite {
             .get("hash")
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow!("invite is missing identity hash"))?;
+        // Валидация до сравнения и любых срезов: не-ASCII/короткая строка
+        // не должна доходить до бизнес-логики.
+        let hash_id = IdentityHash::from_hex(hash).map_err(|e| {
+            anyhow!(
+                "invalid identity hash in invite ({}…, {} chars): {}",
+                truncate_display(hash, 16),
+                hash.chars().count(),
+                e
+            )
+        })?;
         let doc_hex = params
             .get("doc")
             .filter(|value| !value.is_empty())
@@ -317,10 +328,10 @@ impl IdentityInvite {
         invite.verify()?;
 
         let computed_hash = invite.hash_hex();
-        if !hash.eq_ignore_ascii_case(&computed_hash) {
+        if hash_id.to_string() != computed_hash {
             return Err(anyhow!(
                 "identity hash mismatch: link has {}, but sha256(ed25519_pub) is {}",
-                hash,
+                hash_id,
                 computed_hash
             ));
         }
@@ -927,6 +938,23 @@ mod tests {
 
         let bad_x25519 = link.replacen(&hex::encode(invite.doc.x25519_pub), &hex::encode([15u8; 32]), 1);
         assert!(IdentityInvite::from_link(&bad_x25519).is_err());
+    }
+
+    #[test]
+    fn invite_rejects_invalid_hash_at_boundary() {
+        let signing_key = SigningKey::from_bytes(&[6u8; 32]);
+        let mut doc = test_doc(16);
+        doc.ed25519_pub = *signing_key.verifying_key().as_bytes();
+        let invite = IdentityInvite::sign(doc, &signing_key).unwrap();
+        let link = invite.to_link().unwrap();
+
+        for bad_hash in ["", "abc", &"я".repeat(64), &"😀".repeat(32)] {
+            let bad_link = link.replacen(&invite.hash_hex(), bad_hash, 1);
+            assert!(
+                IdentityInvite::from_link(&bad_link).is_err(),
+                "invalid hash must be rejected before parsing the document"
+            );
+        }
     }
 
     #[test]
