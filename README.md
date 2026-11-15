@@ -113,9 +113,10 @@ Losing the header key together with the epoch makes the message undecryptable, a
 ### Incoming routing by room alias (M-8)
 
 - The client keeps an in-memory `alias -> room` table (rebuilt at startup from persisted ratchet states and tombstones) and selects the room from the open header before touching any key.
-- Incoming checks have a fixed order: version and size → alias lookup → retired alias (`StaleSession`) → TTL tombstone alias (`StaleSession`) → bootstrap resolution → TTL tombstone `SHA256(session_id)` (`StaleSession`) → `(alias, nonce)` duplicate check → AEAD → ratchet epoch.
+- Incoming checks have a fixed order: version and size → alias lookup → retired alias (`StaleSession`) → TTL tombstone alias (`StaleSession`) → `(alias, nonce)` duplicate check → bootstrap resolution (cached and rate-limited) → TTL tombstone `SHA256(session_id)` (`StaleSession`) → AEAD → ratchet epoch.
 - A non-bootstrap packet with an unknown alias is dropped as `UnknownRoom` with zero decrypt attempts. No contact list is scanned and no packet is tried against several rooms.
-- The only multi-contact path is the first packet of a new session: it carries `bootstrap_nonce`, so the client compares cheap HKDF-derived aliases and runs AEAD for at most the single room that matched. This is bounded alias resolution, not ciphertext fan-out.
+- The only multi-contact path is the first packet of a new session: it carries `bootstrap_nonce`, so the client compares cheap HKDF-derived aliases and runs AEAD for at most the single room that matched. This is bounded alias resolution, not ciphertext fan-out. Successful `alias -> room` resolutions are cached (up to 256 entries), and unknown-bootstrap HKDF scans run under a token bucket (burst 16, one token refilled every 500 ms), so a flood of garbage aliases cannot force O(contacts) work per packet.
+- Header opening tries the last accepted `epoch_id` first, caps lookahead at 8 epochs and retired-epoch candidates at 8, and applies one shared AEAD-attempt budget of 24 per packet across header and payload. Session aliases (including retired ones) are cached, so a garbage v3 packet neither re-derives up to 128 aliases nor walks the whole retired registry.
 - Retired aliases (after `/ratchet-reset`, TTL reset, session eviction or contact deletion) are rejected before dedup and AEAD, so an old packet cannot create a fresh session.
 - Duplicate delivery is suppressed by `(alias, nonce)` for 300 seconds with a hard cap of 8192 entries. The entry is recorded only after a successful decryption, so junk cannot grow the table.
 - Aliases are deterministic from `session_id`: the same session always maps to the same 16-byte alias. This is a deliberate linkability/retention trade-off. A server or observer that sees the alias can group packets into one session, but cannot recover `session_id`, the ratchet epoch, the contact identity or the plaintext. A new alias appears only when the session is reset; aliases are never derived from the long-term identity and are not persisted outside `vault.dat`.
@@ -237,7 +238,9 @@ On non-Unix platforms POSIX modes are unavailable; the client falls back to the 
 
 - Upload: `POST /upload` with `application/octet-stream` and `Content-Length`; the response body is the file hash. The file name is not sent as a header (it is inside the v3 AEAD envelope).
 - Download: `GET /download/<file_hash>`.
-- The download request has its own 300-second timeout; uploads are limited to 100 MB.
+- Both file requests are signed with the same canonical envelope as `/push` and `/pull` (L-6): `X-Auth-Identity`, `X-Identity-Key`, `X-Auth-Timestamp`, `X-Auth-Nonce`, `X-Auth-Signature`. On upload `body_hash = SHA256(envelope)` is bound into the signature, so neither the blob nor the endpoint can be swapped in transit. Every request gets a fresh nonce; a `401` is reported as `unauthorized (401)`.
+- The download request has its own 300-second timeout. The plaintext file is limited to 100 MiB and the encrypted envelope to `FILE_MAX_ENVELOPE` (128 MiB); `MAX_FILE_BODY` is the same 128 MiB.
+- The file server is external to this repository. The client-side contract is: require the auth headers and reject unsigned requests with `401`, verify the canonical signature and the nonce cache before accepting a blob, and reject a declared body above `FILE_MAX_ENVELOPE` with `413` before reading it. Until the server implements these checks, the signature is a forward-compatible protocol requirement; downloaded content is still verified locally by `sha256` and `file_id` (M-B).
 
 ### Response limits and input validation
 
@@ -248,7 +251,7 @@ Response bodies are streamed with hard limits. The limits are inclusive: exactly
 | Limit | Value | Scope |
 | --- | --- | --- |
 | `MAX_MESSAGE_BODY` | 8 MiB | `/pull` multipart body |
-| `MAX_FILE_BODY` | 256 MiB | `/download` body |
+| `MAX_FILE_BODY` | 128 MiB | `/download` body (equal to `FILE_MAX_ENVELOPE`) |
 | `MAX_MULTIPART_PARTS` | 16 | parts per response |
 | `MAX_MULTIPART_HEADERS` | 32 | headers per part |
 | `MAX_MULTIPART_HEADER_BYTES` | 8 KiB | headers per part |
@@ -321,6 +324,7 @@ Type a normal line to send it to the active room. Lines starting with `/` are co
 | `/messages [limit]` | Show recent messages of the active room (default 50) |
 | `/ttl [duration\|off]` | One-way TTL for new messages in the active room; without an argument — show the status |
 | `/ttl-syn [duration\|off]` | Two-way TTL: the peer receives the same timer in an encrypted `SetTtl` control packet |
+| `/ttl-syn-retry` | Resend a two-way TTL whose delivery failed; the TTL stays active locally and is marked unconfirmed |
 | `/ratchet-reset` | Reset the Double Ratchet session with the active contact and notify the peer |
 | `/sendfile`, `/sf [--force] <path>` | Encrypt and upload a file |
 | `/download`, `/dl [id \| name \| hash] [path]` | Download a file from the active room |
@@ -329,7 +333,7 @@ Type a normal line to send it to the active room. Lines starting with `/` are co
 | `/set test` | Show a test notification |
 | `/passwd` | Change the master password and re-encrypt local data |
 
-TTL durations accept `off`, a number with an `s`, `m` or `h` suffix (`30s`, `5m`, `2h`), or plain seconds; zero is rejected. TTL rooms keep the ratchet state in RAM only, and the timer is wiped when TTL is disabled or the client exits. `/ttl-syn` starts a new ratchet session after any change, and `/ttl off` also resets it with the peer.
+TTL durations accept `off`, a number with an `s`, `m` or `h` suffix (`30s`, `5m`, `2h`), or plain seconds; zero is rejected. TTL rooms keep the ratchet state in RAM only, and the timer is wiped when TTL is disabled or the client exits. `/ttl-syn` starts a new ratchet session after any change, and `/ttl off` also resets it with the peer. If the `SetTtl` packet cannot be delivered, the timer is applied locally and shown as unconfirmed (`/ttl`, status badge); `/ttl-syn-retry` resends it without changing the duration.
 
 ### Profile
 
@@ -593,9 +597,10 @@ lastchance://contact?hash=...&doc=<cbor-hex>&sig=<signature-hex>&x25519=...&ed25
 ### Адресация входящих по alias комнаты (M-8)
 
 - Клиент держит в памяти таблицу `alias -> комната` (собирается при старте из сохранённых ratchet-состояний и tombstone-ов) и выбирает комнату по открытому заголовку до обращения к ключам.
-- Порядок проверок входящего пакета фиксирован: версия и размер → поиск alias → retired alias (`StaleSession`) → alias в TTL-tombstone (`StaleSession`) → разрешение bootstrap → `SHA256(session_id)` в TTL-tombstone (`StaleSession`) → проверка дубля `(alias, nonce)` → AEAD → эпоха храповика.
+- Порядок проверок входящего пакета фиксирован: версия и размер → поиск alias → retired alias (`StaleSession`) → alias в TTL-tombstone (`StaleSession`) → проверка дубля `(alias, nonce)` → разрешение bootstrap (с кэшем и лимитом) → `SHA256(session_id)` в TTL-tombstone (`StaleSession`) → AEAD → эпоха храповика.
 - Не-bootstrap пакет с неизвестным alias отбрасывается как `UnknownRoom` без единой попытки расшифровки. Список контактов не перебирается, пакет не пробуется против нескольких комнат.
-- Единственный путь с несколькими контактами — первый пакет новой сессии: он несёт `bootstrap_nonce`, поэтому клиент сравнивает дешёвые HKDF-alias и запускает AEAD максимум для одной совпавшей комнаты. Это ограниченное разрешение alias, а не перебор шифротекста.
+- Единственный путь с несколькими контактами — первый пакет новой сессии: он несёт `bootstrap_nonce`, поэтому клиент сравнивает дешёвые HKDF-alias и запускает AEAD максимум для одной совпавшей комнаты. Это ограниченное разрешение alias, а не перебор шифротекста. Успешные резолвы `alias -> комната` кэшируются (до 256 записей), а HKDF-сканирования неизвестных bootstrap-пакетов идут под token bucket (всплеск 16, одно разрешение каждые 500 мс), поэтому флуд мусорными alias не даёт O(contacts) работы на каждый пакет.
+- Открытие заголовка сначала пробует последний принятый `epoch_id`, ограничивает lookahead 8 эпохами и retired-кандидатов 8 записями, а общий бюджет AEAD-попыток — 24 на пакет для заголовка и payload вместе. Alias сессий (включая retired) кэшируются, поэтому мусорный v3-пакет не пересчитывает до 128 alias и не перебирает весь retired-реестр.
 - Retired alias (после `/ratchet-reset`, сброса TTL, вытеснения сессии или удаления контакта) отклоняется до дедупликации и AEAD, поэтому старый пакет не может создать новую сессию.
 - Повторная доставка подавляется по `(alias, nonce)` в течение 300 секунд с жёстким лимитом в 8192 записи. Запись появляется только после успешной расшифровки, поэтому мусор не раздувает таблицу.
 - Alias детерминированно выводится из `session_id`: одна сессия всегда даёт один и тот же 16-байтный alias. Это осознанный компромисс по связываемости/хранению. Сервер или наблюдатель, видящий alias, может группировать пакеты одной сессии, но не может восстановить `session_id`, эпоху храповика, личность контакта или открытый текст. Новый alias появляется только при сбросе сессии; alias никогда не выводится из долговременной идентичности и не хранится вне `vault.dat`.
@@ -713,7 +718,9 @@ LastChance `1.0.0` использует wire-format v3. Он намеренно 
 
 - Загрузка: `POST /upload` с `application/octet-stream` и `Content-Length`; тело ответа — хеш файла. Имя файла не передаётся заголовком (оно внутри AEAD-конверта v3).
 - Скачивание: `GET /download/<file_hash>`.
-- У скачивания отдельный таймаут 300 секунд; загрузка ограничена 100 МБ.
+- Оба файловых запроса подписываются тем же каноническим конвертом, что `/push` и `/pull` (L-6): `X-Auth-Identity`, `X-Identity-Key`, `X-Auth-Timestamp`, `X-Auth-Nonce`, `X-Auth-Signature`. При загрузке `body_hash = SHA256(конверта)` входит в подпись, поэтому по дороге нельзя подменить ни тело, ни endpoint. Каждый запрос получает свежий nonce; `401` показывается как `unauthorized (401)`.
+- У скачивания отдельный таймаут 300 секунд. Открытый файл ограничен 100 МиБ, зашифрованный конверт — `FILE_MAX_ENVELOPE` (128 МиБ); `MAX_FILE_BODY` равен тем же 128 МиБ.
+- Файловый сервер находится вне этого репозитория. Контракт для клиентской стороны: требовать заголовки аутентификации и отклонять неподписанные запросы ответом `401`, проверять каноническую подпись и nonce-кэш до приёма блоба, а заявленное тело больше `FILE_MAX_ENVELOPE` — ответом `413` до чтения. Пока сервер не реализует эти проверки, подпись остаётся требованием протокола на будущее; целостность скачанного контента по-прежнему проверяется локально по `sha256` и `file_id` (M-B).
 
 ### Лимиты и валидация ввода
 
@@ -724,7 +731,7 @@ LastChance `1.0.0` использует wire-format v3. Он намеренно 
 | Лимит | Значение | Область |
 | --- | --- | --- |
 | `MAX_MESSAGE_BODY` | 8 МиБ | multipart-тело `/pull` |
-| `MAX_FILE_BODY` | 256 МиБ | тело `/download` |
+| `MAX_FILE_BODY` | 128 МиБ | тело `/download` (равен `FILE_MAX_ENVELOPE`) |
 | `MAX_MULTIPART_PARTS` | 16 | частей на ответ |
 | `MAX_MULTIPART_HEADERS` | 32 | заголовков на часть |
 | `MAX_MULTIPART_HEADER_BYTES` | 8 КиБ | заголовки одной части |
@@ -793,6 +800,7 @@ Seconds: 10
 | `/messages [limit]` | Последние сообщения активной комнаты (по умолчанию 50) |
 | `/ttl [duration\|off]` | Односторонний TTL для новых сообщений в активной комнате; без аргумента — показать состояние |
 | `/ttl-syn [duration\|off]` | Двусторонний TTL: собеседник получает тот же таймер в зашифрованном управляющем пакете `SetTtl` |
+| `/ttl-syn-retry` | Повторно отправить двусторонний TTL после ошибки доставки; TTL остаётся активным локально и помечается как неподтверждённый |
 | `/ratchet-reset` | Сбросить сессию Double Ratchet с активным контактом и уведомить собеседника |
 | `/sendfile`, `/sf [--force] <path>` | Зашифровать и загрузить файл |
 | `/download`, `/dl [id \| name \| hash] [path]` | Скачать файл активной комнаты |
@@ -801,7 +809,7 @@ Seconds: 10
 | `/set test` | Показать тестовое уведомление |
 | `/passwd` | Сменить мастер-пароль и перешифровать локальные данные |
 
-Длительность TTL принимает `off`, число с суффиксом `s`, `m` или `h` (`30s`, `5m`, `2h`) либо секунды без суффикса; ноль отклоняется. TTL-комнаты держат состояние храповика только в RAM, а таймер затирается при отключении TTL или выходе из клиента. `/ttl-syn` запускает новую сессию храповика после любого изменения, а `/ttl off` дополнительно сбрасывает её с собеседником.
+Длительность TTL принимает `off`, число с суффиксом `s`, `m` или `h` (`30s`, `5m`, `2h`) либо секунды без суффикса; ноль отклоняется. TTL-комнаты держат состояние храповика только в RAM, а таймер затирается при отключении TTL или выходе из клиента. `/ttl-syn` запускает новую сессию храповика после любого изменения, а `/ttl off` дополнительно сбрасывает её с собеседником. Если пакет `SetTtl` не удалось доставить, таймер применяется локально и показывается как неподтверждённый (`/ttl`, бейдж состояния); `/ttl-syn-retry` повторяет отправку, не меняя длительность.
 
 ### Профиль
 

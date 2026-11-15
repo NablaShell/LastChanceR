@@ -402,7 +402,16 @@ impl Listener {
         Ok(messages)
     }
 
-    pub async fn download_file(&self, file_hash: &str) -> Result<Vec<u8>> {
+    /// Скачивает файловый конверт по хешу.
+    ///
+    /// `/download/<hash>` подписывается тем же каноническим конвертом, что
+    /// `/push` и `/pull` (L-6). Тело ответа ограничено [`MAX_FILE_BODY`],
+    /// который совпадает с [`crate::crypto::FILE_MAX_ENVELOPE`].
+    pub async fn download_file(
+        &self,
+        file_hash: &str,
+        signing_key: &SigningKey,
+    ) -> Result<Vec<u8>> {
         if file_hash.is_empty() {
             return Err(anyhow!("empty file_hash"));
         }
@@ -419,13 +428,21 @@ impl Listener {
 
         let config = self.current_config()?;
         let client = self.current_client()?;
-        let url = format!("{}/download/{}", config.file_server_url, file_hash);
+        let path = format!("/download/{}", file_hash);
+        let url = format!("{}{}", config.file_server_url, path);
+        let signed = auth::RequestSignature::sign(signing_key, "GET", &path, "", &[]);
 
-        let response = client
+        let mut request = client
             .get(&url)
             // Общий таймаут клиента рассчитан на long-poll; файл может
             // качаться дольше, поэтому для download задаём свой лимит.
-            .timeout(DOWNLOAD_TIMEOUT)
+            .timeout(DOWNLOAD_TIMEOUT);
+
+        for (name, value) in signed.headers() {
+            request = request.header(name, value);
+        }
+
+        let response = request
             .header("X-Requested-With", "XMLHttpRequest")
             .header("User-Agent", "Mozilla/5.0 (X11; Arch Linux; rv:130.0) Gecko/20100101 Firefox/130.0")
             .header(&config.mask_header_name, &config.mask_header_value)
@@ -440,10 +457,21 @@ impl Listener {
                     .map_err(|e| anyhow!("download body rejected: {}", e))?;
                 Ok(data)
             }
+            401 => {
+                let body = read_body_limited(response, MAX_ERROR_BODY, BODY_READ_TIMEOUT)
+                    .await
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                    .unwrap_or_default();
+                Err(anyhow!("unauthorized (401): {}", body))
+            }
             404 => Err(anyhow!(
                 "file not found (already downloaded or expired)"
             )),
             400 => Err(anyhow!("bad request (missing file hash)")),
+            413 => Err(anyhow!(
+                "file too large (413, max {} bytes)",
+                MAX_FILE_BODY
+            )),
             429 => Err(anyhow!("rate limited (429)")),
             code => {
                 let body = read_body_limited(response, MAX_ERROR_BODY, BODY_READ_TIMEOUT)
@@ -1003,5 +1031,227 @@ mod tests {
                 Err(MultipartError::Malformed(_))
             ));
         }
+    }
+
+    const FILE_HASH: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// Читает один HTTP-запрос целиком (заголовки + тело по Content-Length).
+    async fn read_request(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let header_end = loop {
+            let read = stream.read(&mut chunk).await.expect("read request");
+            if read == 0 {
+                break request.len();
+            }
+            request.extend_from_slice(&chunk[..read]);
+            if let Some(position) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                break position + 4;
+            }
+        };
+
+        let headers = String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
+        let declared = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+
+        while request.len() < header_end + declared {
+            let read = stream.read(&mut chunk).await.expect("read body");
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..read]);
+        }
+        request
+    }
+
+    fn split_request(
+        raw: &[u8],
+    ) -> (
+        String,
+        String,
+        String,
+        std::collections::HashMap<String, String>,
+        Vec<u8>,
+    ) {
+        let header_end = raw
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|position| position + 4)
+            .expect("header terminator");
+        let head = String::from_utf8_lossy(&raw[..header_end]).into_owned();
+        let mut lines = head.split("\r\n");
+        let request_line = lines.next().expect("request line");
+        let mut parts = request_line.split(' ');
+        let method = parts.next().unwrap_or_default().to_string();
+        let target = parts.next().unwrap_or_default().to_string();
+        let (path, query) = target.split_once('?').unwrap_or((&target, ""));
+        let (path, query) = (path.to_string(), query.to_string());
+
+        let mut headers = std::collections::HashMap::new();
+        for line in lines {
+            if line.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+            }
+        }
+
+        (method, path, query, headers, raw[header_end..].to_vec())
+    }
+
+    #[tokio::test]
+    async fn download_request_carries_canonical_signature() {
+        use crate::network::auth::{AuthFailure, AuthRequest, AuthVerifier};
+        use tokio::io::AsyncWriteExt;
+
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = tcp.local_addr().expect("addr");
+        let (request_sender, request_receiver) = tokio::sync::oneshot::channel();
+        let payload = b"encrypted envelope".to_vec();
+        let body = payload.clone();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = tcp.accept().await.expect("accept");
+            let raw = read_request(&mut stream).await;
+            let _ = request_sender.send(raw);
+            let mut response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            response.extend_from_slice(&body);
+            let _ = stream.write_all(&response).await;
+            let _ = stream.shutdown().await;
+        });
+
+        let config = Config {
+            file_server_url: format!("http://{}", addr),
+            ..Config::default()
+        };
+        let listener = Listener::new(&config).expect("listener");
+        let signing_key = SigningKey::from_bytes(&[53u8; 32]);
+        let downloaded = listener
+            .download_file(FILE_HASH, &signing_key)
+            .await
+            .expect("download");
+        assert_eq!(downloaded, payload);
+
+        let raw = request_receiver.await.expect("captured request");
+        let (method, path, query, headers, body) = split_request(&raw);
+        assert_eq!(method, "GET");
+        assert_eq!(path, format!("/download/{}", FILE_HASH));
+        assert!(query.is_empty());
+        assert!(body.is_empty());
+
+        let identity_hash =
+            crate::identity::hash_ed25519_public(signing_key.verifying_key().as_bytes());
+        assert_eq!(
+            headers.get("x-auth-identity").map(String::as_str),
+            Some(identity_hash.as_str())
+        );
+        assert_eq!(
+            headers.get("x-identity-key").map(String::as_str),
+            Some(hex::encode(signing_key.verifying_key().as_bytes()).as_str())
+        );
+
+        let timestamp: i64 = headers
+            .get("x-auth-timestamp")
+            .expect("timestamp")
+            .parse()
+            .expect("timestamp number");
+        let nonce = headers.get("x-auth-nonce").expect("nonce").clone();
+        let signature = headers.get("x-auth-signature").expect("signature").clone();
+        let now = chrono::Utc::now().timestamp();
+        let verifying_key = signing_key.verifying_key();
+
+        let mut verifier = AuthVerifier::new();
+        let request = AuthRequest {
+            method: "GET",
+            path: &path,
+            query: "",
+            timestamp,
+            nonce: &nonce,
+            signature: &signature,
+            body: &[],
+        };
+        assert_eq!(
+            verifier.verify(&verifying_key, &identity_hash, &request, now),
+            Ok(())
+        );
+        assert_eq!(
+            verifier.verify(&verifying_key, &identity_hash, &request, now),
+            Err(AuthFailure::ReplayedNonce)
+        );
+
+        // Подпись привязана к конкретному файлу и методу.
+        for (method, path) in [
+            ("GET", "/download/ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+            ("POST", path.as_str()),
+        ] {
+            let mut verifier = AuthVerifier::new();
+            let request = AuthRequest {
+                method,
+                path,
+                query: "",
+                timestamp,
+                nonce: &nonce,
+                signature: &signature,
+                body: &[],
+            };
+            assert_eq!(
+                verifier.verify(&verifying_key, &identity_hash, &request, now),
+                Err(AuthFailure::InvalidSignature)
+            );
+        }
+
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn download_401_is_reported_as_unauthorized() {
+        use tokio::io::AsyncWriteExt;
+
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = tcp.local_addr().expect("addr");
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = tcp.accept().await.expect("accept");
+            let _ = read_request(&mut stream).await;
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 12\r\nConnection: close\r\n\r\nunauthorized",
+                )
+                .await;
+            let _ = stream.shutdown().await;
+        });
+
+        let config = Config {
+            file_server_url: format!("http://{}", addr),
+            ..Config::default()
+        };
+        let listener = Listener::new(&config).expect("listener");
+        let signing_key = SigningKey::from_bytes(&[54u8; 32]);
+        let error = listener
+            .download_file(FILE_HASH, &signing_key)
+            .await
+            .expect_err("401 must fail");
+        assert!(
+            error.to_string().contains("unauthorized (401)"),
+            "unexpected error: {}",
+            error
+        );
+
+        server.await.expect("server task");
     }
 }

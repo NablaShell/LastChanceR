@@ -201,6 +201,14 @@ fixed_secret! {
     RootKey
 }
 
+fixed_secret! {
+    /// Общий секрет комнаты (X25519 + HKDF), кэшируемый в `App`.
+    ///
+    /// В отличие от `[u8; 32]` затирается при `drop`, поэтому удаление
+    /// контакта или завершение процесса не оставляют ключ в куче.
+    SharedSecret
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,6 +239,9 @@ mod tests {
 
         let root = RootKey::from_bytes([0xEF; 32]);
         assert_eq!(format!("{:?}", root), "<redacted>");
+
+        let shared = SharedSecret::from_bytes([0x12; 32]);
+        assert_eq!(format!("{:?}", shared), "<redacted>");
     }
 
     /// Проверяет Drop-хук на стековом буфере фиксированной длины.
@@ -250,6 +261,24 @@ mod tests {
         unsafe {
             std::mem::ManuallyDrop::drop(&mut root);
             for index in 0..RootKey::SIZE {
+                assert_eq!(ptr.add(index).read(), 0, "byte {index} was not wiped");
+            }
+        }
+    }
+
+    #[test]
+    fn shared_secret_is_wiped_on_drop() {
+        // L-4: кэш общих секретов комнат хранит именно этот тип, поэтому
+        // проверяем затирание на нём, а не только на `RootKey`.
+        let mut secret = std::mem::ManuallyDrop::new(SharedSecret::from_bytes([0xCD; 32]));
+        let ptr = secret.expose().as_ptr();
+
+        // SAFETY: `ManuallyDrop::drop` выполняет `ZeroizeOnDrop`, но не
+        // освобождает память; указатель остаётся валидным для чтения
+        // внутри текущей области видимости.
+        unsafe {
+            std::mem::ManuallyDrop::drop(&mut secret);
+            for index in 0..SharedSecret::SIZE {
                 assert_eq!(ptr.add(index).read(), 0, "byte {index} was not wiped");
             }
         }

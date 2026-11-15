@@ -1,49 +1,76 @@
-name: Build & Release
+name: CI & Cross-Platform Release
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
 
 permissions:
   contents: write
 
 jobs:
-  build:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  build-release:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
     strategy:
-      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            asset_name: lastchance-linux-x86_64
-            bin_name: lastchance
+            asset: lastchance-linux-amd64
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            asset: lastchance-linux-arm64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            asset_name: lastchance-windows-x86_64.exe
-            bin_name: lastchance.exe
+            asset: lastchance-windows-amd64.exe
           - os: macos-latest
             target: aarch64-apple-darwin
-            asset_name: lastchance-macos-arm64
-            bin_name: lastchance
-
+            asset: lastchance-macos-arm64
     runs-on: ${{ matrix.os }}
-
     steps:
-      - name: Скачать код репозитория
-        uses: actions/checkout@v4
-
-      - name: Установить Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Собрать релизный бинарник
-        run: cargo build --release
-
-      - name: Подготовить файл к загрузке
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install ARM64 cross-linker (for RPi 5)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Build release binary
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Prepare artifact & checksum
         shell: bash
-        run: cp target/release/${{ matrix.bin_name }} ${{ matrix.asset_name }}
-
-      - name: Прикрепить к GitHub Release
+        run: |
+          BIN_PATH="target/${{ matrix.target }}/release/lastchance"
+          if [[ "${{ matrix.target }}" == *"windows"* ]]; then BIN_PATH="${BIN_PATH}.exe"; fi
+          cp "$BIN_PATH" "${{ matrix.asset }}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          else
+            shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          fi
+      - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ matrix.asset_name }}
+          files: |
+            ${{ matrix.asset }}
+            ${{ matrix.asset }}.sha256

@@ -41,6 +41,8 @@ First release with the hardened wire format and authenticated network API.
 - Response bodies and multipart parsing are bounded (M-2).
 - Identifier parsing is validated at the boundary and byte slicing is
   char-safe (M-1).
+- A two-way `/ttl-syn` whose `SetTtl` packet cannot be delivered stays active
+  locally but is shown as unconfirmed, and `/ttl-syn-retry` resends it (L-8).
 
 ### Security
 
@@ -48,6 +50,19 @@ First release with the hardened wire format and authenticated network API.
   file names are removed.
 - Duplicate `(alias, nonce)` detection and retired-alias checks happen before
   AEAD and ratchet progression.
+- Unknown-bootstrap floods are CPU-bounded (L-1): duplicate delivery is checked
+  before room resolution, successful `alias -> room` resolutions are cached, and
+  HKDF contact scans run under a token bucket.
+- Garbage v3 packets cannot force unbounded ratchet work (L-2): session aliases
+  (including retired ones) are cached instead of re-derived per packet, the last
+  accepted epoch is tried first, header lookahead and retired-epoch candidates
+  are capped, and one shared AEAD-attempt budget covers header and payload.
+- File API requests (`/upload`, `/download`) carry the same canonical signature
+  and nonce as `/push`/`/pull`, and the download body limit is aligned with
+  `FILE_MAX_ENVELOPE` (128 MiB) instead of 256 MiB (L-6). The external file
+  server must reject requests without auth headers with `401`, and oversized
+  bodies with `413` before reading them; this contract is documented in the
+  README.
 - Invalid signatures do not pollute the nonce cache.
 
 ### Breaking

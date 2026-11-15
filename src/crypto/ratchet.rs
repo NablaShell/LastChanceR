@@ -87,7 +87,7 @@ use hkdf::Hkdf;
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fmt;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, Zeroizing};
@@ -135,7 +135,19 @@ pub const TAG_SIZE: usize = 16;
 const HEADER_PLAINTEXT_SIZE: usize = 32 + 4 + 4 + 4;
 /// Насколько вперёд искать `epoch_id` нового заголовка. Потеря большего
 /// числа эпох подряд означает, что сессию нужно переустановить.
-const MAX_HEADER_EPOCH_LOOKAHEAD: u32 = 64;
+///
+/// L-2: значение ограничено, чтобы мусорный пакет не заставлял перебирать
+/// десятки ключей заголовка. Окно приёма всё равно хранит только
+/// [`MAX_EPOCHS`] эпох, поэтому 8 покрывает реордеринг с запасом.
+const MAX_HEADER_EPOCH_LOOKAHEAD: u32 = 8;
+/// L-2: сколько последних вытесненных `epoch_id` пробовать при открытии
+/// заголовка. Полный список (до [`MAX_SEEN_DH_PUBS`]) нужен только для
+/// типизированной ошибки replay, а не для перебора всех ключей.
+const MAX_RETIRED_HEADER_CANDIDATES: usize = 8;
+/// L-2: жёсткий бюджет AEAD-попыток на один пакет — заголовок и payload
+/// вместе. Нормальный пакет укладывается в 2 попытки, худший легитимный
+/// случай (пропуск окна эпох) — в ~19.
+pub const MAX_AEAD_ATTEMPTS_PER_PACKET: usize = 24;
 
 const KDF_SALT: &[u8] = b"lastchance-double-ratchet-v3";
 const STATE_VERSION: u8 = 3;
@@ -532,10 +544,45 @@ struct RecvEpoch {
     skipped: BTreeMap<u32, Zeroizing<[u8; 32]>>,
 }
 
+/// L-2: единый бюджет AEAD-попыток на один входящий пакет.
+///
+/// Счётчик общий для открытия заголовка и расшифровки payload: мусорный
+/// пакет не может потратить больше [`MAX_AEAD_ATTEMPTS_PER_PACKET`] попыток,
+/// даже если окно эпох и реестр retired-эпох заполнены.
+#[derive(Debug)]
+struct AeadBudget {
+    remaining: usize,
+}
+
+impl AeadBudget {
+    fn new() -> Self {
+        Self {
+            remaining: MAX_AEAD_ATTEMPTS_PER_PACKET,
+        }
+    }
+
+    /// Списывает одну попытку. `false` — бюджет исчерпан.
+    fn spend(&mut self) -> bool {
+        match self.remaining.checked_sub(1) {
+            Some(remaining) => {
+                self.remaining = remaining;
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn spent(&self) -> usize {
+        MAX_AEAD_ATTEMPTS_PER_PACKET - self.remaining
+    }
+}
+
 /// Один сессионный контекст: собственные bootstrap-ключи, корень сессии
 /// и окна эпох отправки/приёма.
 struct Session {
     descriptor: SessionDescriptor,
+    /// L-2: alias текущей сессии, выведенный один раз при создании.
+    alias: [u8; SESSION_ALIAS_SIZE],
     root: Zeroizing<[u8; 32]>,
     /// Секрет для шифрования заголовков. Ротируется вместе с сессией,
     /// а ключ заголовка — вместе с `epoch_id`.
@@ -548,6 +595,9 @@ struct Session {
     next_epoch_id: u32,
     /// Первый пакет сессии уже отправлен: bootstrap-nonce больше не нужен.
     bootstrap_sent: bool,
+    /// L-2: `epoch_id` последнего успешно открытого заголовка. Пробуется
+    /// первым, поэтому обычный поток тратит одну AEAD-попытку.
+    last_epoch_id: Option<u32>,
     send_epochs: VecDeque<SendEpoch>,
     recv_epochs: VecDeque<RecvEpoch>,
     /// `epoch_id` вытесненных эпох приёма. Нужны, чтобы открыть заголовок
@@ -574,9 +624,11 @@ impl Session {
 
         let local = KeyPair::from_private(*local_private);
         let peer_bootstrap_pub = PublicKey::from(&StaticSecret::from(*peer_private)).to_bytes();
+        let alias = session_alias(&descriptor.id)?;
 
         Ok(Self {
             descriptor,
+            alias,
             root,
             header_secret,
             local,
@@ -585,6 +637,7 @@ impl Session {
             received_since_send: false,
             next_epoch_id: 0,
             bootstrap_sent: false,
+            last_epoch_id: None,
             send_epochs: VecDeque::new(),
             recv_epochs: VecDeque::new(),
             retired_epoch_ids: VecDeque::new(),
@@ -635,34 +688,64 @@ impl Session {
         Ok(packet)
     }
 
-    /// Расшифровывает зашифрованный заголовок, перебирая известные эпохи и
-    /// небольшое окно новых `epoch_id`.
-    fn open_header(&self, open: &OpenHeader, packet: &[u8]) -> Result<RatchetHeader> {
+    /// Расшифровывает зашифрованный заголовок, перебирая last-эпоху,
+    /// известные эпохи и ограниченное окно новых `epoch_id`.
+    ///
+    /// L-2: число кандидатов и AEAD-попыток жёстко ограничено. Кэш
+    /// `last_epoch_id` даёт одну попытку для обычного потока; retired-эпохи
+    /// перебираются только в пределах [`MAX_RETIRED_HEADER_CANDIDATES`].
+    fn open_header(
+        &self,
+        open: &OpenHeader,
+        packet: &[u8],
+        budget: &mut AeadBudget,
+    ) -> Result<RatchetHeader> {
         if packet.len()
             < open.header_offset + ENCRYPTED_HEADER_SIZE + TAG_SIZE
         {
             return Err(anyhow!("ratchet packet is too short for v3 header"));
         }
 
-        let mut candidates: Vec<u32> = self
+        let mut candidates: Vec<u32> = Vec::new();
+        if let Some(last) = self.last_epoch_id {
+            candidates.push(last);
+        }
+        // Свежие эпохи важнее старых: пакеты приходят почти по порядку.
+        candidates.extend(self.recv_epochs.iter().rev().map(|epoch| epoch.epoch_id));
+
+        let max_known = self
             .recv_epochs
             .iter()
             .map(|epoch| epoch.epoch_id)
-            .collect();
-        candidates.extend(self.retired_epoch_ids.iter().copied());
-        let max_known = candidates.iter().copied().max();
+            .chain(self.retired_epoch_ids.iter().copied())
+            .max();
         let start = max_known.map_or(0, |value| value.saturating_add(1));
         for offset in 0..MAX_HEADER_EPOCH_LOOKAHEAD {
             candidates.push(start.saturating_add(offset));
         }
-        candidates.sort_unstable();
-        candidates.dedup();
+
+        // Retired-эпохи идут последними: для нового пакета они заведомо
+        // мимо, а для replay их обычно отсекает адресная таблица.
+        candidates.extend(
+            self.retired_epoch_ids
+                .iter()
+                .rev()
+                .take(MAX_RETIRED_HEADER_CANDIDATES)
+                .copied(),
+        );
+
+        // Дедупликация без сортировки: порядок кандидатов — приоритет.
+        let mut seen = HashSet::new();
+        candidates.retain(|epoch_id| seen.insert(*epoch_id));
 
         let aad = open.aad(packet);
         let encrypted = &packet
             [open.header_offset..open.header_offset + ENCRYPTED_HEADER_SIZE];
 
         for epoch_id in candidates {
+            if !budget.spend() {
+                break;
+            }
             let key = derive_header_key(&self.header_secret, epoch_id)?;
             let cipher = XChaCha20Poly1305::new_from_slice(key.as_ref())
                 .map_err(|_| anyhow!("invalid ratchet header key"))?;
@@ -693,8 +776,14 @@ impl Session {
         Err(anyhow!("ratchet header authentication failed"))
     }
 
-    fn decrypt(&mut self, open: &OpenHeader, packet: &[u8]) -> Result<Vec<u8>> {
-        let header = self.open_header(open, packet)?;
+    fn decrypt(
+        &mut self,
+        open: &OpenHeader,
+        packet: &[u8],
+        budget: &mut AeadBudget,
+    ) -> Result<Vec<u8>> {
+        let header = self.open_header(open, packet, budget)?;
+        self.last_epoch_id = Some(header.epoch_id);
 
         let mut order: Vec<usize> = (0..self.recv_epochs.len()).collect();
         let mut known_peer = false;
@@ -710,7 +799,8 @@ impl Session {
 
         for index in order {
             let mut candidate = self.recv_epochs[index].clone();
-            if let Ok(plaintext) = decrypt_with_epoch(&mut candidate, open, &header, packet) {
+            if let Ok(plaintext) = decrypt_with_epoch(&mut candidate, open, &header, packet, budget)
+            {
                 self.recv_epochs[index] = candidate;
                 self.note_accepted_epoch(index);
                 return Ok(plaintext);
@@ -748,7 +838,9 @@ impl Session {
                 skipped: BTreeMap::new(),
             };
 
-            if let Ok(plaintext) = decrypt_with_epoch(&mut epoch, open, &header, packet) {
+            if let Ok(plaintext) =
+                decrypt_with_epoch(&mut epoch, open, &header, packet, budget)
+            {
                 // Сначала окно (может отказать с EpochOverflow), затем реестр:
                 // отклонённый ключ не должен блокировать будущий легитимный.
                 self.push_recv_epoch(epoch)?;
@@ -901,6 +993,10 @@ pub struct RatchetState {
     /// `session_id` уничтоженных сессий: пакеты с ними не принимаются,
     /// даже если криптографически валидны.
     retired: Vec<[u8; SESSION_ID_SIZE]>,
+    /// L-2: alias уничтоженных сессий. Выводится один раз при ретирации,
+    /// а не на каждом входящем пакете: иначе флуд заставлял бы делать до
+    /// [`MAX_RETIRED_SESSIONS`] HKDF-вызовов до AEAD.
+    retired_aliases: HashSet<[u8; SESSION_ALIAS_SIZE]>,
 }
 
 impl RatchetState {
@@ -928,6 +1024,7 @@ impl RatchetState {
             sessions,
             active: descriptor.id,
             retired: Vec::new(),
+            retired_aliases: HashSet::new(),
         };
         state.retire_sessions(retired);
         Ok(state)
@@ -955,6 +1052,30 @@ impl RatchetState {
     /// выводится новый контекст. Пакеты уничтоженных сессий отклоняются
     /// как [`RatchetError::StaleSession`].
     pub fn decrypt(&mut self, packet: &[u8], shared_secret: &[u8; 32]) -> Result<Vec<u8>> {
+        self.decrypt_counted(packet, shared_secret).0
+    }
+
+    /// L-2: то же, что [`Self::decrypt`], но возвращает фактическое число
+    /// потраченных AEAD-попыток (включая пути ошибки).
+    ///
+    /// Приложение складывает это значение в [`crate::network::routing::RoutingStats`],
+    /// чтобы флуд-тест мог проверить верхнюю границу.
+    pub fn decrypt_counted(
+        &mut self,
+        packet: &[u8],
+        shared_secret: &[u8; 32],
+    ) -> (Result<Vec<u8>>, usize) {
+        let mut budget = AeadBudget::new();
+        let result = self.decrypt_with_budget(packet, shared_secret, &mut budget);
+        (result, budget.spent())
+    }
+
+    fn decrypt_with_budget(
+        &mut self,
+        packet: &[u8],
+        shared_secret: &[u8; 32],
+        budget: &mut AeadBudget,
+    ) -> Result<Vec<u8>> {
         if !is_valid_packet_len(packet.len()) {
             return Err(anyhow!(
                 "invalid ratchet packet size {}: expected a bucket + randomized padding",
@@ -964,22 +1085,20 @@ impl RatchetState {
 
         let open = OpenHeader::parse(packet)?;
 
-        for retired in &self.retired {
-            if session_alias(retired)? == open.alias {
-                return Err(RatchetError::StaleSession.into());
-            }
+        if self.retired_aliases.contains(&open.alias) {
+            return Err(RatchetError::StaleSession.into());
         }
 
         let mut matched = None;
         for (index, session) in self.sessions.iter().enumerate() {
-            if session_alias(&session.descriptor.id)? == open.alias {
+            if session.alias == open.alias {
                 matched = Some(index);
                 break;
             }
         }
 
         if let Some(index) = matched {
-            let plaintext = self.sessions[index].decrypt(&open, packet)?;
+            let plaintext = self.sessions[index].decrypt(&open, packet, budget)?;
             self.active = self.sessions[index].descriptor.id;
             return Ok(plaintext);
         }
@@ -1001,7 +1120,7 @@ impl RatchetState {
         }
 
         let mut session = Session::derive(shared_secret, self.role, descriptor)?;
-        let plaintext = session.decrypt(&open, packet)?;
+        let plaintext = session.decrypt(&open, packet, budget)?;
 
         self.active = descriptor.id;
         self.sessions.push_back(session);
@@ -1015,9 +1134,10 @@ impl RatchetState {
     #[cfg(test)]
     pub(crate) fn header_for_test(&self, packet: &[u8]) -> Result<RatchetHeader> {
         let open = OpenHeader::parse(packet)?;
+        let mut budget = AeadBudget::new();
         for session in &self.sessions {
-            if session_alias(&session.descriptor.id)? == open.alias {
-                return session.open_header(&open, packet);
+            if session.alias == open.alias {
+                return session.open_header(&open, packet, &mut budget);
             }
         }
         Err(anyhow!("no session matches the packet alias"))
@@ -1048,24 +1168,20 @@ impl RatchetState {
 
     /// Alias активной сессии — адрес входящего пакета (M-8).
     pub fn active_alias(&self) -> Result<[u8; SESSION_ALIAS_SIZE]> {
-        session_alias(&self.active)
+        self.active_session()
+            .map(|session| session.alias)
+            .ok_or_else(|| anyhow!("active ratchet session is missing"))
     }
 
     /// Alias всех живых сессионных контекстов комнаты.
     pub fn session_aliases(&self) -> Result<Vec<[u8; SESSION_ALIAS_SIZE]>> {
-        self.sessions
-            .iter()
-            .map(|session| session_alias(&session.descriptor.id))
-            .collect()
+        Ok(self.sessions.iter().map(|session| session.alias).collect())
     }
 
     /// Alias уничтоженных/вытесненных сессий: по ним пакет отклоняется
     /// как [`RatchetError::StaleSession`] без попытки расшифровки.
     pub fn retired_aliases(&self) -> Result<Vec<[u8; SESSION_ALIAS_SIZE]>> {
-        self.retired
-            .iter()
-            .map(session_alias)
-            .collect()
+        Ok(self.retired_aliases.iter().copied().collect())
     }
 
     /// Все `session_id`, которые уже нельзя принимать: активные контексты
@@ -1084,9 +1200,15 @@ impl RatchetState {
         if self.retired.contains(&session_id) {
             return;
         }
+        if let Ok(alias) = session_alias(&session_id) {
+            self.retired_aliases.insert(alias);
+        }
         self.retired.push(session_id);
         if self.retired.len() > MAX_RETIRED_SESSIONS {
-            self.retired.remove(0);
+            let evicted = self.retired.remove(0);
+            if let Ok(alias) = session_alias(&evicted) {
+                self.retired_aliases.remove(&alias);
+            }
         }
     }
 
@@ -1323,11 +1445,14 @@ impl RatchetState {
                 seen_dh_pubs.pop_front();
             }
 
+            let session_id = decode16(&session.id)?;
+            let alias = session_alias(&session_id)?;
             sessions.push_back(Session {
                 descriptor: SessionDescriptor {
-                    id: decode16(&session.id)?,
+                    id: session_id,
                     nonce: decode32(&session.nonce)?,
                 },
+                alias,
                 root: Zeroizing::new(decode32(&session.root)?),
                 header_secret: Zeroizing::new(decode32(&session.header_secret)?),
                 next_epoch_id: session.next_epoch_id,
@@ -1343,6 +1468,7 @@ impl RatchetState {
                     .map(decode32)
                     .transpose()?,
                 received_since_send: session.received_since_send,
+                last_epoch_id: None,
                 send_epochs,
                 recv_epochs,
                 retired_epoch_ids: session.retired_epoch_ids.iter().copied().collect(),
@@ -1367,6 +1493,7 @@ impl RatchetState {
             sessions,
             active,
             retired: Vec::new(),
+            retired_aliases: HashSet::new(),
         };
         for session_id in &raw.retired {
             state.remember_retired(decode16(session_id)?);
@@ -1544,13 +1671,14 @@ fn decrypt_with_epoch(
     open: &OpenHeader,
     header: &RatchetHeader,
     packet: &[u8],
+    budget: &mut AeadBudget,
 ) -> Result<Vec<u8>> {
     if header.n < epoch.next_index {
         let key = epoch
             .skipped
             .remove(&header.n)
             .ok_or_else(|| anyhow!("ratchet message key is no longer available"))?;
-        return open_packet(open, packet, &key);
+        return open_packet(open, packet, &key, budget);
     }
 
     let distance = header.n - epoch.next_index;
@@ -1579,7 +1707,7 @@ fn decrypt_with_epoch(
     }
 
     let key = message_key.ok_or_else(|| anyhow!("ratchet message key was not derived"))?;
-    open_packet(open, packet, &key)
+    open_packet(open, packet, &key, budget)
 }
 
 /// Проверяет, что длина пакета лежит в `bucket + rand(0..=bucket/8)`.
@@ -1700,7 +1828,11 @@ fn open_packet(
     open: &OpenHeader,
     packet: &[u8],
     message_key: &[u8; 32],
+    budget: &mut AeadBudget,
 ) -> Result<Vec<u8>> {
+    if !budget.spend() {
+        return Err(anyhow!("ratchet AEAD attempt budget exhausted"));
+    }
     if packet.len() < open.header_offset + ENCRYPTED_HEADER_SIZE + TAG_SIZE {
         return Err(anyhow!("ratchet packet is too short"));
     }
@@ -2410,6 +2542,46 @@ mod tests {
         }
     }
 
+    /// L-2: заголовок мусорного пакета не может заставить перебрать все
+    /// retired-эпохи и большое окно lookahead.
+    #[test]
+    fn garbage_header_attempts_are_bounded() {
+        let mut session = Session::derive(
+            &SHARED,
+            Role::Responder,
+            SessionDescriptor::generate(&SHARED).unwrap(),
+        )
+        .unwrap();
+        for index in 0..MAX_EPOCHS {
+            let mut epoch = test_recv_epoch([index as u8 + 1; 32]);
+            epoch.epoch_id = index as u32;
+            session.recv_epochs.push_back(epoch);
+        }
+        for index in 0..MAX_SEEN_DH_PUBS {
+            session.retired_epoch_ids.push_back(100 + index as u32);
+        }
+        session.last_epoch_id = Some(1000);
+
+        // Валидный по размеру v3-пакет с чужим зашифрованным заголовком.
+        let mut packet = vec![0u8; 256];
+        packet[0] = PROTOCOL_VERSION;
+        packet[1] = 0;
+        let alias = session_alias(&session.descriptor.id).unwrap();
+        packet[2..2 + SESSION_ALIAS_SIZE].copy_from_slice(&alias);
+
+        let open = OpenHeader::parse(&packet).unwrap();
+        let mut budget = AeadBudget::new();
+        assert!(session.open_header(&open, &packet, &mut budget).is_err());
+        assert!(
+            budget.spent()
+                <= 1 + MAX_EPOCHS + MAX_RETIRED_HEADER_CANDIDATES
+                    + MAX_HEADER_EPOCH_LOOKAHEAD as usize,
+            "header search must be capped, spent {} attempts",
+            budget.spent()
+        );
+        assert!(budget.spent() <= MAX_AEAD_ATTEMPTS_PER_PACKET);
+    }
+
     #[test]
     fn epoch_window_evicts_the_oldest_inactive_epoch() {
         let mut session =
@@ -2524,6 +2696,12 @@ mod tests {
         assert_eq!(state.retired.len(), MAX_RETIRED_SESSIONS);
         assert!(state.retired.contains(&ids[ids.len() - 1]));
         assert!(!state.retired.contains(&ids[0]));
+        // L-2: alias-кэш строится вместе с реестром и не хранит вытесненные.
+        assert_eq!(state.retired_aliases().unwrap().len(), MAX_RETIRED_SESSIONS);
+        assert!(!state
+            .retired_aliases()
+            .unwrap()
+            .contains(&session_alias(&ids[0]).unwrap()));
     }
 
     // -----------------------------------------------------------------

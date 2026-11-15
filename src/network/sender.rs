@@ -328,7 +328,17 @@ impl Sender {
         ))
     }
 
-    pub async fn upload_file(&self, payload: &[u8]) -> Result<String> {
+    /// Загружает файловый конверт на файловый сервер.
+    ///
+    /// `/upload` подписывается тем же каноническим конвертом, что `/push` и
+    /// `/pull` (L-6): подпись покрывает метод, путь, timestamp, одноразовый
+    /// nonce и `SHA256(payload)`, поэтому ни тело, ни endpoint нельзя
+    /// подменить по дороге.
+    pub async fn upload_file(
+        &self,
+        payload: &[u8],
+        signing_key: &SigningKey,
+    ) -> Result<String> {
         if payload.is_empty() {
             return Err(anyhow!("empty payload"));
         }
@@ -342,14 +352,22 @@ impl Sender {
 
         let config = self.current_config()?;
         let client = self.current_client()?;
-        let url = format!("{}/upload", config.file_server_url);
+        let path = "/upload";
+        let url = format!("{}{}", config.file_server_url, path);
+        let signed = auth::RequestSignature::sign(signing_key, "POST", path, "", payload);
 
-        let response = client
+        let mut request = client
             .post(&url)
             .header("Content-Type", "application/octet-stream")
             // Content-Length обязателен (API.md §5.1). body(Bytes) его ставит сам,
             // но явный заголовок защищает от регрессий.
-            .header("Content-Length", payload.len().to_string())
+            .header("Content-Length", payload.len().to_string());
+
+        for (name, value) in signed.headers() {
+            request = request.header(name, value);
+        }
+
+        let response = request
             // Имя файла больше не передаётся открытым заголовком (M-4):
             // оно лежит внутри AEAD-конверта v3.
             .header("X-Requested-With", "XMLHttpRequest")
@@ -362,8 +380,15 @@ impl Sender {
 
         match response.status().as_u16() {
             200 => read_upload_hash(response).await,
+            401 => {
+                let body = read_error_body(response, MAX_ERROR_BODY).await;
+                Err(anyhow!("unauthorized (401): {}", body))
+            }
             411 => Err(anyhow!("missing Content-Length")),
-            413 => Err(anyhow!("file too large (413)")),
+            413 => Err(anyhow!(
+                "file too large (413, max {} bytes)",
+                MAX_UPLOAD_SIZE
+            )),
             429 => Err(anyhow!("rate limited (429)")),
             code => {
                 let body = read_error_body(response, MAX_ERROR_BODY).await;
@@ -781,7 +806,11 @@ mod tests {
             ..Config::default()
         };
         let sender = Sender::new(&config).expect("sender");
-        let hash = sender.upload_file(b"encrypted envelope").await.expect("upload");
+        let signing_key = SigningKey::from_bytes(&[46u8; 32]);
+        let hash = sender
+            .upload_file(b"encrypted envelope", &signing_key)
+            .await
+            .expect("upload");
         assert_eq!(hash.len(), 64);
 
         let headers = server.await.expect("server task");
@@ -828,8 +857,9 @@ mod tests {
         });
 
         let sender = Sender::new(&upload_config(addr)).expect("sender");
+        let signing_key = SigningKey::from_bytes(&[47u8; 32]);
         let hash = sender
-            .upload_file(b"encrypted envelope")
+            .upload_file(b"encrypted envelope", &signing_key)
             .await
             .expect("body of exactly the limit is allowed");
         assert_eq!(hash, UPLOAD_HASH);
@@ -864,8 +894,9 @@ mod tests {
         });
 
         let sender = Sender::new(&upload_config(addr)).expect("sender");
+        let signing_key = SigningKey::from_bytes(&[48u8; 32]);
         let error = sender
-            .upload_file(b"encrypted envelope")
+            .upload_file(b"encrypted envelope", &signing_key)
             .await
             .expect_err("body over the limit must be rejected");
         assert!(
@@ -916,9 +947,10 @@ mod tests {
         });
 
         let sender = Sender::new(&upload_config(addr)).expect("sender");
+        let signing_key = SigningKey::from_bytes(&[49u8; 32]);
         let error = tokio::time::timeout(
             Duration::from_secs(10),
-            sender.upload_file(b"encrypted envelope"),
+            sender.upload_file(b"encrypted envelope", &signing_key),
         )
         .await
         .expect("endless body must not hang")
@@ -934,6 +966,217 @@ mod tests {
             written.load(Ordering::SeqCst) < 4 * 1024 * 1024,
             "client kept reading past the limit instead of closing: {} bytes written",
             written.load(Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_request_carries_canonical_signature() {
+        use crate::network::auth::{AuthFailure, AuthRequest, AuthVerifier};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (request_sender, request_receiver) = tokio::sync::oneshot::channel();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let raw = read_request(&mut stream).await;
+            let _ = request_sender.send(raw);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                UPLOAD_HASH.len(),
+                UPLOAD_HASH
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        });
+
+        let sender = Sender::new(&upload_config(addr)).expect("sender");
+        let signing_key = SigningKey::from_bytes(&[50u8; 32]);
+        let payload = b"encrypted envelope";
+        let hash = sender
+            .upload_file(payload, &signing_key)
+            .await
+            .expect("upload");
+        assert_eq!(hash, UPLOAD_HASH);
+
+        let raw = request_receiver.await.expect("captured request");
+        let (method, path, query, headers, body) = split_request(&raw);
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/upload");
+        assert!(query.is_empty());
+        assert_eq!(body.as_slice(), payload.as_slice());
+
+        let identity_hash = hash_ed25519_public(signing_key.verifying_key().as_bytes());
+        assert_eq!(
+            headers.get("x-auth-identity").map(String::as_str),
+            Some(identity_hash.as_str())
+        );
+        assert_eq!(
+            headers.get("x-identity-key").map(String::as_str),
+            Some(hex::encode(signing_key.verifying_key().as_bytes()).as_str())
+        );
+
+        let timestamp: i64 = headers
+            .get("x-auth-timestamp")
+            .expect("timestamp")
+            .parse()
+            .expect("timestamp number");
+        let nonce = headers.get("x-auth-nonce").expect("nonce").clone();
+        let signature = headers.get("x-auth-signature").expect("signature").clone();
+        let now = chrono::Utc::now().timestamp();
+        let verifying_key = signing_key.verifying_key();
+
+        let mut verifier = AuthVerifier::new();
+        let request = AuthRequest {
+            method: "POST",
+            path: "/upload",
+            query: "",
+            timestamp,
+            nonce: &nonce,
+            signature: &signature,
+            body: payload,
+        };
+        assert_eq!(
+            verifier.verify(&verifying_key, &identity_hash, &request, now),
+            Ok(())
+        );
+        assert_eq!(
+            verifier.verify(&verifying_key, &identity_hash, &request, now),
+            Err(AuthFailure::ReplayedNonce)
+        );
+
+        // Подпись привязана к endpoint и телу: /upload-подпись нельзя
+        // переиспользовать для скачивания или подменить байты конверта.
+        for (path, body) in [
+            ("/download/abc", payload.as_slice()),
+            ("/upload", b"other".as_slice()),
+        ] {
+            let mut verifier = AuthVerifier::new();
+            let request = AuthRequest {
+                method: "POST",
+                path,
+                query: "",
+                timestamp,
+                nonce: &nonce,
+                signature: &signature,
+                body,
+            };
+            assert_eq!(
+                verifier.verify(&verifying_key, &identity_hash, &request, now),
+                Err(AuthFailure::InvalidSignature)
+            );
+        }
+
+        server.await.expect("server task");
+    }
+
+    /// Серверной части нет в репозитории, поэтому здесь эталонная проверка
+    /// тем же [`AuthVerifier`]: подписанный `/upload` принимается, а запрос
+    /// без подписи получает `401` (L-6). Сам клиент неподписанных запросов
+    /// файлового API не отправляет.
+    #[tokio::test]
+    async fn unsigned_upload_is_rejected_with_401_by_reference_verifier() {
+        use crate::network::auth::{AuthRequest, AuthVerifier};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let signing_key = SigningKey::from_bytes(&[51u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+
+        let server = tokio::spawn(async move {
+            let mut verifier = AuthVerifier::new();
+            for request_index in 0..2 {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let raw = read_request(&mut stream).await;
+                let (method, path, query, headers, body) = split_request(&raw);
+
+                let identity = headers
+                    .get("x-auth-identity")
+                    .cloned()
+                    .unwrap_or_default();
+                let timestamp = headers
+                    .get("x-auth-timestamp")
+                    .and_then(|value| value.parse::<i64>().ok());
+                let nonce = headers.get("x-auth-nonce").cloned().unwrap_or_default();
+                let signature = headers.get("x-auth-signature").cloned().unwrap_or_default();
+
+                let accepted = timestamp.is_some_and(|timestamp| {
+                    let request = AuthRequest {
+                        method: &method,
+                        path: &path,
+                        query: &query,
+                        timestamp,
+                        nonce: &nonce,
+                        signature: &signature,
+                        body: &body,
+                    };
+                    verifier
+                        .verify(&verifying_key, &identity, &request, chrono::Utc::now().timestamp())
+                        .is_ok()
+                });
+
+                let response = if accepted {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        UPLOAD_HASH.len(),
+                        UPLOAD_HASH
+                    )
+                } else {
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Length: 12\r\nConnection: close\r\n\r\nunauthorized".to_string()
+                };
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+
+                assert_eq!(request_index == 0, accepted);
+            }
+        });
+
+        let sender = Sender::new(&upload_config(addr)).expect("sender");
+        let hash = sender
+            .upload_file(b"encrypted envelope", &signing_key)
+            .await
+            .expect("signed upload must be accepted");
+        assert_eq!(hash, UPLOAD_HASH);
+
+        let unsigned = reqwest::Client::new()
+            .post(format!("http://{}/upload", addr))
+            .body("unsigned envelope")
+            .send()
+            .await
+            .expect("unsigned upload");
+        assert_eq!(unsigned.status().as_u16(), 401);
+        assert!(
+            unsigned.text().await.unwrap_or_default().contains("unauthorized"),
+            "401 body must stay opaque"
+        );
+
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn oversize_upload_is_rejected_before_any_network() {
+        // Порт 1 заведомо недоступен: если бы проверка размера стояла после
+        // отправки, ошибка была бы транспортной, а не «file too large».
+        let config = Config {
+            file_server_url: "http://127.0.0.1:1".to_string(),
+            ..Config::default()
+        };
+        let sender = Sender::new(&config).expect("sender");
+        let signing_key = SigningKey::from_bytes(&[52u8; 32]);
+        let payload = vec![0u8; MAX_UPLOAD_SIZE + 1];
+
+        let error = sender
+            .upload_file(&payload, &signing_key)
+            .await
+            .expect_err("oversize upload must be rejected locally");
+        assert!(
+            format!("{}", error).contains("file too large"),
+            "unexpected error: {}",
+            error
         );
     }
 }

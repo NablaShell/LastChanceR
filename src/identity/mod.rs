@@ -1,7 +1,7 @@
 // src/identity/mod.rs
 use crate::crypto::secret::{Ed25519Seed, SecretBytes, SecretString, X25519Priv};
 use crate::storage::SafeFSOps;
-use crate::types::{truncate_display, IdentityHash};
+use crate::types::{sanitize_display_text, truncate_display, IdentityHash};
 use crate::vault::{self, MasterKey, Vault};
 use anyhow::{anyhow, Result};
 use bip39::Mnemonic;
@@ -66,6 +66,9 @@ impl IdentityDoc {
                 ));
             }
         }
+        // Сам ник не меняем: он входит в подписанный CBOR. Управляющие
+        // символы отбрасываются на границе отображения/импорта
+        // (см. `display_nickname`).
 
         Ok(Self {
             version,
@@ -242,8 +245,10 @@ impl IdentityInvite {
     pub fn display_nickname(&self) -> String {
         self.doc
             .nickname
-            .clone()
-            .filter(|name| !name.trim().is_empty())
+            .as_deref()
+            .map(sanitize_display_text)
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
             .unwrap_or_else(|| format!("user_{}", &self.hash_hex()[..8]))
     }
 
@@ -959,6 +964,25 @@ mod tests {
         let parsed = IdentityInvite::from_link(&link).unwrap();
         assert_eq!(parsed.doc.nickname, None);
         assert!(parsed.display_nickname().starts_with("user_"));
+    }
+
+    #[test]
+    fn display_nickname_sanitizes_terminal_and_bidi_controls() {
+        let mut doc = test_doc(10);
+        doc.nickname = Some("evil\x1b[2J\u{202E}name".to_string());
+        let invite = IdentityInvite {
+            doc,
+            signature: [0u8; 64],
+        };
+        assert_eq!(invite.display_nickname(), "evil[2Jname");
+
+        let mut doc = test_doc(10);
+        doc.nickname = Some("🙂 שלום".to_string());
+        let invite = IdentityInvite {
+            doc,
+            signature: [0u8; 64],
+        };
+        assert_eq!(invite.display_nickname(), "🙂 שלום");
     }
 
     #[test]

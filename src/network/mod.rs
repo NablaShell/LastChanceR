@@ -25,7 +25,11 @@ use std::time::Duration;
 /// Максимальный размер multipart-ответа `/pull` (сообщения).
 pub const MAX_MESSAGE_BODY: usize = 8 * 1024 * 1024; // 8 MiB
 /// Максимальный размер скачиваемого файла (до расшифровки).
-pub const MAX_FILE_BODY: usize = 256 * 1024 * 1024; // 256 MiB
+///
+/// Равен максимальному размеру файлового конверта: скачивать больше, чем
+/// клиент способен принять и расшифровать, бессмысленно (L-6). Лимит
+/// применяется к телу ответа; HTTP-заголовки в него не входят.
+pub const MAX_FILE_BODY: usize = crate::crypto::FILE_MAX_ENVELOPE;
 /// Максимум частей в одном multipart-ответе.
 pub const MAX_MULTIPART_PARTS: usize = 16;
 /// Максимум заголовков одной части.
@@ -57,4 +61,20 @@ pub(crate) fn build_http_client(timeout: Duration, proxy_url: Option<&str>) -> R
     builder
         .build()
         .map_err(|e| anyhow!("failed to create HTTP client: {}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// L-6: клиент не должен принимать по `/download` больше, чем способен
+    /// расшифровать. Верхняя граница тела совпадает с размером конверта.
+    #[test]
+    fn file_body_limit_matches_file_envelope_limit() {
+        assert_eq!(MAX_FILE_BODY, crate::crypto::FILE_MAX_ENVELOPE);
+        assert!(
+            MAX_FILE_BODY < 256 * 1024 * 1024,
+            "the old 256 MiB limit would download envelopes the client cannot accept"
+        );
+    }
 }

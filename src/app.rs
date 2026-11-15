@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 
 use crate::crypto;
 use crate::crypto::ratchet::{self, RatchetState, Role as RatchetRole};
-use crate::crypto::secret::SecretBytes;
+use crate::crypto::secret::{SecretBytes, SharedSecret};
 use crate::i18n::{tr, Lang};
 use crate::identity::{
     hash_ed25519_public, Identity, IdentityDoc, IdentityInvite, IdentityManager,
@@ -21,7 +21,8 @@ use crate::storage::{
 };
 use crate::storage::paths::create_private_file;
 use crate::types::{
-    normalize_file_id, parse_file_notification_checked, truncate_display, FileHash,
+    normalize_file_id, parse_file_notification_checked, sanitize_display_text, truncate_display,
+    FileHash,
 };
 use crate::vault::{self, MasterKey, Vault};
 
@@ -90,6 +91,19 @@ pub enum AppEvent {
 pub struct RoomTtl {
     pub seconds: Option<u64>,
     pub synced: bool,
+    /// Двусторонний TTL применён локально, но `SetTtl` не доставлен.
+    /// Требует явного ретрая ([`App::resync_ttl`]); до подтверждения
+    /// TTL не передаётся в метаданных обычных сообщений.
+    pub pending_sync: bool,
+}
+
+/// Итог двусторонней смены TTL (`/ttl-syn`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TtlSyncOutcome {
+    /// `SetTtl` доставлен собеседнику.
+    Synced,
+    /// TTL применён локально, но уведомление не отправлено.
+    LocalOnly { error: String },
 }
 
 /// Результат импорта подписанного invite.
@@ -224,6 +238,13 @@ impl TtlTombstoneRegistry {
     }
 }
 
+/// Кэш общих секретов комнат.
+///
+/// Значение — [`SharedSecret`]: затирается при `drop` и не реализует
+/// `Clone`, поэтому наружу его можно отдать только по ссылке
+/// (см. [`App::with_shared_secret`]) или явным `duplicate()`.
+type SharedSecretMap = HashMap<String, SharedSecret>;
+
 pub struct App {
     config: RwLock<Config>,
     base_dir: String,
@@ -232,7 +253,7 @@ pub struct App {
     identity_manager: Arc<Mutex<IdentityManager>>,
     pub identity: Identity,
 
-    shared_secrets: Arc<Mutex<HashMap<String, [u8; 32]>>>,
+    shared_secrets: Arc<Mutex<SharedSecretMap>>,
     /// Состояния Double Ratchet. Для обычных комнат они сохраняются в
     /// `vault.dat`, для комнат с RAM-TTL остаются только здесь.
     ratchets: Arc<Mutex<HashMap<String, RatchetState>>>,
@@ -681,7 +702,7 @@ fn try_ratchet_decrypt(
     ratchets: &Arc<Mutex<HashMap<String, RatchetState>>>,
     retired_sessions: &RetiredRatchetSessions,
     ttl_active: bool,
-) -> Option<DecryptedRatchet> {
+) -> (Option<DecryptedRatchet>, usize) {
     let retired = match retired_sessions_for(retired_sessions, room_hash) {
         Ok(retired) => retired,
         Err(_) => {
@@ -689,11 +710,11 @@ fn try_ratchet_decrypt(
                 "Incoming packet dropped for {}: retired session lock poisoned",
                 truncate_display(room_hash, 16)
             );
-            return None;
+            return (None, 0);
         }
     };
 
-    let (plaintext, serialized, aliases) = {
+    let (plaintext, serialized, aliases, aead_attempts) = {
         let mut states = match ratchets.lock() {
             Ok(states) => states,
             Err(_) => {
@@ -701,10 +722,10 @@ fn try_ratchet_decrypt(
                     "Incoming packet dropped for {}: ratchet lock poisoned",
                     truncate_display(room_hash, 16)
                 );
-                return None;
+                return (None, 0);
             }
         };
-        ensure_ratchet_state(
+        if ensure_ratchet_state(
             &mut states,
             room_hash,
             shared_secret,
@@ -713,10 +734,16 @@ fn try_ratchet_decrypt(
             ttl_active,
             &retired,
         )
-        .ok()?;
+        .is_err()
+        {
+            return (None, 0);
+        }
 
-        let state = states.get_mut(room_hash)?;
-        match state.decrypt(packet, shared_secret) {
+        let Some(state) = states.get_mut(room_hash) else {
+            return (None, 0);
+        };
+        let (decrypted, aead_attempts) = state.decrypt_counted(packet, shared_secret);
+        match decrypted {
             Ok(plaintext) => {
                 let serialized = if ttl_active {
                     None
@@ -724,7 +751,7 @@ fn try_ratchet_decrypt(
                     state.to_bytes().ok()
                 };
                 let aliases = state.session_aliases().unwrap_or_default();
-                (plaintext, serialized, aliases)
+                (plaintext, serialized, aliases, aead_attempts)
             }
             Err(error) => {
                 if let Some(typed) = error.downcast_ref::<ratchet::RatchetError>() {
@@ -734,31 +761,37 @@ fn try_ratchet_decrypt(
                         typed
                     );
                 }
-                return None;
+                return (None, aead_attempts);
             }
         }
     };
 
-    Some(DecryptedRatchet {
-        plaintext,
-        serialized,
-        aliases,
-    })
+    (
+        Some(DecryptedRatchet {
+            plaintext,
+            serialized,
+            aliases,
+        }),
+        aead_attempts,
+    )
 }
 
-/// Достаёт общий секрет комнаты из уже загруженной карты.
-fn shared_secret_for_room(
+/// Выполняет `f` с общим секретом комнаты, не копируя его из карты.
+///
+/// `Err` возвращается и при poison, и при отсутствии секрета: оба случая
+/// означают, что продолжать криптографию нельзя.
+fn with_room_secret<T>(
     room: &str,
-    shared_secrets: &Arc<Mutex<HashMap<String, [u8; 32]>>>,
-) -> Option<[u8; 32]> {
-    match shared_secrets.lock() {
-        Ok(secrets) => secrets.get(room).copied(),
-        Err(_) => {
-            // Ключевой кэш повреждён: не подставляем «пустой» секрет.
-            warn!("Incoming packet dropped: shared secret lock poisoned");
-            None
-        }
-    }
+    shared_secrets: &Arc<Mutex<SharedSecretMap>>,
+    f: impl FnOnce(&SharedSecret) -> T,
+) -> Result<T> {
+    let secrets = shared_secrets
+        .lock()
+        .map_err(|_| anyhow!("shared secret lock poisoned"))?;
+    let secret = secrets
+        .get(room)
+        .ok_or_else(|| anyhow!("no shared secret for room {}", truncate_display(room, 16)))?;
+    Ok(f(secret))
 }
 
 /// Единственный fallback для первого пакета сессии (M-8).
@@ -768,30 +801,36 @@ fn shared_secret_for_room(
 /// AEAD не запускается ни для одного несовпавшего контакта. Обычные пакеты
 /// этот путь не используют.
 ///
-/// M-C: вместе с комнатой и секретом возвращается `SHA256(session_id)`,
-/// чтобы проверить tombstone до создания новой сессии.
+/// M-C: вместе с комнатой возвращается `SHA256(session_id)`, чтобы
+/// проверить tombstone до создания новой сессии. Сам секрет не копируется:
+/// он нужен только для HKDF внутри этой функции.
+///
+/// L-1: второе значение — число выполненных HKDF-вызовов. Счётчик нужен
+/// приложению и флуд-тесту, чтобы проверить верхнюю границу работы.
 fn resolve_bootstrap_room(
     alias: &[u8; ratchet::SESSION_ALIAS_SIZE],
     nonce: &[u8; ratchet::BOOTSTRAP_NONCE_SIZE],
-    shared_secrets: &Arc<Mutex<HashMap<String, [u8; 32]>>>,
-) -> Option<(String, [u8; 32], [u8; 32])> {
+    shared_secrets: &Arc<Mutex<SharedSecretMap>>,
+) -> (Option<(String, [u8; 32])>, usize) {
     let secrets = match shared_secrets.lock() {
         Ok(secrets) => secrets,
         Err(_) => {
             warn!("Incoming packet dropped: shared secret lock poisoned");
-            return None;
+            return (None, 0);
         }
     };
+    let mut attempts = 0usize;
     for (room, secret) in secrets.iter() {
+        attempts = attempts.saturating_add(1);
         if let Ok((candidate_alias, session_id_hash)) =
-            ratchet::bootstrap_session_fingerprint(secret, nonce)
+            ratchet::bootstrap_session_fingerprint(secret.expose(), nonce)
         {
             if &candidate_alias == alias {
-                return Some((room.clone(), *secret, session_id_hash));
+                return (Some((room.clone(), session_id_hash)), attempts);
             }
         }
     }
-    None
+    (None, attempts)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1008,7 +1047,7 @@ impl App {
                     &contact.public_key,
                 ) {
                     Ok(secret) => {
-                        secrets.insert(contact.hash.clone(), secret);
+                        secrets.insert(contact.hash.clone(), SharedSecret::from_bytes(secret));
                     }
                     Err(e) => {
                         warn!(
@@ -1027,7 +1066,7 @@ impl App {
                 &identity.public_key,
             ) {
                 Ok(secret) => {
-                    secrets.insert(identity.hash.clone(), secret);
+                    secrets.insert(identity.hash.clone(), SharedSecret::from_bytes(secret));
                 }
                 Err(e) => warn!("Failed to derive self shared secret: {}", e),
             }
@@ -1243,7 +1282,7 @@ impl App {
     #[allow(clippy::too_many_arguments)]
     async fn handle_incoming_packet(
         packet: Vec<u8>,
-        shared_secrets: &Arc<Mutex<HashMap<String, [u8; 32]>>>,
+        shared_secrets: &Arc<Mutex<SharedSecretMap>>,
         storage: &Arc<Storage>,
         room_ttls: &Arc<Mutex<HashMap<String, RoomTtl>>>,
         ratchets: &Arc<Mutex<HashMap<String, RatchetState>>>,
@@ -1253,9 +1292,10 @@ impl App {
         identity_hash: &str,
         event_sender: &mpsc::UnboundedSender<AppEvent>,
     ) {
-        // M-8/M-C: порядок проверок до криптографии —
+        // M-8/M-C/L-1: порядок проверок до криптографии —
         // version/размер → alias lookup → retired в памяти → tombstone
-        // TTL-сессии → dedup → AEAD → ratchet.
+        // TTL-сессии → pre-dedup → bootstrap-резолв (с кэшем и лимитом)
+        // → tombstone bootstrap → AEAD → ratchet.
         let (info, route) = {
             let mut router = match inbound_router.lock() {
                 Ok(router) => router,
@@ -1291,22 +1331,41 @@ impl App {
             }
         }
 
-        let (from_hash, shared_secret, bootstrap_hash) = match route {
-            Route::Active(room) => match shared_secret_for_room(&room, shared_secrets) {
-                Some(secret) => {
-                    let hash = info
-                        .bootstrap_nonce
-                        .and_then(|nonce| ratchet::bootstrap_session_id_hash(&secret, &nonce).ok());
-                    (room, secret, hash)
-                }
-                None => {
-                    warn!(
-                        "Incoming packet for {} has no shared secret",
-                        truncate_display(&room, 16)
-                    );
+        let now = std::time::Instant::now();
+
+        // L-1: dedup до любого bootstrap-резолва. Повтор уже доставленного
+        // пакета не должен запускать HKDF даже для неизвестного alias.
+        {
+            let mut router = match inbound_router.lock() {
+                Ok(router) => router,
+                Err(_) => {
+                    // Без проверки nonce пакет может оказаться replay.
+                    warn!("Incoming packet dropped: routing lock poisoned");
                     return;
                 }
-            },
+            };
+            if router.is_duplicate(info.alias, &info.nonce, now) {
+                warn!("Incoming packet rejected: {}", RoutingError::ReplayNonce);
+                return;
+            }
+        }
+
+        let (from_hash, bootstrap_hash) = match route {
+            Route::Active(room) => {
+                // Секрет живёт в карте: HKDF получает ссылку, копии нет.
+                let hash = match with_room_secret(&room, shared_secrets, |secret| {
+                    info.bootstrap_nonce.and_then(|nonce| {
+                        ratchet::bootstrap_session_id_hash(secret.expose(), &nonce).ok()
+                    })
+                }) {
+                    Ok(hash) => hash,
+                    Err(e) => {
+                        warn!("Incoming packet dropped: {:#}", e);
+                        return;
+                    }
+                };
+                (room, hash)
+            }
             Route::Retired(room) => {
                 warn!(
                     "Incoming packet rejected: {} ({})",
@@ -1318,11 +1377,77 @@ impl App {
             Route::Unknown => {
                 // Первый пакет сессии: alias ещё никому не известен.
                 // Сравниваем только дешёвые HKDF-alias, без AEAD-перебора.
-                let resolved = info
-                    .bootstrap_nonce
-                    .and_then(|nonce| resolve_bootstrap_room(&info.alias, &nonce, shared_secrets));
+                let Some(nonce) = info.bootstrap_nonce else {
+                    warn!("Incoming packet rejected: {}", RoutingError::UnknownRoom);
+                    return;
+                };
+
+                // L-1: лимит на неизвестные bootstrap-пакеты. Один токен
+                // покрывает и попадание в кэш (1 HKDF), и полный скан.
+                let allowed = {
+                    let mut router = match inbound_router.lock() {
+                        Ok(router) => router,
+                        Err(_) => {
+                            warn!("Incoming packet dropped: routing lock poisoned");
+                            return;
+                        }
+                    };
+                    router.allow_bootstrap_scan(now)
+                };
+                if !allowed {
+                    warn!(
+                        "Incoming packet rejected: {} (bootstrap rate limit)",
+                        RoutingError::UnknownRoom
+                    );
+                    return;
+                }
+
+                // L-1: положительный кэш alias -> room снимает O(contacts)
+                // HKDF для повторных пакетов той же bootstrap-сессии.
+                let cached = {
+                    let mut router = match inbound_router.lock() {
+                        Ok(router) => router,
+                        Err(_) => {
+                            warn!("Incoming packet dropped: routing lock poisoned");
+                            return;
+                        }
+                    };
+                    router.cached_bootstrap_room(info.alias)
+                };
+                let resolved = match cached {
+                    Some(room) => {
+                        let hash = match with_room_secret(&room, shared_secrets, |secret| {
+                            ratchet::bootstrap_session_id_hash(secret.expose(), &nonce).ok()
+                        }) {
+                            Ok(hash) => hash,
+                            Err(e) => {
+                                warn!("Incoming packet dropped: {:#}", e);
+                                return;
+                            }
+                        };
+                        let hkdf_attempts = usize::from(hash.is_some());
+                        if let Ok(mut router) = inbound_router.lock() {
+                            router.note_bootstrap_hkdf(hkdf_attempts);
+                        }
+                        hash.map(|hash| (room, hash))
+                    }
+                    None => {
+                        let (resolved, hkdf_attempts) =
+                            resolve_bootstrap_room(&info.alias, &nonce, shared_secrets);
+                        if let Ok(mut router) = inbound_router.lock() {
+                            router.note_bootstrap_hkdf(hkdf_attempts);
+                        }
+                        if let Some((room, _)) = resolved.as_ref() {
+                            if let Ok(mut router) = inbound_router.lock() {
+                                router.cache_bootstrap_room(info.alias, room.clone());
+                            }
+                        }
+                        resolved
+                    }
+                };
+
                 match resolved {
-                    Some((room, secret, hash)) => (room, secret, Some(hash)),
+                    Some((room, hash)) => (room, Some(hash)),
                     None => {
                         warn!("Incoming packet rejected: {}", RoutingError::UnknownRoom);
                         return;
@@ -1351,26 +1476,6 @@ impl App {
             }
         }
 
-        let now = std::time::Instant::now();
-        {
-            let mut router = match inbound_router.lock() {
-                Ok(router) => router,
-                Err(_) => {
-                    // Без проверки nonce пакет может оказаться replay.
-                    warn!("Incoming packet dropped: routing lock poisoned");
-                    return;
-                }
-            };
-            if router.is_duplicate(info.alias, &info.nonce, now) {
-                warn!(
-                    "Incoming packet rejected: {} ({})",
-                    RoutingError::ReplayNonce,
-                    truncate_display(&from_hash, 16)
-                );
-                return;
-            }
-        }
-
         let ttl_active = room_has_ttl(room_ttls, &from_hash);
         {
             let mut router = match inbound_router.lock() {
@@ -1382,16 +1487,30 @@ impl App {
             };
             router.note_decrypt_attempt();
         }
-        let decrypted = match try_ratchet_decrypt(
-            &packet,
-            &from_hash,
-            &shared_secret,
-            identity_hash,
-            storage,
-            ratchets,
-            retired_ratchet_sessions,
-            ttl_active,
-        ) {
+        let (decrypted, aead_attempts) =
+            match with_room_secret(&from_hash, shared_secrets, |secret| {
+                try_ratchet_decrypt(
+                    &packet,
+                    &from_hash,
+                    secret.expose(),
+                    identity_hash,
+                    storage,
+                    ratchets,
+                    retired_ratchet_sessions,
+                    ttl_active,
+                )
+            }) {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    warn!("Incoming packet dropped: {:#}", e);
+                    return;
+                }
+            };
+        // L-2: даже отклонённый пакет учитывается в бюджете AEAD.
+        if let Ok(mut router) = inbound_router.lock() {
+            router.note_aead_attempts(aead_attempts);
+        }
+        let decrypted = match decrypted {
             Some(decrypted) => decrypted,
             None => {
                 warn!(
@@ -1442,6 +1561,7 @@ impl App {
                                 RoomTtl {
                                     seconds: Some(value),
                                     synced: true,
+                                    pending_sync: false,
                                 },
                             );
                         }
@@ -1734,7 +1854,7 @@ impl App {
                 .shared_secrets
                 .lock()
                 .map_err(|_| anyhow!("shared secrets lock poisoned"))?;
-            secrets.insert(hash.clone(), shared_secret);
+            secrets.insert(hash.clone(), SharedSecret::from_bytes(shared_secret));
         }
 
         let _ = self.storage.ensure_room(&nickname, &hash);
@@ -1925,38 +2045,38 @@ impl App {
     /// `vault.dat`. Для комнаты с RAM-TTL состояние остаётся в памяти.
     fn encrypt_with_ratchet(&self, room_hash: &str, payload: &[u8]) -> Result<Vec<u8>> {
         let ttl_active = self.get_room_ttl(room_hash).is_some();
-        let shared_secret = self.get_shared_secret(room_hash)?;
         let identity_hash = self.identity.hash.clone();
         let retired = retired_sessions_for(&self.retired_ratchet_sessions, room_hash)?;
 
-        let (packet, serialized, aliases) = {
-            let mut states = self
-                .ratchets
-                .lock()
-                .map_err(|_| anyhow!("ratchet lock poisoned"))?;
+        let (packet, serialized, aliases) =
+            self.with_shared_secret(room_hash, |shared_secret| {
+                let mut states = self
+                    .ratchets
+                    .lock()
+                    .map_err(|_| anyhow!("ratchet lock poisoned"))?;
 
-            ensure_ratchet_state(
-                &mut states,
-                room_hash,
-                &shared_secret,
-                &identity_hash,
-                self.storage.as_ref(),
-                ttl_active,
-                &retired,
-            )?;
+                ensure_ratchet_state(
+                    &mut states,
+                    room_hash,
+                    shared_secret.expose(),
+                    &identity_hash,
+                    self.storage.as_ref(),
+                    ttl_active,
+                    &retired,
+                )?;
 
-            let state = states
-                .get_mut(room_hash)
-                .ok_or_else(|| anyhow!("ratchet state is missing"))?;
-            let packet = state.encrypt(payload)?;
-            let serialized = if ttl_active {
-                None
-            } else {
-                Some(state.to_bytes()?)
-            };
-            let aliases = state.session_aliases().unwrap_or_default();
-            (packet, serialized, aliases)
-        };
+                let state = states
+                    .get_mut(room_hash)
+                    .ok_or_else(|| anyhow!("ratchet state is missing"))?;
+                let packet = state.encrypt(payload)?;
+                let serialized = if ttl_active {
+                    None
+                } else {
+                    Some(state.to_bytes()?)
+                };
+                let aliases = state.session_aliases().unwrap_or_default();
+                Ok((packet, serialized, aliases))
+            })?;
 
         match self.inbound_router.lock() {
             Ok(mut router) => router.register_state(room_hash, &aliases),
@@ -2167,6 +2287,7 @@ impl App {
                     RoomTtl {
                         seconds: Some(value),
                         synced: false,
+                        pending_sync: false,
                     },
                 );
             }
@@ -2191,9 +2312,15 @@ impl App {
     ///
     /// При включении TTL флаг выставляется до шифрования: иначе `SetTtl`
     /// создаст/сдвинет храповик, и тот попадёт в `vault.dat` (H-3).
-    /// Ошибка отправки не откатывает TTL — снапшот с ratchet всё равно не
-    /// записывается, а ошибка возвращается вызывающему.
-    pub async fn set_synced_ttl(&self, room_hash: &str, seconds: Option<u64>) -> Result<()> {
+    /// Ошибка отправки не откатывает TTL: снапшот с ratchet всё равно не
+    /// записывается. Вместо отката TTL помечается как применённый локально
+    /// (`pending_sync`), а вызывающий получает [`TtlSyncOutcome::LocalOnly`],
+    /// чтобы показать статус и предложить ретрай ([`Self::resync_ttl`]).
+    pub async fn set_synced_ttl(
+        &self,
+        room_hash: &str,
+        seconds: Option<u64>,
+    ) -> Result<TtlSyncOutcome> {
         let payload = crypto::encode_set_ttl(seconds);
         let was_ttl = self.get_room_ttl(room_hash).is_some();
 
@@ -2210,7 +2337,10 @@ impl App {
                     room_hash.to_string(),
                     RoomTtl {
                         seconds,
-                        synced: true,
+                        // Подтверждение появится только после успешной
+                        // отправки `SetTtl`.
+                        synced: false,
+                        pending_sync: false,
                     },
                 );
             }
@@ -2223,7 +2353,29 @@ impl App {
             {
                 // TTL намеренно не откатываем: сессия уже переключена в RAM,
                 // а на диске ratchet-состояния быть не должно (H-3).
-                return Err(anyhow!("failed to send TTL update: {}", e));
+                // Оставляем явный признак для UI и ретрая.
+                if let Some(ttl) = self
+                    .room_ttls
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get_mut(room_hash)
+                {
+                    ttl.synced = false;
+                    ttl.pending_sync = true;
+                }
+                return Ok(TtlSyncOutcome::LocalOnly {
+                    error: format!("{:#}", e),
+                });
+            }
+
+            if let Some(ttl) = self
+                .room_ttls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get_mut(room_hash)
+            {
+                ttl.synced = true;
+                ttl.pending_sync = false;
             }
         } else {
             // Выключение TTL: пакет шифруется в текущей RAM-сессии, затем
@@ -2258,7 +2410,53 @@ impl App {
         // Обе стороны начинают храповик заново после смены TTL-режима.
         // При выключении TTL комната уже не TTL, но retiring-сессия была
         // TTL-сессией: на диск попадает только tombstone-хеш (M-C).
-        self.clear_ratchet_with_mode(room_hash, was_ttl || seconds.is_some())
+        self.clear_ratchet_with_mode(room_hash, was_ttl || seconds.is_some())?;
+        Ok(TtlSyncOutcome::Synced)
+    }
+
+    /// Повторно отправляет собеседнику уже применённый локально TTL.
+    ///
+    /// Вызывается после [`TtlSyncOutcome::LocalOnly`]: длительность не
+    /// меняется, поэтому TTL не откатывается и не включается заново. При
+    /// повторной ошибке `pending_sync` сохраняется и ретрай можно повторить.
+    pub async fn resync_ttl(&self, room_hash: &str) -> Result<TtlSyncOutcome> {
+        let ttl = self
+            .get_room_ttl(room_hash)
+            .ok_or_else(|| anyhow!("RAM TTL is not active for this room"))?;
+
+        // Ретрай имеет смысл только для неподтверждённого обновления:
+        // односторонний `/ttl` не должен превращаться в двусторонний.
+        if ttl.synced || !ttl.pending_sync {
+            return Err(anyhow!("TTL update is not pending confirmation"));
+        }
+
+        let payload = crypto::encode_set_ttl(ttl.seconds);
+        let packet = self.encrypt_with_ratchet(room_hash, &payload)?;
+
+        if let Err(e) = self
+            .sender
+            .send_message(room_hash, &packet, &self.signing_key)
+            .await
+        {
+            return Ok(TtlSyncOutcome::LocalOnly {
+                error: format!("{:#}", e),
+            });
+        }
+
+        if let Some(ttl) = self
+            .room_ttls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_mut(room_hash)
+        {
+            ttl.synced = true;
+            ttl.pending_sync = false;
+        }
+
+        // Собеседник сбросил храповик по `SetTtl`; локально делаем то же,
+        // причём retiring-сессия считается TTL-сессией.
+        self.clear_ratchet_with_mode(room_hash, true)?;
+        Ok(TtlSyncOutcome::Synced)
     }
 
     /// Сохраняет исходящее сообщение, делая его эфемерным при активном TTL.
@@ -2306,10 +2504,13 @@ impl App {
             .file_name()
             .and_then(|n| n.to_str())
             .ok_or_else(|| anyhow!("{}", texts.invalid_file_path))?;
+        // Имя из файловой системы может содержать ESC/bidi-управление.
+        // Санитизируем его до шифрования, уведомления и записи в БД.
+        let file_name = sanitize_display_text(file_name);
 
         // Emit upload started event
         self.emit_event(AppEvent::UploadStarted {
-            file_name: file_name.to_string(),
+            file_name: file_name.clone(),
         });
 
         // Open file
@@ -2343,19 +2544,19 @@ impl App {
             progress: 30,
         });
 
-        // Get shared secret
-        let shared_secret = self.get_shared_secret(room_hash)?;
-
         // Encrypt file in the v3 envelope: name and real size are inside
-        // AEAD, and AAD binds file_id/room/sender/recipient.
-        let encrypted_data = crypto::encrypt_file_v3(
-            &file_data,
-            file_name,
-            &shared_secret,
-            room_hash,
-            &self.identity.hash,
-            room_hash,
-        )?;
+        // AEAD, and AAD binds file_id/room/sender/recipient. Секрет остаётся
+        // в кэше: замыкание получает ссылку, копия не создаётся.
+        let encrypted_data = self.with_shared_secret(room_hash, |shared_secret| {
+            crypto::encrypt_file_v3(
+                &file_data,
+                &file_name,
+                shared_secret.expose(),
+                room_hash,
+                &self.identity.hash,
+                room_hash,
+            )
+        })?;
 
         // Идентификатор известен из открытого заголовка конверта; он
         // уйдёт в E2E-уведомление, чтобы получатель мог отличить этот
@@ -2371,7 +2572,10 @@ impl App {
         });
 
         // Upload file
-        let file_hash = match self.sender.upload_file(&encrypted_data).await {
+        let file_hash = match self
+            .sender
+            .upload_file(&encrypted_data, &self.signing_key)
+            .await {
             Ok(hash) => hash,
             Err(e) => {
                 self.emit_event(AppEvent::UploadError {
@@ -2386,7 +2590,7 @@ impl App {
         self.storage.save_file_record(
             &file_hash,
             room_hash,
-            file_name,
+            &file_name,
             file_size,
             is_ephemeral,
         )?;
@@ -2399,7 +2603,7 @@ impl App {
 
         // Emit upload completed event
         self.emit_event(AppEvent::UploadCompleted {
-            file_name: file_name.to_string(),
+            file_name: file_name.clone(),
             file_hash: file_hash.clone(),
             file_id: file_id_hex.clone(),
             file_size: Some(file_size),
@@ -2408,7 +2612,7 @@ impl App {
         // Send file notification message
         let message_text = texts
             .file_notification
-            .replacen("{}", file_name, 1)
+            .replacen("{}", &file_name, 1)
             .replacen("{}", &humanize_bytes(file_size as u64), 1)
             .replacen("{}", &file_hash, 1)
             .replacen("{}", &file_id_hex, 1);
@@ -2446,7 +2650,10 @@ impl App {
         self.emit_event(AppEvent::DownloadStarted);
 
         // Download encrypted file
-        let encrypted_data = match self.listener.download_file(file_hash).await {
+        let encrypted_data = match self
+            .listener
+            .download_file(file_hash, &self.signing_key)
+            .await {
             Ok(data) => data,
             Err(e) => {
                 self.emit_event(AppEvent::DownloadError {
@@ -2478,17 +2685,17 @@ impl App {
 
         // Shared secret берём именно у комнаты файла: /dl может найти файл
         // среди полученных за сессию, не переключая активную комнату.
-        let shared_secret = self.get_shared_secret(room_hash)?;
-
         // Decrypt file. AAD canonicalises the identity pair, so the same
         // call works for sent and received files in this room.
-        let file = match crypto::decrypt_file_v3(
-            &encrypted_data,
-            &shared_secret,
-            room_hash,
-            &self.identity.hash,
-            room_hash,
-        ) {
+        let file = match self.with_shared_secret(room_hash, |shared_secret| {
+            crypto::decrypt_file_v3(
+                &encrypted_data,
+                shared_secret.expose(),
+                room_hash,
+                &self.identity.hash,
+                room_hash,
+            )
+        }) {
             Ok(file) => file,
             Err(e) => {
                 self.emit_event(AppEvent::DownloadError {
@@ -2548,46 +2755,56 @@ impl App {
         Ok(())
     }
 
-    fn get_shared_secret(&self, room_hash: &str) -> Result<[u8; 32]> {
+    /// Выполняет `f` с общим секретом комнаты.
+    ///
+    /// Секрет не копируется: при попадании в кэш `f` получает ссылку на
+    /// значение в `HashMap` (блокировка карты держится на время вызова).
+    /// При промахе ключ выводится из X25519 и кладётся в карту.
+    ///
+    /// Ключевой кэш — fail-closed: poison означает неизвестное состояние,
+    /// операция не продолжается с частичной картой.
+    fn with_shared_secret<T>(
+        &self,
+        room_hash: &str,
+        f: impl FnOnce(&SharedSecret) -> Result<T>,
+    ) -> Result<T> {
         {
-            // Ключевой кэш — fail-closed: poison означает неизвестное
-            // состояние, операция не продолжается с частичной картой.
             let secrets = self
                 .shared_secrets
                 .lock()
                 .map_err(|_| anyhow!("shared secret lock poisoned"))?;
             if let Some(secret) = secrets.get(room_hash) {
-                return Ok(*secret);
+                return f(secret);
             }
         }
 
         // Check if self
-        if room_hash == self.identity.hash {
-            let secret =
-                crypto::generate_shared_key(self.identity.private_key.expose(), &self.identity.public_key)?;
-
-            let mut secrets = self
-                .shared_secrets
-                .lock()
-                .map_err(|_| anyhow!("shared secret lock poisoned"))?;
-            secrets.insert(room_hash.to_string(), secret);
-            return Ok(secret);
-        }
-
-        // Load from storage
-        let contact = self.storage.get_contact(room_hash)?;
-        let secret = crypto::generate_shared_key(
-            self.identity.private_key.expose(),
-            &contact.public_key,
-        )?;
+        let derived = if room_hash == self.identity.hash {
+            crypto::generate_shared_key(
+                self.identity.private_key.expose(),
+                &self.identity.public_key,
+            )?
+        } else {
+            // Load from storage
+            let contact = self.storage.get_contact(room_hash)?;
+            crypto::generate_shared_key(self.identity.private_key.expose(), &contact.public_key)?
+        };
+        let derived = SharedSecret::from_bytes(derived);
 
         let mut secrets = self
             .shared_secrets
             .lock()
             .map_err(|_| anyhow!("shared secret lock poisoned"))?;
-        secrets.insert(room_hash.to_string(), secret);
+        let secret = secrets.entry(room_hash.to_string()).or_insert(derived);
+        f(secret)
+    }
 
-        Ok(secret)
+    /// Тестовая копия секрета: явный `duplicate()` вместо возврата из
+    /// продакшн-API. `SharedSecret` намеренно не реализует `Clone`.
+    #[cfg(test)]
+    fn shared_secret_for_test(&self, room_hash: &str) -> SharedSecret {
+        self.with_shared_secret(room_hash, |secret| Ok(secret.duplicate()))
+            .expect("test shared secret")
     }
 
     pub fn get_messages(&self, room_hash: &str, limit: i64) -> Result<Vec<Message>> {
@@ -2736,6 +2953,7 @@ fn humanize_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::routing::{BOOTSTRAP_SCAN_BURST, BOOTSTRAP_SCAN_REFILL};
     use tempfile::tempdir;
     use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519Secret};
 
@@ -2940,14 +3158,26 @@ mod tests {
     async fn download_rejects_substituted_envelope_by_hash_and_file_id() {
         let (app, temp_dir, _receiver) = setup_test_app();
         let room = app.identity.hash.clone();
-        let secret = app.get_shared_secret(&room).unwrap();
+        let secret = app.shared_secret_for_test(&room);
 
-        let envelope_a =
-            crypto::encrypt_file_v3(b"contents of A", "a.txt", &secret, &room, &room, &room)
-                .unwrap();
-        let envelope_b =
-            crypto::encrypt_file_v3(b"contents of B", "b.txt", &secret, &room, &room, &room)
-                .unwrap();
+        let envelope_a = crypto::encrypt_file_v3(
+            b"contents of A",
+            "a.txt",
+            secret.expose(),
+            &room,
+            &room,
+            &room,
+        )
+        .unwrap();
+        let envelope_b = crypto::encrypt_file_v3(
+            b"contents of B",
+            "b.txt",
+            secret.expose(),
+            &room,
+            &room,
+            &room,
+        )
+        .unwrap();
         let hash_a = crate::network::auth::body_hash(&envelope_a);
         let hash_b = crate::network::auth::body_hash(&envelope_b);
         let id_a = hex::encode(crypto::file_envelope_id(&envelope_a).unwrap());
@@ -3265,19 +3495,78 @@ mod tests {
             .unwrap()
             .is_some());
 
-        let result = app.set_synced_ttl(&hash, Some(30)).await;
-        assert!(result.is_err(), "send failure must surface");
+        let outcome = app.set_synced_ttl(&hash, Some(30)).await.unwrap();
+        assert!(
+            matches!(outcome, TtlSyncOutcome::LocalOnly { .. }),
+            "send failure must be reported as local-only, not confirmed"
+        );
 
+        let ttl = app.get_room_ttl(&hash).expect("TTL must stay active");
         assert_eq!(
-            app.get_room_ttl(&hash).and_then(|ttl| ttl.seconds),
+            ttl.seconds,
             Some(30),
             "TTL must not be silently rolled back"
         );
+        assert!(!ttl.synced, "failed delivery is not a peer confirmation");
+        assert!(ttl.pending_sync, "UI must be able to offer a retry");
         assert!(app
             .get_storage()
             .persisted_ratchet_state_for_test(&hash)
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn synced_ttl_retry_confirms_pending_sync() {
+        // L-8: после ошибки отправки TTL остаётся локальным и явно
+        // помеченным, а повторная синхронизация подтверждает его.
+        let failing = spawn_http_stub("400 Bad Request").await;
+        let config = Config {
+            server_url: failing,
+            ..Config::default()
+        };
+        let (app, _temp_dir, _receiver) = setup_test_app_with_config(config);
+
+        let invite = test_invite(7, "RetryPeer");
+        let hash = invite.hash_hex();
+        app.add_contact_with_ed25519(&invite).unwrap();
+
+        let outcome = app.set_synced_ttl(&hash, Some(45)).await.unwrap();
+        match outcome {
+            TtlSyncOutcome::LocalOnly { error } => assert!(!error.is_empty()),
+            TtlSyncOutcome::Synced => panic!("send failure must not report synced"),
+        }
+
+        let ttl = app.get_room_ttl(&hash).expect("TTL is applied locally");
+        assert_eq!(ttl.seconds, Some(45));
+        assert!(!ttl.synced);
+        assert!(ttl.pending_sync);
+
+        // Повторный ретрай при всё ещё недоступном сервере сохраняет статус.
+        let still_failing = spawn_http_stub("500 Internal Server Error").await;
+        let mut config = app.get_config();
+        config.server_url = still_failing;
+        app.update_config(config).unwrap();
+        assert!(matches!(
+            app.resync_ttl(&hash).await.unwrap(),
+            TtlSyncOutcome::LocalOnly { .. }
+        ));
+        assert!(app.get_room_ttl(&hash).unwrap().pending_sync);
+
+        // Успешный ретрай снимает pending и подтверждает доставку.
+        let ok_server = spawn_http_stub("200 OK").await;
+        let mut config = app.get_config();
+        config.server_url = ok_server;
+        app.update_config(config).unwrap();
+
+        assert_eq!(
+            app.resync_ttl(&hash).await.unwrap(),
+            TtlSyncOutcome::Synced
+        );
+        let ttl = app.get_room_ttl(&hash).unwrap();
+        assert_eq!(ttl.seconds, Some(45), "retry must not change the duration");
+        assert!(ttl.synced);
+        assert!(!ttl.pending_sync);
     }
 
     #[tokio::test]
@@ -3333,17 +3622,18 @@ mod tests {
             .unwrap()
             .is_none());
 
-        let shared_secret = app.get_shared_secret(&hash).unwrap();
+        let shared_secret = app.shared_secret_for_test(&hash);
         let decrypted = try_ratchet_decrypt(
             &packet,
             &hash,
-            &shared_secret,
+            shared_secret.expose(),
             &app.identity.hash,
             &app.storage,
             &app.ratchets,
             &app.retired_ratchet_sessions,
             false,
         )
+        .0
         .expect("self-chat packet must decrypt");
 
         assert_eq!(
@@ -3419,7 +3709,7 @@ mod tests {
             .get(&hash)
             .unwrap()
             .session_id();
-        let shared_secret = app.get_shared_secret(&hash).unwrap();
+        let shared_secret = app.shared_secret_for_test(&hash);
 
         app.clear_ratchet(&hash).unwrap();
 
@@ -3436,13 +3726,14 @@ mod tests {
         let decrypted = try_ratchet_decrypt(
             &fresh,
             &hash,
-            &shared_secret,
+            shared_secret.expose(),
             &app.identity.hash,
             &app.storage,
             &app.ratchets,
             &app.retired_ratchet_sessions,
             false,
         )
+        .0
         .expect("new bootstrap packet must decrypt");
         assert_eq!(decrypted.plaintext, b"fresh");
 
@@ -3451,13 +3742,14 @@ mod tests {
             try_ratchet_decrypt(
                 &bootstrap,
                 &hash,
-                &shared_secret,
+                shared_secret.expose(),
                 &app.identity.hash,
                 &app.storage,
                 &app.ratchets,
                 &app.retired_ratchet_sessions,
                 false,
             )
+            .0
             .is_none(),
             "bootstrap packet from a cleared ratchet must not decrypt"
         );
@@ -3491,7 +3783,7 @@ mod tests {
             .get(&hash)
             .unwrap()
             .session_id();
-        let shared_secret = app.get_shared_secret(&hash).unwrap();
+        let shared_secret = app.shared_secret_for_test(&hash);
 
         app.clear_ratchet(&hash).unwrap();
         drop(app);
@@ -3513,13 +3805,14 @@ mod tests {
             try_ratchet_decrypt(
                 &bootstrap,
                 &hash,
-                &shared_secret,
+                shared_secret.expose(),
                 &reopened.identity.hash,
                 &reopened.storage,
                 &reopened.ratchets,
                 &reopened.retired_ratchet_sessions,
                 false,
             )
+            .0
             .is_none(),
             "replayed bootstrap packet must stay rejected after restart"
         );
@@ -3896,6 +4189,132 @@ mod tests {
         .await;
     }
 
+    /// Пакет правильной v3-формы, но с мусорным зашифрованным заголовком.
+    fn garbage_packet(
+        alias: [u8; ratchet::SESSION_ALIAS_SIZE],
+        bootstrap_nonce: Option<[u8; ratchet::BOOTSTRAP_NONCE_SIZE]>,
+        nonce_seed: u64,
+    ) -> Vec<u8> {
+        let mut packet = vec![0u8; 256];
+        packet[0] = ratchet::PROTOCOL_VERSION;
+        packet[1] = if bootstrap_nonce.is_some() {
+            ratchet::FLAG_BOOTSTRAP
+        } else {
+            0
+        };
+        packet[2..2 + ratchet::SESSION_ALIAS_SIZE].copy_from_slice(&alias);
+
+        let mut offset = ratchet::OPEN_HEADER_FIXED;
+        if let Some(bootstrap_nonce) = bootstrap_nonce {
+            packet[offset..offset + ratchet::BOOTSTRAP_NONCE_SIZE]
+                .copy_from_slice(&bootstrap_nonce);
+            offset += ratchet::BOOTSTRAP_NONCE_SIZE;
+        }
+        let mut nonce = [0u8; ratchet::NONCE_SIZE];
+        nonce[..8].copy_from_slice(&nonce_seed.to_le_bytes());
+        packet[offset..offset + ratchet::NONCE_SIZE].copy_from_slice(&nonce);
+        packet
+    }
+
+    #[tokio::test]
+    async fn garbage_bootstrap_flood_has_bounded_hkdf_work() {
+        // L-1: флуд случайными bootstrap-alias не должен вызывать HKDF по
+        // всем контактам на каждый пакет. Лимитер режет всплеск, а счётчик
+        // сканирований остаётся ограниченным.
+        let (app, _temp_dir, _receiver, _hash) = setup_router_room();
+        let room_count = app.shared_secrets.lock().unwrap().len() as u64;
+        assert!(room_count >= 1);
+
+        const FLOOD: u64 = 256;
+        let started = std::time::Instant::now();
+        for index in 0..FLOOD {
+            let mut alias = [0u8; ratchet::SESSION_ALIAS_SIZE];
+            alias[..8].copy_from_slice(&index.to_le_bytes());
+            alias[8] = 0xA5;
+            deliver_packet(&app, garbage_packet(alias, Some([0x5A; 32]), index)).await;
+        }
+        let elapsed = started.elapsed();
+
+        let stats = app.inbound_router.lock().unwrap().stats();
+        let refills =
+            u64::try_from(elapsed.as_millis() / BOOTSTRAP_SCAN_REFILL.as_millis())
+                .unwrap_or(u64::MAX);
+        let allowed_scans = BOOTSTRAP_SCAN_BURST as u64 + refills + 1;
+        assert!(
+            stats.bootstrap_hkdf_attempts <= allowed_scans * room_count,
+            "HKDF scans must be rate bounded: {} > {}",
+            stats.bootstrap_hkdf_attempts,
+            allowed_scans * room_count
+        );
+        assert!(
+            stats.bootstrap_hkdf_attempts < FLOOD * room_count,
+            "flood must not scan every packet"
+        );
+        assert!(stats.bootstrap_rate_limited > 0, "limiter must engage");
+        assert_eq!(stats.decrypt_attempts, 0, "garbage has no valid room");
+    }
+
+    #[tokio::test]
+    async fn garbage_for_live_alias_has_bounded_aead_attempts() {
+        // L-2: мусорные пакеты с живым alias могут заставить храповик
+        // перебирать эпохи, но не больше общего бюджета на пакет.
+        let (app, _temp_dir, _receiver, hash) = setup_router_room();
+        let live = app.encrypt_with_ratchet(&hash, b"prime").unwrap();
+        let mut alias = [0u8; ratchet::SESSION_ALIAS_SIZE];
+        alias.copy_from_slice(&live[2..2 + ratchet::SESSION_ALIAS_SIZE]);
+
+        const FLOOD: u64 = 8;
+        for index in 0..FLOOD {
+            let before = app.inbound_router.lock().unwrap().stats().aead_attempts;
+            deliver_packet(&app, garbage_packet(alias, None, index)).await;
+            let after = app.inbound_router.lock().unwrap().stats().aead_attempts;
+            assert!(
+                after - before <= ratchet::MAX_AEAD_ATTEMPTS_PER_PACKET as u64,
+                "one packet must not exceed the AEAD budget"
+            );
+        }
+
+        let stats = app.inbound_router.lock().unwrap().stats();
+        assert_eq!(stats.decrypt_attempts, FLOOD);
+        assert!(stats.aead_attempts > 0);
+        assert!(
+            stats.aead_attempts <= FLOOD * ratchet::MAX_AEAD_ATTEMPTS_PER_PACKET as u64,
+            "AEAD work must stay bounded"
+        );
+        assert!(app.get_messages(&hash, 10).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_resolution_is_cached_per_alias() {
+        // L-1: после успешного HKDF-резолва повторный bootstrap-пакет той же
+        // сессии не должен снова перебирать контакты.
+        let (app, _temp_dir, _receiver, hash) = setup_router_room();
+        let live = app.encrypt_with_ratchet(&hash, b"prime").unwrap();
+        let mut alias = [0u8; ratchet::SESSION_ALIAS_SIZE];
+        alias.copy_from_slice(&live[2..2 + ratchet::SESSION_ALIAS_SIZE]);
+        let mut bootstrap_nonce = [0u8; ratchet::BOOTSTRAP_NONCE_SIZE];
+        bootstrap_nonce.copy_from_slice(
+            &live[ratchet::OPEN_HEADER_FIXED
+                ..ratchet::OPEN_HEADER_FIXED + ratchet::BOOTSTRAP_NONCE_SIZE],
+        );
+
+        // Снимаем живой маршрут, чтобы оба пакета шли через Unknown-bootstrap.
+        app.inbound_router.lock().unwrap().remove_room(&hash);
+        let room_count = app.shared_secrets.lock().unwrap().len() as u64;
+
+        deliver_packet(&app, garbage_packet(alias, Some(bootstrap_nonce), 1)).await;
+        deliver_packet(&app, garbage_packet(alias, Some(bootstrap_nonce), 2)).await;
+
+        let stats = app.inbound_router.lock().unwrap().stats();
+        assert_eq!(stats.bootstrap_cache_hits, 1, "second packet uses cache");
+        assert_eq!(stats.decrypt_attempts, 2);
+        assert!(stats.bootstrap_hkdf_attempts >= 2);
+        assert!(
+            stats.bootstrap_hkdf_attempts <= room_count + 1,
+            "only one full scan plus one cached lookup are allowed"
+        );
+    }
+
     /// Self-chat проверяет маршрутизацию без второго клиента (`SelfChat`
     /// умеет открывать собственные пакеты). Контактная запись нужна только
     /// ради FK `messages.room_hash -> contacts.hash`.
@@ -4228,10 +4647,36 @@ mod tests {
 
         poison_mutex(&app.shared_secrets);
 
-        let error = app.get_shared_secret(&hash).unwrap_err();
+        let error = app.with_shared_secret(&hash, |_| Ok(())).unwrap_err();
         assert!(
             error.to_string().contains("shared secret lock poisoned"),
             "unexpected error: {error}"
+        );
+    }
+
+    /// L-4: продакшн-путь отдаёт ссылку на значение в кэше, а не копию.
+    /// Если `with_shared_secret` начнёт копировать секрет, указатели
+    /// разойдутся и тест упадёт.
+    #[test]
+    fn with_shared_secret_exposes_cached_value_without_copy() {
+        let (app, _temp_dir, _receiver) = setup_test_app();
+        let hash = app.identity.hash.clone();
+
+        let cached = {
+            let secrets = app.shared_secrets.lock().unwrap();
+            secrets
+                .get(&hash)
+                .expect("self secret is loaded at startup")
+                .expose()
+                .as_ptr()
+        };
+        let exposed = app
+            .with_shared_secret(&hash, |secret| Ok(secret.expose().as_ptr()))
+            .unwrap();
+
+        assert_eq!(
+            cached, exposed,
+            "with_shared_secret must not copy the cached secret"
         );
     }
 

@@ -11,7 +11,7 @@ pub mod storage;
 pub mod types;
 pub mod vault;
 
-pub use app::{App, AppEvent};
+pub use app::{App, AppEvent, TtlSyncOutcome};
 pub use i18n::Lang;
 pub use network::Config;
 pub use storage::{get_base_dir, get_base_dir_with_override};

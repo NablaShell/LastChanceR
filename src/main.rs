@@ -40,8 +40,8 @@ use lastchance::network::config::notify_level_label;
 use lastchance::storage::{
     Storage, LEGACY_DB_FILE_NAME, TOFU_CHANGED, TOFU_PENDING, TOFU_VERIFIED, VAULT_FILE_NAME,
 };
-use lastchance::types::{parse_file_notification, short_hash};
-use lastchance::{get_base_dir_with_override, vault, App, AppEvent, Config, Vault};
+use lastchance::types::{parse_file_notification, sanitize_display_text, short_hash};
+use lastchance::{get_base_dir_with_override, vault, App, AppEvent, Config, TtlSyncOutcome, Vault};
 
 // ============================================================
 // МОДЕЛЬ ИНТЕРФЕЙСА
@@ -110,6 +110,7 @@ const COMMANDS: &[&str] = &[
     "/messages",
     "/ttl",
     "/ttl-syn",
+    "/ttl-syn-retry",
     "/ratchet-reset",
     "/sendfile",
     "/download",
@@ -180,6 +181,8 @@ struct UiState {
     ttl_seconds: Option<u64>,
     /// Включён ли двусторонний режим `/ttl-syn`.
     ttl_synced: bool,
+    /// Двусторонний TTL применён локально, но собеседник не подтвердил.
+    ttl_pending: bool,
     /// Приветственное окно выбора языка при первом запуске.
     welcome: Option<WelcomeFlow>,
 }
@@ -654,6 +657,7 @@ impl UiState {
             lang,
             ttl_seconds: None,
             ttl_synced: false,
+            ttl_pending: false,
             welcome: None,
         };
         refresh_chats(app, &mut state);
@@ -765,17 +769,37 @@ fn sync_ttl_state(app: &App, state: &mut UiState) {
     let ttl = app.get_room_ttl(&state.room);
     state.ttl_seconds = ttl.and_then(|value| value.seconds);
     state.ttl_synced = ttl.map(|value| value.synced).unwrap_or(false);
+    state.ttl_pending = ttl.map(|value| value.pending_sync).unwrap_or(false);
+}
+
+/// Текст статуса TTL для `/ttl` и `/ttl-syn` без аргумента.
+fn ttl_status_text(texts: &Texts, seconds: Option<u64>, pending: bool, synced: bool) -> String {
+    match seconds {
+        Some(value) if pending => tr(texts.ttl_status_pending, &[&value.to_string()]),
+        Some(value) if synced => tr(texts.ttl_status_synced, &[&value.to_string()]),
+        Some(value) => tr(texts.ttl_status_on, &[&value.to_string()]),
+        None => texts.ttl_status_off.to_string(),
+    }
+}
+
+/// Бейдж TTL для заголовка активного чата.
+fn ttl_badge_for(texts: &Texts, seconds: Option<u64>, pending: bool, synced: bool) -> String {
+    let Some(value) = seconds else {
+        return String::new();
+    };
+    let value = value.to_string();
+    if pending {
+        tr(texts.ttl_badge_pending, &[&value])
+    } else if synced {
+        tr(texts.ttl_badge_synced, &[&value])
+    } else {
+        tr(texts.ttl_badge, &[&value])
+    }
 }
 
 /// Бейдж TTL для заголовка активного чата.
 fn ttl_badge(state: &UiState, texts: &Texts) -> String {
-    match state.ttl_seconds {
-        Some(seconds) if state.ttl_synced => {
-            tr(texts.ttl_badge_synced, &[&seconds.to_string()])
-        }
-        Some(seconds) => tr(texts.ttl_badge, &[&seconds.to_string()]),
-        None => String::new(),
-    }
+    ttl_badge_for(texts, state.ttl_seconds, state.ttl_pending, state.ttl_synced)
 }
 
 /// Разбирает аргумент `/ttl` и `/ttl-syn`.
@@ -948,7 +972,7 @@ fn register_file(
         room_hash: room_hash.to_string(),
         file_hash: file_hash.to_string(),
         file_id: file_id.map(str::to_string),
-        file_name: file_name.to_string(),
+        file_name: sanitize_display_text(file_name),
         timestamp,
     });
     id
@@ -1015,6 +1039,7 @@ fn safe_file_name(file_name: &str) -> String {
         .next()
         .unwrap_or(file_name)
         .replace('\0', "");
+    let base = sanitize_display_text(&base);
     let base = base.trim();
 
     if base.is_empty() || base == "." || base == ".." {
@@ -4749,6 +4774,7 @@ fn invite_file_name(nickname: &str) -> String {
         .chars()
         .map(|c| if matches!(c, '/' | '\\' | '\0') { '_' } else { c })
         .collect();
+    let safe = sanitize_display_text(&safe);
     let safe = safe.trim();
     let safe = if safe.is_empty() { "user" } else { safe };
 
@@ -5087,15 +5113,12 @@ async fn handle_command(
             }
 
             let Some(raw) = parts.get(1).copied() else {
-                let text = match (state.ttl_seconds, state.ttl_synced) {
-                    (Some(seconds), true) => {
-                        tr(state.lang.texts().ttl_status_synced, &[&seconds.to_string()])
-                    }
-                    (Some(seconds), false) => {
-                        tr(state.lang.texts().ttl_status_on, &[&seconds.to_string()])
-                    }
-                    (None, _) => state.lang.texts().ttl_status_off.to_string(),
-                };
+                let text = ttl_status_text(
+                    state.lang.texts(),
+                    state.ttl_seconds,
+                    state.ttl_pending,
+                    state.ttl_synced,
+                );
                 push_system(state, &text);
                 state.status = text;
                 return Ok(false);
@@ -5179,7 +5202,7 @@ async fn handle_command(
             };
 
             match app.set_synced_ttl(&state.room, seconds).await {
-                Ok(()) => {
+                Ok(TtlSyncOutcome::Synced) => {
                     sync_ttl_state(app, state);
                     let text = match seconds {
                         Some(value) => tr(
@@ -5191,10 +5214,64 @@ async fn handle_command(
                     push_system(state, &text);
                     state.status = text;
                 }
+                Ok(TtlSyncOutcome::LocalOnly { error }) => {
+                    sync_ttl_state(app, state);
+                    let text = match seconds {
+                        Some(value) => tr(
+                            state.lang.texts().ttl_enabled_pending,
+                            &[&value.to_string(), &error],
+                        ),
+                        // Выключение при ошибке отправки откатывается
+                        // внутри `set_synced_ttl`, поэтому LocalOnly здесь
+                        // возможен только при включении.
+                        None => tr(state.lang.texts().ttl_retry_error, &[&error]),
+                    };
+                    push_system(state, &text);
+                    state.status = text;
+                }
                 Err(e) => push_error(
                     state,
                     &tr(
                         state.lang.texts().ttl_apply_error,
+                        &[&format!("{:#}", e)],
+                    ),
+                ),
+            }
+        }
+
+        "/ttl-syn-retry" => {
+            if state.room.is_empty() {
+                push_error(state, state.lang.texts().no_active_room_short);
+                return Ok(false);
+            }
+
+            let Some(ttl) = app.get_room_ttl(&state.room) else {
+                push_error(state, state.lang.texts().ttl_retry_nothing);
+                return Ok(false);
+            };
+
+            if !ttl.pending_sync {
+                push_error(state, state.lang.texts().ttl_retry_not_pending);
+                return Ok(false);
+            }
+
+            match app.resync_ttl(&state.room).await {
+                Ok(TtlSyncOutcome::Synced) => {
+                    sync_ttl_state(app, state);
+                    let text = state.lang.texts().ttl_retry_done.to_string();
+                    push_system(state, &text);
+                    state.status = text;
+                }
+                Ok(TtlSyncOutcome::LocalOnly { error }) => {
+                    sync_ttl_state(app, state);
+                    let text = tr(state.lang.texts().ttl_retry_error, &[&error]);
+                    push_error(state, &text);
+                    state.status = text;
+                }
+                Err(e) => push_error(
+                    state,
+                    &tr(
+                        state.lang.texts().ttl_retry_error,
                         &[&format!("{:#}", e)],
                     ),
                 ),
@@ -6292,6 +6369,25 @@ mod tests {
     }
 
     #[test]
+    fn pending_ttl_is_shown_as_unconfirmed() {
+        let texts = Lang::En.texts();
+
+        let pending = ttl_status_text(texts, Some(30), true, false);
+        assert_eq!(pending, tr(texts.ttl_status_pending, &["30"]));
+        assert!(pending.contains("not confirmed"));
+
+        let synced = ttl_status_text(texts, Some(30), false, true);
+        assert!(synced.contains("synced with peer"));
+
+        let one_way = ttl_status_text(texts, Some(30), false, false);
+        assert!(one_way.contains("one-way"));
+
+        let badge = ttl_badge_for(texts, Some(30), true, false);
+        assert!(badge.contains("unconfirmed"));
+        assert_ne!(badge, ttl_badge_for(texts, Some(30), false, true));
+    }
+
+    #[test]
     fn word_left_navigation_handles_mixed_text() {
         let mut cursor = MIXED.len();
         boundary(MIXED, cursor);
@@ -6459,6 +6555,20 @@ mod tests {
         assert_eq!(sanitize_pasted_text("a\tb"), "a b");
         assert_eq!(sanitize_pasted_text("a\u{7}b"), "ab");
         assert_eq!(sanitize_pasted_text("🙂\nтест"), "🙂 тест");
+    }
+
+    #[test]
+    fn file_names_drop_escape_sequences_and_bidi_overrides() {
+        assert_eq!(
+            safe_file_name("../evil\x1b[31m\u{202E}.txt"),
+            "evil[31m.txt"
+        );
+        assert_eq!(safe_file_name("\x1b\u{202E}"), "download");
+        assert_eq!(safe_file_name("🙂 שלום.txt"), "🙂 שלום.txt");
+        assert_eq!(
+            invite_file_name("Alice\x1b[31m\u{202E}"),
+            "Alice[31m_lastchance.invite"
+        );
     }
 
     #[test]

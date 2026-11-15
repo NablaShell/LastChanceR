@@ -24,6 +24,9 @@ pub const HEADER_IDENTITY: &str = "X-Auth-Identity";
 pub const HEADER_TIMESTAMP: &str = "X-Auth-Timestamp";
 pub const HEADER_NONCE: &str = "X-Auth-Nonce";
 pub const HEADER_SIGNATURE: &str = "X-Auth-Signature";
+/// Открытый Ed25519-ключ отправителя (hex). Позволяет проверить подпись без
+/// поиска контакта, что нужно отдельному файловому серверу.
+pub const HEADER_IDENTITY_KEY: &str = "X-Identity-Key";
 
 /// Допустимое опоздание запроса (timestamp в прошлом).
 pub const TIMESTAMP_WINDOW_SECS: i64 = 60;
@@ -132,6 +135,53 @@ pub fn sign_request(
     let canonical = canonical_request(method, path, query, timestamp, nonce, body);
     let signature = signing_key.sign(&canonical);
     base64url_encode(&signature.to_bytes())
+}
+
+/// Подписанные заголовки одного запроса.
+///
+/// Используется файловым API (`/upload`, `/download`), чтобы не дублировать
+/// генерацию timestamp/nonce и сборку заголовков в sender/listener.
+pub struct RequestSignature {
+    pub identity_hash: String,
+    pub identity_key: String,
+    pub timestamp: i64,
+    pub nonce: String,
+    pub signature: String,
+}
+
+impl RequestSignature {
+    /// Подписывает запрос тем же каноническим конвертом, что `/push` и
+    /// `/pull` (H-4). Каждый вызов получает свежие `timestamp` и `nonce`.
+    pub fn sign(
+        signing_key: &SigningKey,
+        method: &str,
+        path: &str,
+        query: &str,
+        body: &[u8],
+    ) -> Self {
+        let timestamp = chrono::Utc::now().timestamp();
+        let nonce = generate_nonce();
+        let signature = sign_request(signing_key, method, path, query, timestamp, &nonce, body);
+
+        Self {
+            identity_hash: hash_ed25519_public(signing_key.verifying_key().as_bytes()),
+            identity_key: hex::encode(signing_key.verifying_key().as_bytes()),
+            timestamp,
+            nonce,
+            signature,
+        }
+    }
+
+    /// Заголовки для [`reqwest::RequestBuilder`]-подобного API.
+    pub fn headers(&self) -> [(&'static str, String); 5] {
+        [
+            (HEADER_IDENTITY, self.identity_hash.clone()),
+            (HEADER_IDENTITY_KEY, self.identity_key.clone()),
+            (HEADER_TIMESTAMP, self.timestamp.to_string()),
+            (HEADER_NONCE, self.nonce.clone()),
+            (HEADER_SIGNATURE, self.signature.clone()),
+        ]
+    }
 }
 
 /// Параметры проверяемого HTTP-запроса.

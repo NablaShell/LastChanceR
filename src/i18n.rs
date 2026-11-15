@@ -195,8 +195,14 @@ texts! {
     ttl_status_off: "RAM TTL is off", "RAM TTL выключен";
     ttl_status_on: "RAM TTL: {} (one-way; new messages are RAM-only)", "RAM TTL: {} (односторонний; новые сообщения только в RAM)";
     ttl_status_synced: "RAM TTL-SYN: {} (synced with peer)", "RAM TTL-SYN: {} (синхронизирован с собеседником)";
+    ttl_status_pending: "RAM TTL-SYN: {} (applied locally, not confirmed)", "RAM TTL-SYN: {} (применён локально, не подтверждён)";
     ttl_enabled_local: "RAM TTL enabled: {} (one-way)", "RAM TTL включён: {} (односторонний)";
     ttl_enabled_synced: "RAM TTL-SYN enabled: {} (peer notified)", "RAM TTL-SYN включён: {} (собеседник уведомлён)";
+    ttl_enabled_pending: "RAM TTL-SYN enabled locally: {} (not confirmed: {}); retry: /ttl-syn-retry", "RAM TTL-SYN включён локально: {} (не подтверждён: {}); повтор: /ttl-syn-retry";
+    ttl_retry_done: "RAM TTL-SYN confirmed with peer", "RAM TTL-SYN подтверждён собеседником";
+    ttl_retry_error: "Failed to confirm RAM TTL: {}", "Не удалось подтвердить RAM TTL: {}";
+    ttl_retry_nothing: "Nothing to confirm: RAM TTL is not active", "Нечего подтверждать: RAM TTL не активен";
+    ttl_retry_not_pending: "No unconfirmed TTL update to resend", "Нет неподтверждённого обновления TTL для повторной отправки";
     ttl_disabled_local: "RAM TTL disabled", "RAM TTL выключен";
     ttl_disabled_synced: "RAM TTL-SYN disabled; peer notified", "RAM TTL-SYN выключен; собеседник уведомлён";
     ttl_invalid: "Invalid TTL duration: {} (use 30s, 5m, 2h or off)", "Некорректная длительность TTL: {} (используйте 30s, 5m, 2h или off)";
@@ -207,6 +213,7 @@ texts! {
     ttl_self_disabled: "RAM-TTL sync disabled", "Синхронизация RAM-TTL выключена";
     ttl_badge: "[RAM TTL: {}s]", "[RAM TTL: {}s]";
     ttl_badge_synced: "[RAM TTL-SYN: {}s]", "[RAM TTL-SYN: {}s]";
+    ttl_badge_pending: "[RAM TTL-SYN: {}s, unconfirmed]", "[RAM TTL-SYN: {}s, не подтверждён]";
     ttl_purge_error: "TTL cleanup error: {}", "Ошибка очистки TTL: {}";
 
     // ---------- Double Ratchet ----------
@@ -532,6 +539,7 @@ const EN_HELP_SECTIONS: &[HelpSection] = &[
             HelpRow { keys: "/messages [limit]", desc: "Recent messages in the active room" },
             HelpRow { keys: "/ttl [duration|off]", desc: "One-way RAM-only TTL for new messages (30s, 5m, 2h); without an argument — status" },
             HelpRow { keys: "/ttl-syn [duration|off]", desc: "Two-way RAM TTL: the peer receives the same timer via an encrypted SetTtl" },
+            HelpRow { keys: "/ttl-syn-retry", desc: "Resend an unconfirmed two-way TTL after a delivery error" },
             HelpRow { keys: "/ratchet-reset", desc: "Reset the Double Ratchet session with the active contact and reinitialize it" },
             HelpRow { keys: "/sendfile, /sf [--force] <path>", desc: "Send a file; path is from the current directory, ~/ or absolute; system folders require --force" },
             HelpRow { keys: "/download, /dl [id | name | hash] [path]", desc: "Download a room file (the latest by default) to ./downloads" },
@@ -603,6 +611,7 @@ const RU_HELP_SECTIONS: &[HelpSection] = &[
             HelpRow { keys: "/messages [limit]", desc: "Последние сообщения активной комнаты" },
             HelpRow { keys: "/ttl [duration|off]", desc: "Односторонний RAM-TTL для новых сообщений (30s, 5m, 2h); без аргумента — статус" },
             HelpRow { keys: "/ttl-syn [duration|off]", desc: "Двусторонний RAM-TTL: собеседник получает тот же таймер через зашифрованный SetTtl" },
+            HelpRow { keys: "/ttl-syn-retry", desc: "Повторно отправить неподтверждённый двусторонний TTL после ошибки доставки" },
             HelpRow { keys: "/ratchet-reset", desc: "Сбросить сессию Double Ratchet с активным контактом и инициализировать её заново" },
             HelpRow { keys: "/sendfile, /sf [--force] <path>", desc: "Отправить файл; путь от текущей директории, ~/ и абсолютный; системные папки — только с --force" },
             HelpRow { keys: "/download, /dl [id | name | hash] [path]", desc: "Скачать файл комнаты (по умолчанию последний) в ./downloads" },

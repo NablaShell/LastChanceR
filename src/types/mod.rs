@@ -41,6 +41,28 @@ pub fn truncate_display(value: &str, max_chars: usize) -> String {
     out
 }
 
+/// Убирает символы, которыми можно управлять терминалом или подменить
+/// направление текста.
+///
+/// Управляющие `C0`/`C1`-символы (включая `ESC`) отбрасываются, поэтому
+/// ANSI-последовательности не переживают санитизацию. Из bidi-разметки
+/// удаляются только явные embedding/override/isolate-маркеры: обычный
+/// Unicode (кириллица, эмодзи, RTL-буквы) сохраняется как есть.
+pub fn sanitize_display_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| !c.is_control() && !is_bidi_control(*c))
+        .collect()
+}
+
+fn is_bidi_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{202A}'..='\u{202E}' // LRE, RLE, PDF, LRO, RLO
+            | '\u{2066}'..='\u{2069}' // LRI, RLI, FSI, PDI
+    )
+}
+
 /// Короткое представление идентификатора для UI и логов: 6 символов + `…`.
 ///
 /// Работает по `char`, а не по байтам, поэтому не паникует на кириллице,
@@ -107,6 +129,7 @@ pub fn parse_file_notification_checked(text: &str) -> Result<Option<FileNotifica
     };
 
     let file_name = file_name
+        .map(|name| sanitize_display_text(&name))
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| format!("file_{}", bare_hash.chars().take(8).collect::<String>()));
 
@@ -178,6 +201,31 @@ mod tests {
             );
             assert!(parse_file_notification(&text).is_none());
         }
+    }
+
+    #[test]
+    fn display_text_drops_controls_and_bidi_overrides() {
+        assert_eq!(
+            sanitize_display_text("Alice\x1b[31m\u{202E}Bob\u{2066}!"),
+            "Alice[31mBob!"
+        );
+        assert_eq!(sanitize_display_text("a\nb\tc\u{7f}d"), "abcd");
+    }
+
+    #[test]
+    fn display_text_keeps_legitimate_unicode() {
+        assert_eq!(sanitize_display_text("🙂 שלום مرحبا"), "🙂 שלום مرحبا");
+        assert_eq!(sanitize_display_text("Иван 🙂"), "Иван 🙂");
+    }
+
+    #[test]
+    fn file_notification_sanitizes_name() {
+        let hash = "a".repeat(64);
+        let text = format!("📎 Файл: report\x1b[31m\u{202E}.pdf\nХеш: {}", hash);
+        let parsed = parse_file_notification_checked(&text)
+            .unwrap()
+            .expect("file notification");
+        assert_eq!(parsed.file_name, "report[31m.pdf");
     }
 
     #[test]

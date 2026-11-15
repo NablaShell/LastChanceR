@@ -32,6 +32,17 @@ pub const DELIVERY_TTL: Duration = Duration::from_secs(300);
 /// Жёсткий предел таблицы дедупликации (fail-closed по памяти, не по трафику).
 pub const MAX_DELIVERY_ENTRIES: usize = 8192;
 
+/// L-1: сколько успешных bootstrap-резолвов alias -> room помнить.
+///
+/// Кэш нужен, чтобы повторный bootstrap-пакет не запускал HKDF по всем
+/// контактам. Ключ — alias, выведенный из `session_id`, поэтому подделать
+/// запись без знания общего секрета нельзя.
+pub const MAX_BOOTSTRAP_CACHE_ENTRIES: usize = 256;
+/// L-1: всплеск HKDF-сканирований неизвестных bootstrap-пакетов.
+pub const BOOTSTRAP_SCAN_BURST: u32 = 16;
+/// L-1: пополнение бюджета сканирований — одно разрешение на интервал.
+pub const BOOTSTRAP_SCAN_REFILL: Duration = Duration::from_millis(500);
+
 /// Куда адресован входящий пакет.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Route {
@@ -95,6 +106,54 @@ pub struct RoutingStats {
     pub unknown_rooms: u64,
     pub stale_sessions: u64,
     pub replayed_packets: u64,
+    /// L-1: сколько HKDF-сканований контактов выполнено для неизвестных
+    /// bootstrap-пакетов (включая попадания в кэш alias -> room).
+    pub bootstrap_hkdf_attempts: u64,
+    /// L-1: сколько неизвестных bootstrap-пакетов отброшено лимитером.
+    pub bootstrap_rate_limited: u64,
+    /// L-1: сколько bootstrap-пакетов разрешено без сканирования контактов.
+    pub bootstrap_cache_hits: u64,
+    /// L-2: фактическое число AEAD-попыток в храповике.
+    pub aead_attempts: u64,
+}
+
+/// L-1: token bucket для HKDF-сканирований неизвестных bootstrap-пакетов.
+///
+/// Один пакет стоит один токен независимо от числа контактов, поэтому
+/// флуд случайными alias ограничен сверху `burst * contacts` HKDF-вызовами
+/// на всплеск. Легитимный первый контакт может попасть под лимит во время
+/// атаки; отказ временный, бюджет пополняется.
+#[derive(Debug)]
+struct BootstrapScanLimiter {
+    tokens: u32,
+    last_refill: Instant,
+}
+
+impl Default for BootstrapScanLimiter {
+    fn default() -> Self {
+        Self {
+            tokens: BOOTSTRAP_SCAN_BURST,
+            last_refill: Instant::now(),
+        }
+    }
+}
+
+impl BootstrapScanLimiter {
+    fn allow(&mut self, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.last_refill);
+        let refill = u32::try_from(elapsed.as_millis() / BOOTSTRAP_SCAN_REFILL.as_millis())
+            .unwrap_or(u32::MAX);
+        if refill > 0 {
+            self.tokens = self.tokens.saturating_add(refill).min(BOOTSTRAP_SCAN_BURST);
+            self.last_refill += BOOTSTRAP_SCAN_REFILL * refill;
+        }
+
+        if self.tokens == 0 {
+            return false;
+        }
+        self.tokens -= 1;
+        true
+    }
 }
 
 /// Таблица alias -> комната и окно дедупликации доставки.
@@ -109,6 +168,10 @@ pub struct InboundRouter {
     seen: HashSet<DeliveryKey>,
     order: VecDeque<(Instant, DeliveryKey)>,
     delivery_ttl: Duration,
+    /// L-1: положительный кэш bootstrap alias -> room.
+    bootstrap_cache: HashMap<Alias, String>,
+    bootstrap_cache_order: VecDeque<Alias>,
+    bootstrap_limiter: BootstrapScanLimiter,
     stats: RoutingStats,
 }
 
@@ -146,6 +209,58 @@ impl InboundRouter {
     pub fn remove_room(&mut self, room: &str) {
         self.active.retain(|_, mapped| mapped != room);
         self.retired.retain(|_, mapped| mapped != room);
+        self.bootstrap_cache.retain(|_, mapped| mapped != room);
+        let cache = &self.bootstrap_cache;
+        self.bootstrap_cache_order
+            .retain(|alias| cache.contains_key(alias));
+    }
+
+    /// L-1: возвращает закэшированную комнату для bootstrap-alias.
+    pub fn cached_bootstrap_room(&mut self, alias: Alias) -> Option<String> {
+        let room = self.bootstrap_cache.get(&alias).cloned();
+        if room.is_some() {
+            self.stats.bootstrap_cache_hits = self.stats.bootstrap_cache_hits.saturating_add(1);
+        }
+        room
+    }
+
+    /// L-1: запоминает успешный bootstrap-резолв alias -> room.
+    ///
+    /// Кэш ограничен по числу записей: старейший alias вытесняется, поэтому
+    /// флуд не может раздувать память.
+    pub fn cache_bootstrap_room(&mut self, alias: Alias, room: String) {
+        if self.bootstrap_cache.insert(alias, room).is_none() {
+            self.bootstrap_cache_order.push_back(alias);
+        }
+
+        while self.bootstrap_cache_order.len() > MAX_BOOTSTRAP_CACHE_ENTRIES {
+            if let Some(evicted) = self.bootstrap_cache_order.pop_front() {
+                self.bootstrap_cache.remove(&evicted);
+            }
+        }
+    }
+
+    /// L-1: разрешает одну попытку HKDF-резолва неизвестного bootstrap.
+    pub fn allow_bootstrap_scan(&mut self, now: Instant) -> bool {
+        if self.bootstrap_limiter.allow(now) {
+            return true;
+        }
+        self.stats.bootstrap_rate_limited =
+            self.stats.bootstrap_rate_limited.saturating_add(1);
+        false
+    }
+
+    /// L-1: учитывает фактически выполненные HKDF-вызовы.
+    pub fn note_bootstrap_hkdf(&mut self, attempts: usize) {
+        self.stats.bootstrap_hkdf_attempts = self
+            .stats
+            .bootstrap_hkdf_attempts
+            .saturating_add(attempts as u64);
+    }
+
+    /// L-2: учитывает AEAD-попытки, выполненные храповиком.
+    pub fn note_aead_attempts(&mut self, attempts: usize) {
+        self.stats.aead_attempts = self.stats.aead_attempts.saturating_add(attempts as u64);
     }
 
     /// Ищет комнату по alias, обновляя счётчики.

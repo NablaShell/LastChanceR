@@ -12,13 +12,19 @@ use std::path::{Path, PathBuf};
 ///
 /// Комментарии тоже сканируются: упоминание паттерна в комментарии — повод
 /// явно объяснить его в ревью, а не оставить случайно.
-const BANNED_PATTERNS: [&str; 6] = [
+const BANNED_PATTERNS: [&str; 9] = [
     ".private_key.clone()",
     ".seed_phrase.clone()",
     ".ed25519_private_key.clone()",
     ".private_key.to_vec()",
     ".ed25519_private_key.to_vec()",
     "current_root_key",
+    // L-4: общий секрет комнаты живёт только в `SharedSecret` внутри
+    // `HashMap` и не возвращается по значению. Старый accessor и сырой
+    // массив как тип значения снова появятся здесь, если защиту уберут.
+    "get_shared_secret",
+    "HashMap<String, [u8; 32]>",
+    ".expose().to_owned()",
 ];
 
 fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
