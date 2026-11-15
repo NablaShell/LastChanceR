@@ -75,6 +75,8 @@ struct FileEntry {
     id: usize,
     room_hash: String,
     file_hash: String,
+    /// Идентификатор конверта из E2E-уведомления (если оно нового формата).
+    file_id: Option<String>,
     file_name: String,
     /// Время сообщения о файле (unix timestamp) — чтобы выбрать последний.
     timestamp: i64,
@@ -874,12 +876,13 @@ fn load_room_feed(app: &App, state: &mut UiState) -> Vec<FeedEntry> {
                 let time = m.timestamp.format("%H:%M:%S").to_string();
 
                 let text = match parse_file_notification(&m.text) {
-                    Some((file_name, file_hash)) => {
+                    Some(notification) => {
                         let id = register_file(
                             state,
                             &room,
-                            &file_name,
-                            &file_hash,
+                            &notification.file_name,
+                            &notification.file_hash,
+                            notification.file_id.as_deref(),
                             m.timestamp.timestamp(),
                         );
                         let sender = if outgoing {
@@ -887,7 +890,14 @@ fn load_room_feed(app: &App, state: &mut UiState) -> Vec<FeedEntry> {
                         } else {
                             room_title.as_str()
                         };
-                        file_feed_line(&time, sender, id, &file_name, outgoing, state.lang)
+                        file_feed_line(
+                            &time,
+                            sender,
+                            id,
+                            &notification.file_name,
+                            outgoing,
+                            state.lang,
+                        )
                     }
                     None => format!("[{}] {}", time, m.text),
                 };
@@ -916,6 +926,7 @@ fn register_file(
     room_hash: &str,
     file_name: &str,
     file_hash: &str,
+    file_id: Option<&str>,
     timestamp: i64,
 ) -> usize {
     if let Some(existing) = state
@@ -924,6 +935,9 @@ fn register_file(
         .find(|f| f.room_hash == room_hash && f.file_hash == file_hash)
     {
         existing.timestamp = timestamp;
+        if let Some(file_id) = file_id {
+            existing.file_id = Some(file_id.to_string());
+        }
         return existing.id;
     }
 
@@ -933,6 +947,7 @@ fn register_file(
         id,
         room_hash: room_hash.to_string(),
         file_hash: file_hash.to_string(),
+        file_id: file_id.map(str::to_string),
         file_name: file_name.to_string(),
         timestamp,
     });
@@ -3172,8 +3187,18 @@ fn handle_app_event(app: &Arc<App>, state: &mut UiState, event: AppEvent) {
             };
 
             if room_hash == state.room {
-                if let Some((file_name, file_hash)) = incoming_file {
-                    let id = register_file(state, &room_hash, &file_name, &file_hash, timestamp);
+                if let Some(notification) = incoming_file {
+                    let file_name = notification.file_name;
+                    let file_hash = notification.file_hash;
+                    let file_id = notification.file_id;
+                    let id = register_file(
+                        state,
+                        &room_hash,
+                        &file_name,
+                        &file_hash,
+                        file_id.as_deref(),
+                        timestamp,
+                    );
                     state.feed.push(FeedEntry {
                         kind: if outgoing {
                             FeedKind::Outgoing
@@ -3207,10 +3232,19 @@ fn handle_app_event(app: &Arc<App>, state: &mut UiState, event: AppEvent) {
                 let count = *count;
 
                 let file_note = match incoming_file {
-                    Some((file_name, file_hash)) => {
-                        let id =
-                            register_file(state, &room_hash, &file_name, &file_hash, timestamp);
-                        tr(state.lang.texts().unread_file_note, &[&id.to_string(), &file_name])
+                    Some(notification) => {
+                        let id = register_file(
+                            state,
+                            &room_hash,
+                            &notification.file_name,
+                            &notification.file_hash,
+                            notification.file_id.as_deref(),
+                            timestamp,
+                        );
+                        tr(
+                            state.lang.texts().unread_file_note,
+                            &[&id.to_string(), &notification.file_name],
+                        )
                     }
                     None => String::new(),
                 };
@@ -3269,6 +3303,7 @@ fn handle_app_event(app: &Arc<App>, state: &mut UiState, event: AppEvent) {
         AppEvent::UploadCompleted {
             file_name,
             file_hash,
+            file_id,
             file_size,
         } => {
             let room = state.room.clone();
@@ -3277,6 +3312,7 @@ fn handle_app_event(app: &Arc<App>, state: &mut UiState, event: AppEvent) {
                 &room,
                 &file_name,
                 &file_hash,
+                Some(&file_id),
                 chrono::Utc::now().timestamp(),
             );
             let size = file_size
@@ -5005,12 +5041,13 @@ async fn handle_command(
                             let time = m.timestamp.format("%H:%M:%S").to_string();
 
                             let line = match parse_file_notification(&m.text) {
-                                Some((file_name, file_hash)) => {
+                                Some(notification) => {
                                     let id = register_file(
                                         state,
                                         &room,
-                                        &file_name,
-                                        &file_hash,
+                                        &notification.file_name,
+                                        &notification.file_hash,
+                                        notification.file_id.as_deref(),
                                         m.timestamp.timestamp(),
                                     );
                                     let sender = if outgoing {
@@ -5018,7 +5055,14 @@ async fn handle_command(
                                     } else {
                                         room_title.as_str()
                                     };
-                                    file_feed_line(&time, sender, id, &file_name, outgoing, state.lang)
+                                    file_feed_line(
+                                        &time,
+                                        sender,
+                                        id,
+                                        &notification.file_name,
+                                        outgoing,
+                                        state.lang,
+                                    )
                                 }
                                 None => format!("[{}] {} {}", time, dir, m.text),
                             };
@@ -5273,6 +5317,7 @@ async fn handle_command(
             let app_ref = app.clone();
             let room = file.room_hash.clone();
             let file_hash = file.file_hash.clone();
+            let file_id = file.file_id.clone();
             let target_display = format!("#{} {}", file.id, file.file_name);
             let tx = ui_tx.clone();
             state.status = tr(state.lang.texts().download_saving, &[&target_display]);
@@ -5280,7 +5325,7 @@ async fn handle_command(
 
             tokio::spawn(async move {
                 match app_ref
-                    .download_and_save_file(&room, &file_hash, &path_display)
+                    .download_and_save_file(&room, &file_hash, file_id.as_deref(), &path_display)
                     .await
                 {
                     Ok(()) => {

@@ -357,6 +357,22 @@ pub struct DecryptedFile {
     pub data: Vec<u8>,
 }
 
+/// Извлекает `file_id` из заголовка v3-конверта без расшифровки.
+///
+/// Отправитель кладёт этот идентификатор в E2E-уведомление, а получатель
+/// сверяет его с `DecryptedFile::file_id` после [`decrypt_file_v3`]. Это
+/// связывает уведомление с конкретным конвертом, даже если у пары/комнаты
+/// есть несколько валидных файлов.
+pub fn file_envelope_id(envelope: &[u8]) -> Option<[u8; FILE_ID_SIZE]> {
+    if envelope.len() < FILE_HEADER_SIZE || envelope[0] != FILE_VERSION_V3 {
+        return None;
+    }
+
+    let mut file_id = [0u8; FILE_ID_SIZE];
+    file_id.copy_from_slice(&envelope[1..1 + FILE_ID_SIZE]);
+    Some(file_id)
+}
+
 fn file_key(shared_secret: &[u8; 32], file_id: &[u8; FILE_ID_SIZE]) -> Result<Zeroizing<[u8; 32]>> {
     let hkdf = Hkdf::<Sha256>::new(Some(file_id), shared_secret);
     let mut key = Zeroizing::new([0u8; 32]);

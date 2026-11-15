@@ -20,7 +20,9 @@ use crate::storage::{
     Contact, Message, SafeFSOps, Storage, TOFU_CHANGED, TOFU_PENDING, TOFU_VERIFIED,
 };
 use crate::storage::paths::create_private_file;
-use crate::types::{parse_file_notification_checked, truncate_display, FileHash};
+use crate::types::{
+    normalize_file_id, parse_file_notification_checked, truncate_display, FileHash,
+};
 use crate::vault::{self, MasterKey, Vault};
 
 // ============================================================
@@ -61,6 +63,9 @@ pub enum AppEvent {
     UploadCompleted {
         file_name: String,
         file_hash: String,
+        /// Случайный `file_id` конверта (32 hex-символа): попадает в
+        /// E2E-уведомление и проверяется при скачивании.
+        file_id: String,
         file_size: Option<i64>,
     },
     UploadError {
@@ -2023,6 +2028,13 @@ impl App {
             room_hash,
         )?;
 
+        // Идентификатор известен из открытого заголовка конверта; он
+        // уйдёт в E2E-уведомление, чтобы получатель мог отличить этот
+        // конверт от любого другого валидного файла той же комнаты.
+        let file_id = crypto::file_envelope_id(&encrypted_data)
+            .ok_or_else(|| anyhow!("encrypted file envelope has no file id"))?;
+        let file_id_hex = hex::encode(file_id);
+
         // Emit progress event
         self.emit_event(AppEvent::UploadProgress {
             status: texts.upload_sending.to_string(),
@@ -2060,6 +2072,7 @@ impl App {
         self.emit_event(AppEvent::UploadCompleted {
             file_name: file_name.to_string(),
             file_hash: file_hash.clone(),
+            file_id: file_id_hex.clone(),
             file_size: Some(file_size),
         });
 
@@ -2068,7 +2081,8 @@ impl App {
             .file_notification
             .replacen("{}", file_name, 1)
             .replacen("{}", &humanize_bytes(file_size as u64), 1)
-            .replacen("{}", &file_hash, 1);
+            .replacen("{}", &file_hash, 1)
+            .replacen("{}", &file_id_hex, 1);
 
         self.send_message(room_hash, &message_text).await?;
 
@@ -2079,17 +2093,25 @@ impl App {
         &self,
         room_hash: &str,
         file_hash: &str,
+        file_id: Option<&str>,
         save_path: &str,
     ) -> Result<()> {
         // Хеш приходит из сообщения/UI и уходит в URL: валидируем до сети.
         let bare_hash = file_hash.strip_prefix("sha256:").unwrap_or(file_hash);
-        FileHash::from_hex(bare_hash).map_err(|e| {
+        let expected_hash = FileHash::from_hex(bare_hash).map_err(|e| {
             anyhow!(
                 "invalid file hash ({}…): {}",
                 truncate_display(file_hash, 16),
                 e
             )
         })?;
+        let expected_file_id =
+            match file_id {
+                Some(id) => Some(normalize_file_id(id).map_err(|e| {
+                    anyhow!("invalid file id ({}…): {}", truncate_display(id, 16), e)
+                })?),
+                None => None,
+            };
 
         // Emit download started event
         self.emit_event(AppEvent::DownloadStarted);
@@ -2104,6 +2126,26 @@ impl App {
                 return Err(anyhow!("download failed: {}", e));
             }
         };
+
+        // Транспортная целостность: сервер обязан вернуть ровно тот
+        // конверт, чей sha256 записан в E2E-уведомлении. Проверка стоит
+        // до AEAD/дешифровки и отсекает подмену «другого файла по тому же
+        // URL». Аутентичность привязки к уведомлению даёт file_id ниже.
+        let downloaded_hash = crate::network::auth::body_hash(&encrypted_data);
+        if downloaded_hash != expected_hash.to_string() {
+            let error = format!(
+                "file hash mismatch: expected {}, got {}",
+                expected_hash,
+                truncate_display(&downloaded_hash, 16)
+            );
+            self.emit_event(AppEvent::DownloadError {
+                error: error.clone(),
+            });
+            return Err(anyhow!(
+                "downloaded envelope failed integrity check: {}",
+                error
+            ));
+        }
 
         // Shared secret берём именно у комнаты файла: /dl может найти файл
         // среди полученных за сессию, не переключая активную комнату.
@@ -2126,6 +2168,28 @@ impl App {
                 return Err(anyhow!("decryption failed: {}", e));
             }
         };
+
+        // `file_hash` покрывает байты конверта, но не доказывает, что это
+        // файл из уведомления, если хеш когда-либо придёт из другого
+        // источника. `file_id` из E2E-текста связан с AAD и различает два
+        // валидных конверта одной пары/комнаты.
+        if let Some(expected_id) = expected_file_id.as_deref() {
+            let actual_id = hex::encode(file.file_id);
+            if actual_id != expected_id {
+                let error = format!(
+                    "file id mismatch: expected {}, got {}",
+                    truncate_display(expected_id, 16),
+                    truncate_display(&actual_id, 16)
+                );
+                self.emit_event(AppEvent::DownloadError {
+                    error: error.clone(),
+                });
+                return Err(anyhow!(
+                    "downloaded file does not match file notification: {}",
+                    error
+                ));
+            }
+        }
         let file_data = file.data;
 
         // Save file. Путь выбирает пользователь (например, ./downloads/...),
@@ -2411,6 +2475,45 @@ mod tests {
         format!("http://{addr}")
     }
 
+    /// HTTP-stub файлового сервера: на любой GET отвечает заданным телом.
+    /// Нужен для проверки подмены конверта по `/download/<hash>`.
+    async fn spawn_file_stub(body: Vec<u8>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = [0u8; 4096];
+                let mut data = Vec::new();
+                loop {
+                    let n = match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    data.extend_from_slice(&buf[..n]);
+                    if data.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(headers.as_bytes()).await;
+                let _ = stream.write_all(&body).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
     fn test_invite_variant(seed: u8, x_seed: u8, nickname: &str) -> IdentityInvite {
         let signing_key = SigningKey::from_bytes(&[seed; 32]);
         let x_secret = X25519Secret::from([x_seed; 32]);
@@ -2497,6 +2600,73 @@ mod tests {
         assert_eq!(humanize_bytes(1024), "1.0 KB");
         assert_eq!(humanize_bytes(1024 * 1024), "1.0 MB");
         assert_eq!(humanize_bytes(1024 * 1024 * 1024), "1.0 GB");
+    }
+
+    /// M-B: сервер отдаёт валидный конверт *другого* файла.
+    ///
+    /// 1. По URL с hash(A) приходит B — отказ по sha256 до дешифровки.
+    /// 2. Хеш совпадает с B, но file_id в E2E-уведомлении от A — отказ
+    ///    после дешифровки, потому что file_id входит в AAD конверта.
+    #[tokio::test]
+    async fn download_rejects_substituted_envelope_by_hash_and_file_id() {
+        let (app, temp_dir, _receiver) = setup_test_app();
+        let room = app.identity.hash.clone();
+        let secret = app.get_shared_secret(&room).unwrap();
+
+        let envelope_a =
+            crypto::encrypt_file_v3(b"contents of A", "a.txt", &secret, &room, &room, &room)
+                .unwrap();
+        let envelope_b =
+            crypto::encrypt_file_v3(b"contents of B", "b.txt", &secret, &room, &room, &room)
+                .unwrap();
+        let hash_a = crate::network::auth::body_hash(&envelope_a);
+        let hash_b = crate::network::auth::body_hash(&envelope_b);
+        let id_a = hex::encode(crypto::file_envelope_id(&envelope_a).unwrap());
+        let id_b = hex::encode(crypto::file_envelope_id(&envelope_b).unwrap());
+        assert_ne!(hash_a, hash_b);
+        assert_ne!(id_a, id_b);
+
+        // Сервер отвечает байтами B на любой GET /download/<hash>.
+        let stub = spawn_file_stub(envelope_b).await;
+        app.update_config(Config {
+            file_server_url: stub,
+            ..Config::default()
+        })
+        .unwrap();
+
+        // 1. hash(A) в URL, но сервер вернул B: отказ до AEAD.
+        let out_a = temp_dir.path().join("substituted_a.bin");
+        let err = app
+            .download_and_save_file(&room, &hash_a, Some(&id_a), out_a.to_str().unwrap())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("hash mismatch"),
+            "unexpected error: {:#}",
+            err
+        );
+        assert!(!out_a.exists());
+
+        // 2. Хеш B настоящий, но file_id принадлежит A: ловится только
+        //    после decrypt_file_v3, до записи на диск.
+        let out_b = temp_dir.path().join("substituted_b.bin");
+        let err = app
+            .download_and_save_file(&room, &hash_b, Some(&id_a), out_b.to_str().unwrap())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("file id mismatch"),
+            "unexpected error: {:#}",
+            err
+        );
+        assert!(!out_b.exists());
+
+        // 3. Контроль: совпадающие hash и file_id принимаются.
+        let out_ok = temp_dir.path().join("accepted.bin");
+        app.download_and_save_file(&room, &hash_b, Some(&id_b), out_ok.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&out_ok).unwrap(), b"contents of B");
     }
 
     #[test]

@@ -483,7 +483,7 @@ texts! {
     upload_encrypting: "Encrypting...", "Шифрование...";
     upload_sending: "Sending to server...", "Отправка на сервер...";
     upload_finished: "Completed", "Завершено";
-    file_notification: "📎 File: {}\nSize: {}\nHash: {}", "📎 Файл: {}\nРазмер: {}\nХеш: {}";
+    file_notification: "📎 File: {}\nSize: {}\nHash: {}\nFile ID: {}", "📎 Файл: {}\nРазмер: {}\nХеш: {}\nFile ID: {}";
 
     // ---------- Welcome ----------
     welcome_status: "choose interface language · ←/→ or 1/2 · Enter — confirm", "выберите язык интерфейса · ←/→ или 1/2 · Enter — подтвердить";

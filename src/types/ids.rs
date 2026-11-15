@@ -14,6 +14,9 @@ pub const HEX_ID_BYTES: usize = 32;
 /// Длина hex-представления идентификатора.
 pub const HEX_ID_LEN: usize = HEX_ID_BYTES * 2;
 
+/// Длина `file_id` v3-конверта в hex-символах (16 случайных байт).
+pub const FILE_ID_HEX_LEN: usize = 32;
+
 /// Ошибка разбора идентификатора.
 ///
 /// Намеренно не содержит исходную строку целиком: недоверенный ввод
@@ -66,6 +69,29 @@ fn decode_hex_id(bytes: &[u8]) -> Result<[u8; HEX_ID_BYTES], IdError> {
         out[index] = (high << 4) | low;
     }
     Ok(out)
+}
+
+/// Проверяет ровно 32 hex-символа и возвращает канонический lower-case hex.
+///
+/// `file_id` лежит в открытом заголовке v3-конверта и дублируется в
+/// E2E-уведомлении о файле. До сверки с расшифрованным конвертом значение
+/// нормализуется: верхний регистр и любые не-hex байты отклоняются.
+pub fn normalize_file_id(value: &str) -> Result<String, IdError> {
+    let bytes = value.as_bytes();
+    if bytes.len() != FILE_ID_HEX_LEN {
+        return Err(IdError::InvalidLength {
+            expected: FILE_ID_HEX_LEN,
+            actual: bytes.len(),
+        });
+    }
+
+    for (index, byte) in bytes.iter().enumerate() {
+        if hex_value(*byte).is_none() {
+            return Err(IdError::InvalidHex { index });
+        }
+    }
+
+    Ok(value.to_ascii_lowercase())
 }
 
 macro_rules! hex_id {
@@ -189,6 +215,29 @@ mod tests {
                 Err(IdError::InvalidHex { .. })
             ));
         }
+    }
+
+    #[test]
+    fn file_id_is_normalized_and_validated() {
+        let lower = "0123456789abcdef0123456789abcdef";
+        assert_eq!(normalize_file_id(lower).unwrap(), lower);
+        assert_eq!(
+            normalize_file_id("0123456789ABCDEF0123456789ABCDEF").unwrap(),
+            lower
+        );
+
+        for value in ["", "a", &"a".repeat(31), &"a".repeat(33)] {
+            assert!(matches!(
+                normalize_file_id(value),
+                Err(IdError::InvalidLength { .. })
+            ));
+        }
+        assert!(matches!(
+            normalize_file_id("g123456789abcdef0123456789abcdef"),
+            Err(IdError::InvalidHex { .. })
+        ));
+        // Многобайтовый UTF-8 не должен паниковать на байтовом индексе.
+        assert!(normalize_file_id(&"я".repeat(32)).is_err());
     }
 
     #[test]
