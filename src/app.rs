@@ -351,23 +351,26 @@ fn room_has_ttl(
     room_ttls: &Arc<Mutex<HashMap<String, RoomTtl>>>,
     room_hash: &str,
 ) -> bool {
-    room_ttls
+    // TTL-кэш — простое RAM-состояние: после poison карта остаётся
+    // логически целой, поэтому продолжаем с inner. Возвращать `false`
+    // при poison нельзя: это позволило бы записать ratchet на диск (H-3).
+    let ttls = room_ttls
         .lock()
-        .ok()
-        .and_then(|ttls| ttls.get(room_hash).and_then(|ttl| ttl.seconds))
-        .is_some()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    ttls.get(room_hash).and_then(|ttl| ttl.seconds).is_some()
 }
 
 /// Возвращает `session_id`, которые уже уничтожены для комнаты.
 fn retired_sessions_for(
     retired: &RetiredRatchetSessions,
     room_hash: &str,
-) -> Vec<[u8; 16]> {
-    retired
+) -> Result<Vec<[u8; 16]>> {
+    // Tombstone-и — часть replay-защиты (H-1/H-2). Poison означает, что
+    // список неизвестен; нельзя притворяться, что сессий не было.
+    let sessions = retired
         .lock()
-        .ok()
-        .and_then(|sessions| sessions.get(room_hash).cloned())
-        .unwrap_or_default()
+        .map_err(|_| anyhow!("retired session lock poisoned"))?;
+    Ok(sessions.get(room_hash).cloned().unwrap_or_default())
 }
 
 /// Переносит tombstone-и комнаты в `vault.dat` либо удаляет их.
@@ -381,7 +384,7 @@ fn persist_retired_sessions(
     ttl_active: bool,
     room_hash: &str,
 ) -> Result<()> {
-    let session_ids = retired_sessions_for(retired, room_hash);
+    let session_ids = retired_sessions_for(retired, room_hash)?;
     if ttl_active {
         storage.delete_retired_ratchet_sessions(room_hash)
     } else {
@@ -394,10 +397,12 @@ fn remember_retired_sessions(
     retired: &RetiredRatchetSessions,
     room_hash: &str,
     session_ids: impl IntoIterator<Item = [u8; 16]>,
-) {
-    let Ok(mut sessions) = retired.lock() else {
-        return;
-    };
+) -> Result<()> {
+    // Poison не позволяет безопасно дополнить список: сообщаем об ошибке,
+    // чтобы вызывающий не удалял ratchet без записанного tombstone.
+    let mut sessions = retired
+        .lock()
+        .map_err(|_| anyhow!("retired session lock poisoned"))?;
     let entry = sessions.entry(room_hash.to_string()).or_default();
     for session_id in session_ids {
         if entry.contains(&session_id) {
@@ -408,6 +413,7 @@ fn remember_retired_sessions(
             entry.remove(0);
         }
     }
+    Ok(())
 }
 
 /// Загружает состояние из `vault.dat` либо создаёт новую сессию.
@@ -498,10 +504,28 @@ fn try_ratchet_decrypt(
     retired_sessions: &RetiredRatchetSessions,
     ttl_active: bool,
 ) -> Option<DecryptedRatchet> {
-    let retired = retired_sessions_for(retired_sessions, room_hash);
+    let retired = match retired_sessions_for(retired_sessions, room_hash) {
+        Ok(retired) => retired,
+        Err(_) => {
+            warn!(
+                "Incoming packet dropped for {}: retired session lock poisoned",
+                truncate_display(room_hash, 16)
+            );
+            return None;
+        }
+    };
 
     let (plaintext, serialized, aliases) = {
-        let mut states = ratchets.lock().ok()?;
+        let mut states = match ratchets.lock() {
+            Ok(states) => states,
+            Err(_) => {
+                warn!(
+                    "Incoming packet dropped for {}: ratchet lock poisoned",
+                    truncate_display(room_hash, 16)
+                );
+                return None;
+            }
+        };
         ensure_ratchet_state(
             &mut states,
             room_hash,
@@ -549,10 +573,14 @@ fn shared_secret_for_room(
     room: &str,
     shared_secrets: &Arc<Mutex<HashMap<String, [u8; 32]>>>,
 ) -> Option<[u8; 32]> {
-    shared_secrets
-        .lock()
-        .ok()
-        .and_then(|secrets| secrets.get(room).copied())
+    match shared_secrets.lock() {
+        Ok(secrets) => secrets.get(room).copied(),
+        Err(_) => {
+            // Ключевой кэш повреждён: не подставляем «пустой» секрет.
+            warn!("Incoming packet dropped: shared secret lock poisoned");
+            None
+        }
+    }
 }
 
 /// Единственный fallback для первого пакета сессии (M-8).
@@ -566,7 +594,13 @@ fn resolve_bootstrap_room(
     nonce: &[u8; ratchet::BOOTSTRAP_NONCE_SIZE],
     shared_secrets: &Arc<Mutex<HashMap<String, [u8; 32]>>>,
 ) -> Option<(String, [u8; 32])> {
-    let secrets = shared_secrets.lock().ok()?;
+    let secrets = match shared_secrets.lock() {
+        Ok(secrets) => secrets,
+        Err(_) => {
+            warn!("Incoming packet dropped: shared secret lock poisoned");
+            return None;
+        }
+    };
     for (room, secret) in secrets.iter() {
         if ratchet::bootstrap_session_alias(secret, nonce)
             .ok()
@@ -589,8 +623,8 @@ fn clear_ratchet_state(
     // Удаление из HashMap запускает Drop для Zeroizing-ключей. Перед этим
     // запоминаем id сессий, чтобы запоздавший пакет не был принят снова,
     // и alias живых сессий для адресной таблицы (M-8).
-    let (session_ids, aliases) = if let Ok(mut states) = ratchets.lock() {
-        match states.remove(room_hash) {
+    let (session_ids, aliases) = match ratchets.lock() {
+        Ok(mut states) => match states.remove(room_hash) {
             Some(state) => {
                 let ids = state.session_ids();
                 let mut aliases = state.session_aliases().unwrap_or_default();
@@ -598,15 +632,38 @@ fn clear_ratchet_state(
                 (ids, aliases)
             }
             None => (Vec::new(), Vec::new()),
+        },
+        Err(_) => {
+            // Состояние храповика неизвестно: не трогаем ни tombstone-и,
+            // ни диск, иначе можно потерять replay-защиту (H-1/H-2).
+            warn!(
+                "Ratchet reset aborted for {}: ratchet lock poisoned",
+                truncate_display(room_hash, 16)
+            );
+            return;
         }
-    } else {
-        (Vec::new(), Vec::new())
     };
-    remember_retired_sessions(retired_sessions, room_hash, session_ids);
 
-    if let Ok(mut router) = inbound_router.lock() {
-        router.retire_room(room_hash, &aliases);
+    if let Err(e) = remember_retired_sessions(retired_sessions, room_hash, session_ids) {
+        warn!(
+            "Ratchet reset aborted for {}: {:#}",
+            truncate_display(room_hash, 16),
+            e
+        );
+        return;
     }
+
+    let mut router = match inbound_router.lock() {
+        Ok(router) => router,
+        Err(_) => {
+            warn!(
+                "Ratchet reset aborted for {}: routing lock poisoned",
+                truncate_display(room_hash, 16)
+            );
+            return;
+        }
+    };
+    router.retire_room(room_hash, &aliases);
 
     // Сначала фиксируем tombstone-и, затем удаляем состояние: сбой записи
     // оставляет старую сессию на диске, а не теряет защиту от replay.
@@ -664,7 +721,11 @@ impl App {
             vault.clone(),
         )));
         let identity = {
-            let mut manager = identity_manager.lock().unwrap();
+            // Личность содержит приватные ключи: poison = состояние
+            // неизвестно, поэтому инициализация завершается ошибкой.
+            let mut manager = identity_manager
+                .lock()
+                .map_err(|_| anyhow!("identity lock poisoned"))?;
             manager.load_or_create("")?
         };
 
@@ -690,7 +751,11 @@ impl App {
 
         {
             let contacts = storage.get_all_contacts()?;
-            let mut secrets = shared_secrets.lock().unwrap();
+            // Кэш общих секретов чувствителен к poison: не продолжаем с
+            // частично заполненной картой.
+            let mut secrets = shared_secrets
+                .lock()
+                .map_err(|_| anyhow!("shared secret lock poisoned"))?;
 
             for contact in &contacts {
                 if let Some(ed25519_hex) = contact.ed25519.as_deref() {
@@ -744,7 +809,11 @@ impl App {
                 .iter()
                 .find(|contact| secrets.contains_key(&contact.hash))
             {
-                let mut current = current_room_hash.lock().unwrap();
+                // Курсор текущей комнаты — простое UI-состояние: после
+                // poison безопасно продолжаем с inner.
+                let mut current = current_room_hash
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 *current = contact.hash.clone();
                 drop(current);
 
@@ -770,7 +839,7 @@ impl App {
                 .map_err(|_| anyhow!("ratchet lock poisoned"))?;
 
             for room in &rooms {
-                let retired = retired_sessions_for(&retired_ratchet_sessions, room);
+                let retired = retired_sessions_for(&retired_ratchet_sessions, room)?;
                 match storage.load_ratchet_state(room) {
                     Ok(Some(bytes)) => match RatchetState::from_bytes(bytes) {
                         Ok(mut state) => {
@@ -813,14 +882,15 @@ impl App {
             }
 
             // Tombstone-и очищенных сессий тоже должны отклоняться адресно.
-            if let Ok(retired) = retired_ratchet_sessions.lock() {
-                for (room, session_ids) in retired.iter() {
-                    let aliases: Vec<_> = session_ids
-                        .iter()
-                        .filter_map(|id| ratchet::session_alias(id).ok())
-                        .collect();
-                    router.register_retired(room, &aliases);
-                }
+            let retired = retired_ratchet_sessions
+                .lock()
+                .map_err(|_| anyhow!("retired session lock poisoned"))?;
+            for (room, session_ids) in retired.iter() {
+                let aliases: Vec<_> = session_ids
+                    .iter()
+                    .filter_map(|id| ratchet::session_alias(id).ok())
+                    .collect();
+                router.register_retired(room, &aliases);
             }
         }
 
@@ -1006,7 +1076,15 @@ impl App {
         };
 
         let now = std::time::Instant::now();
-        if let Ok(mut router) = inbound_router.lock() {
+        {
+            let mut router = match inbound_router.lock() {
+                Ok(router) => router,
+                Err(_) => {
+                    // Без проверки nonce пакет может оказаться replay.
+                    warn!("Incoming packet dropped: routing lock poisoned");
+                    return;
+                }
+            };
             if router.is_duplicate(info.alias, &info.nonce, now) {
                 warn!(
                     "Incoming packet rejected: {} ({})",
@@ -1018,7 +1096,14 @@ impl App {
         }
 
         let ttl_active = room_has_ttl(room_ttls, &from_hash);
-        if let Ok(mut router) = inbound_router.lock() {
+        {
+            let mut router = match inbound_router.lock() {
+                Ok(router) => router,
+                Err(_) => {
+                    warn!("Incoming packet dropped: routing lock poisoned");
+                    return;
+                }
+            };
             router.note_decrypt_attempt();
         }
         let decrypted = match try_ratchet_decrypt(
@@ -1049,7 +1134,17 @@ impl App {
 
         // Индекс обновляется после успешной расшифровки: bootstrap-сессия
         // получает адрес, а мусорные пакеты не занимают таблицу.
-        if let Ok(mut router) = inbound_router.lock() {
+        {
+            let mut router = match inbound_router.lock() {
+                Ok(router) => router,
+                Err(_) => {
+                    warn!(
+                        "Incoming packet dropped for {}: routing lock poisoned",
+                        truncate_display(&from_hash, 16)
+                    );
+                    return;
+                }
+            };
             router.register_state(&from_hash, &aliases);
             router.mark_delivered(info.alias, &info.nonce, now);
         }
@@ -1057,7 +1152,12 @@ impl App {
         // Внутренний конверт: текст с TTL-метаданными или служебные пакеты.
         let (message_text, ttl_seconds) = match crypto::decode_payload(&message) {
             Ok(crypto::E2ePayload::SetTtl { seconds }) => {
-                if let Ok(mut ttls) = room_ttls.lock() {
+                // TTL-кэш — простое RAM-состояние: poison не должен
+                // превращаться в «TTL выключен» (H-3).
+                {
+                    let mut ttls = room_ttls
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     match seconds {
                         Some(value) => {
                             ttls.insert(
@@ -1153,10 +1253,12 @@ impl App {
 
         // Входящее сообщение становится эфемерным, если TTL пришёл в
         // метаданных или включён локальный режим этой комнаты.
+        // Простое RAM-состояние: после poison продолжаем с inner.
         let local_ttl = room_ttls
             .lock()
-            .ok()
-            .and_then(|ttls| ttls.get(&from_hash).and_then(|ttl| ttl.seconds));
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&from_hash)
+            .and_then(|ttl| ttl.seconds);
         let effective_ttl = ttl_seconds.or(local_ttl);
         let expires_at = effective_ttl.map(|seconds| now_timestamp().saturating_add(seconds));
 
@@ -1353,10 +1455,11 @@ impl App {
 
         let _ = self.storage.ensure_room(&nickname, &hash);
 
+        // Курсор комнаты — простое UI-состояние: poison безопасен.
         let mut current = self
             .current_room_hash
             .lock()
-            .map_err(|_| anyhow!("current room lock poisoned"))?;
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if current.is_empty() {
             *current = hash.clone();
         }
@@ -1384,26 +1487,42 @@ impl App {
 
         self.storage.delete_contact(contact_hash)?;
 
-        if let Ok(mut secrets) = self.shared_secrets.lock() {
-            secrets.remove(contact_hash);
-        }
+        // Кэш секретов удаляем только при исправной блокировке: иначе
+        // состояние карты неизвестно.
+        let mut secrets = self
+            .shared_secrets
+            .lock()
+            .map_err(|_| anyhow!("shared secret lock poisoned"))?;
+        secrets.remove(contact_hash);
+        drop(secrets);
 
-        if let Ok(mut ttls) = self.room_ttls.lock() {
-            ttls.remove(contact_hash);
-        }
+        // TTL и курсор комнаты — простое RAM-состояние, poison безопасен.
+        self.room_ttls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(contact_hash);
 
-        if let Ok(mut ratchets) = self.ratchets.lock() {
-            ratchets.remove(contact_hash);
-        }
+        // Ratchet — fail-closed: при poison не притворяемся, что сессии нет.
+        let mut ratchets = self
+            .ratchets
+            .lock()
+            .map_err(|_| anyhow!("ratchet lock poisoned"))?;
+        ratchets.remove(contact_hash);
+        drop(ratchets);
 
-        if let Ok(mut router) = self.inbound_router.lock() {
-            router.remove_room(contact_hash);
-        }
+        let mut router = self
+            .inbound_router
+            .lock()
+            .map_err(|_| anyhow!("routing lock poisoned"))?;
+        router.remove_room(contact_hash);
+        drop(router);
 
-        if let Ok(mut current) = self.current_room_hash.lock() {
-            if current.as_str() == contact_hash {
-                current.clear();
-            }
+        let mut current = self
+            .current_room_hash
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if current.as_str() == contact_hash {
+            current.clear();
         }
 
         Ok(())
@@ -1415,7 +1534,12 @@ impl App {
     }
 
     pub fn update_nickname(&self, new_nickname: &str) -> Result<()> {
-        let mut manager = self.identity_manager.lock().unwrap();
+        // Личность/ключи — fail-closed: poison означает неизвестное
+        // состояние, запись не выполняется.
+        let mut manager = self
+            .identity_manager
+            .lock()
+            .map_err(|_| anyhow!("identity lock poisoned"))?;
         manager.update_nickname(new_nickname)?;
         Ok(())
     }
@@ -1519,7 +1643,7 @@ impl App {
         let ttl_active = self.get_room_ttl(room_hash).is_some();
         let shared_secret = self.get_shared_secret(room_hash)?;
         let identity_hash = self.identity.hash.clone();
-        let retired = retired_sessions_for(&self.retired_ratchet_sessions, room_hash);
+        let retired = retired_sessions_for(&self.retired_ratchet_sessions, room_hash)?;
 
         let (packet, serialized, aliases) = {
             let mut states = self
@@ -1550,8 +1674,12 @@ impl App {
             (packet, serialized, aliases)
         };
 
-        if let Ok(mut router) = self.inbound_router.lock() {
-            router.register_state(room_hash, &aliases);
+        match self.inbound_router.lock() {
+            Ok(mut router) => router.register_state(room_hash, &aliases),
+            Err(_) => warn!(
+                "Failed to register ratchet aliases for {}: routing lock poisoned",
+                truncate_display(room_hash, 16)
+            ),
         }
 
         if let Some(bytes) = serialized {
@@ -1588,7 +1716,13 @@ impl App {
     /// сессии не был принят как новая сессия даже после перезапуска.
     pub fn clear_ratchet(&self, room_hash: &str) -> Result<()> {
         let ttl_active = self.get_room_ttl(room_hash).is_some();
-        let (session_ids, aliases) = if let Ok(mut states) = self.ratchets.lock() {
+        let (session_ids, aliases) = {
+            // Fail-closed: при poison состояние неизвестно, поэтому не
+            // удаляем ни диск, ни tombstone-и (H-1/H-2).
+            let mut states = self
+                .ratchets
+                .lock()
+                .map_err(|_| anyhow!("ratchet lock poisoned"))?;
             match states.remove(room_hash) {
                 Some(state) => {
                     let ids = state.session_ids();
@@ -1598,16 +1732,17 @@ impl App {
                 }
                 None => (Vec::new(), Vec::new()),
             }
-        } else {
-            (Vec::new(), Vec::new())
         };
-        remember_retired_sessions(&self.retired_ratchet_sessions, room_hash, session_ids);
+        remember_retired_sessions(&self.retired_ratchet_sessions, room_hash, session_ids)?;
 
         // M-8: старый alias больше не маршрутизируется ни в какую сессию,
         // а отклоняется как StaleSession до AEAD.
-        if let Ok(mut router) = self.inbound_router.lock() {
-            router.retire_room(room_hash, &aliases);
-        }
+        let mut router = self
+            .inbound_router
+            .lock()
+            .map_err(|_| anyhow!("routing lock poisoned"))?;
+        router.retire_room(room_hash, &aliases);
+        drop(router);
 
         // Сначала tombstone-и, затем удаление состояния: при ошибке записи
         // старая сессия остаётся на диске, а не теряет replay-защиту.
@@ -1626,7 +1761,7 @@ impl App {
     /// сохраняет прежнюю сессию, поэтому локальная копия должна остаться
     /// доступной, но только в оперативной памяти.
     fn enter_ram_ttl(&self, room_hash: &str) -> Result<()> {
-        let retired = retired_sessions_for(&self.retired_ratchet_sessions, room_hash);
+        let retired = retired_sessions_for(&self.retired_ratchet_sessions, room_hash)?;
         {
             let mut states = self
                 .ratchets
@@ -1649,15 +1784,23 @@ impl App {
         }
 
         // M-8: загруженная в RAM сессия должна остаться адресуемой.
-        if let Ok(states) = self.ratchets.lock() {
-            if let Some(state) = states.get(room_hash) {
-                if let Ok(mut router) = self.inbound_router.lock() {
-                    router.register_state(
-                        room_hash,
-                        &state.session_aliases().unwrap_or_default(),
-                    );
-                }
-            }
+        // Fail-closed: не удаляем диск, если не смогли прочитать состояние
+        // или обновить маршрутизацию.
+        let aliases = {
+            let states = self
+                .ratchets
+                .lock()
+                .map_err(|_| anyhow!("ratchet lock poisoned"))?;
+            states
+                .get(room_hash)
+                .map(|state| state.session_aliases().unwrap_or_default())
+        };
+        if let Some(aliases) = aliases {
+            let mut router = self
+                .inbound_router
+                .lock()
+                .map_err(|_| anyhow!("routing lock poisoned"))?;
+            router.register_state(room_hash, &aliases);
         }
 
         // H-3: вместе с ключами с диска уходят и tombstone-и сессий.
@@ -1670,19 +1813,23 @@ impl App {
 
     /// Возвращает активный RAM-TTL комнаты. `None`, если таймер выключен.
     pub fn get_room_ttl(&self, room_hash: &str) -> Option<RoomTtl> {
+        // Простое RAM-состояние: после poison читаем inner, чтобы не
+        // принять активный TTL за выключенный и не записать ratchet (H-3).
         self.room_ttls
             .lock()
-            .ok()
-            .and_then(|ttls| ttls.get(room_hash).copied())
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(room_hash)
+            .copied()
             .filter(|ttl| ttl.seconds.is_some())
     }
 
     /// Устанавливает односторонний RAM-TTL комнаты (только локально).
     pub fn set_room_ttl(&self, room_hash: &str, seconds: Option<u64>) -> Result<()> {
+        // TTL-кэш — простое RAM-состояние: после poison продолжаем с inner.
         let mut ttls = self
             .room_ttls
             .lock()
-            .map_err(|_| anyhow!("ttl lock poisoned"))?;
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         match seconds {
             Some(value) => {
                 ttls.insert(
@@ -1726,7 +1873,7 @@ impl App {
                 let mut ttls = self
                     .room_ttls
                     .lock()
-                    .map_err(|_| anyhow!("ttl lock poisoned"))?;
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 ttls.insert(
                     room_hash.to_string(),
                     RoomTtl {
@@ -1755,7 +1902,7 @@ impl App {
                 let mut ttls = self
                     .room_ttls
                     .lock()
-                    .map_err(|_| anyhow!("ttl lock poisoned"))?;
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let previous = ttls.get(room_hash).copied();
                 ttls.remove(room_hash);
                 previous
@@ -1767,9 +1914,10 @@ impl App {
                 .await
             {
                 if let Some(value) = previous {
-                    if let Ok(mut ttls) = self.room_ttls.lock() {
-                        ttls.insert(room_hash.to_string(), value);
-                    }
+                    self.room_ttls
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .insert(room_hash.to_string(), value);
                 }
                 return Err(anyhow!("failed to send TTL update: {}", e));
             }
@@ -2009,7 +2157,12 @@ impl App {
 
     fn get_shared_secret(&self, room_hash: &str) -> Result<[u8; 32]> {
         {
-            let secrets = self.shared_secrets.lock().unwrap();
+            // Ключевой кэш — fail-closed: poison означает неизвестное
+            // состояние, операция не продолжается с частичной картой.
+            let secrets = self
+                .shared_secrets
+                .lock()
+                .map_err(|_| anyhow!("shared secret lock poisoned"))?;
             if let Some(secret) = secrets.get(room_hash) {
                 return Ok(*secret);
             }
@@ -2020,7 +2173,10 @@ impl App {
             let secret =
                 crypto::generate_shared_key(self.identity.private_key.expose(), &self.identity.public_key)?;
 
-            let mut secrets = self.shared_secrets.lock().unwrap();
+            let mut secrets = self
+                .shared_secrets
+                .lock()
+                .map_err(|_| anyhow!("shared secret lock poisoned"))?;
             secrets.insert(room_hash.to_string(), secret);
             return Ok(secret);
         }
@@ -2032,7 +2188,10 @@ impl App {
             &contact.public_key,
         )?;
 
-        let mut secrets = self.shared_secrets.lock().unwrap();
+        let mut secrets = self
+            .shared_secrets
+            .lock()
+            .map_err(|_| anyhow!("shared secret lock poisoned"))?;
         secrets.insert(room_hash.to_string(), secret);
 
         Ok(secret)
@@ -2045,12 +2204,20 @@ impl App {
     }
 
     pub fn switch_room(&self, room_hash: &str) {
-        let mut current = self.current_room_hash.lock().unwrap();
+        // Курсор комнаты — простое UI-состояние: poison безопасен,
+        // продолжаем с inner.
+        let mut current = self
+            .current_room_hash
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         *current = room_hash.to_string();
     }
 
     pub fn get_current_room(&self) -> String {
-        self.current_room_hash.lock().unwrap().clone()
+        self.current_room_hash
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     pub fn handle_scheme_url(&self, raw_url: &str) {
@@ -3147,6 +3314,217 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().contains(".part-"))
             .collect();
         assert!(leftovers.is_empty(), "temporary file must be renamed/removed");
+    }
+
+    /// Отравитель мьютекса: паника в отдельном потоке оставляет lock
+    /// poisoned, не роняя тестовый поток.
+    fn poison_mutex<T: Send + 'static>(mutex: &Arc<Mutex<T>>) {
+        let cloned = Arc::clone(mutex);
+        let _ = std::thread::spawn(move || {
+            let _guard = cloned
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            panic!("intentional mutex poisoning for test");
+        })
+        .join();
+    }
+
+    #[test]
+    fn poisoned_current_room_mutex_recovers() {
+        let (app, _temp_dir, _receiver) = setup_test_app();
+
+        poison_mutex(&app.current_room_hash);
+
+        // Курсор комнаты — простое UI-состояние: poison не должен
+        // блокировать переключение или чтение.
+        app.switch_room("room-after-poison");
+        assert_eq!(app.get_current_room(), "room-after-poison");
+    }
+
+    #[test]
+    fn poisoned_ttl_mutex_recovers() {
+        let (app, _temp_dir, _receiver) = setup_test_app();
+        let hash = app.identity.hash.clone();
+        app.set_room_ttl(&hash, Some(30)).unwrap();
+
+        poison_mutex(&app.room_ttls);
+
+        assert_eq!(
+            app.get_room_ttl(&hash).and_then(|ttl| ttl.seconds),
+            Some(30)
+        );
+        assert!(room_has_ttl(&app.room_ttls, &hash));
+
+        // Запись после poison тоже восстанавливается на inner-состоянии.
+        app.set_room_ttl(&hash, Some(45)).unwrap();
+        assert_eq!(
+            app.get_room_ttl(&hash).and_then(|ttl| ttl.seconds),
+            Some(45)
+        );
+    }
+
+    #[test]
+    fn poisoned_ratchet_encrypt_fails_closed_without_mutation() {
+        let (app, _temp_dir, _receiver) = setup_test_app();
+        let hash = app.identity.hash.clone();
+        app.encrypt_with_ratchet(&hash, b"prime").unwrap();
+
+        let before = app
+            .ratchets
+            .lock()
+            .unwrap()
+            .get(&hash)
+            .unwrap()
+            .to_bytes()
+            .unwrap()
+            .expose()
+            .to_vec();
+
+        poison_mutex(&app.ratchets);
+
+        let error = app
+            .encrypt_with_ratchet(&hash, b"after-poison")
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("ratchet lock poisoned"),
+            "unexpected error: {error}"
+        );
+
+        let after = app
+            .ratchets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&hash)
+            .unwrap()
+            .to_bytes()
+            .unwrap()
+            .expose()
+            .to_vec();
+        assert_eq!(before, after, "fail-closed path must not advance state");
+    }
+
+    #[test]
+    fn poisoned_ratchet_clear_keeps_persisted_state() {
+        let (app, _temp_dir, _receiver) = setup_test_app();
+        let hash = app.identity.hash.clone();
+        app.encrypt_with_ratchet(&hash, b"prime").unwrap();
+        assert!(app
+            .get_storage()
+            .persisted_ratchet_state_for_test(&hash)
+            .unwrap()
+            .is_some());
+
+        poison_mutex(&app.ratchets);
+
+        let error = app.clear_ratchet(&hash).unwrap_err();
+        assert!(
+            error.to_string().contains("ratchet lock poisoned"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            app.get_storage()
+                .persisted_ratchet_state_for_test(&hash)
+                .unwrap()
+                .is_some(),
+            "fail-closed reset must not delete persisted ratchet state"
+        );
+    }
+
+    #[test]
+    fn poisoned_ratchet_incoming_reset_keeps_persisted_state() {
+        let (app, _temp_dir, _receiver) = setup_test_app();
+        let hash = app.identity.hash.clone();
+        app.encrypt_with_ratchet(&hash, b"prime").unwrap();
+        assert!(app
+            .get_storage()
+            .persisted_ratchet_state_for_test(&hash)
+            .unwrap()
+            .is_some());
+
+        poison_mutex(&app.ratchets);
+
+        clear_ratchet_state(
+            &app.ratchets,
+            &app.storage,
+            &app.retired_ratchet_sessions,
+            &app.inbound_router,
+            &app.room_ttls,
+            &hash,
+        );
+
+        assert!(
+            app.get_storage()
+                .persisted_ratchet_state_for_test(&hash)
+                .unwrap()
+                .is_some(),
+            "poisoned incoming reset must not delete persisted state"
+        );
+    }
+
+    #[test]
+    fn poisoned_shared_secrets_rejects_key_lookup() {
+        let (app, _temp_dir, _receiver) = setup_test_app();
+        let hash = app.identity.hash.clone();
+
+        poison_mutex(&app.shared_secrets);
+
+        let error = app.get_shared_secret(&hash).unwrap_err();
+        assert!(
+            error.to_string().contains("shared secret lock poisoned"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn poisoned_identity_rejects_nickname_update() {
+        let (app, _temp_dir, _receiver) = setup_test_app();
+        let before = app.get_nickname();
+
+        poison_mutex(&app.identity_manager);
+
+        let error = app.update_nickname("Mallory").unwrap_err();
+        assert!(
+            error.to_string().contains("identity lock poisoned"),
+            "unexpected error: {error}"
+        );
+        // Read-only fallback не должен мутировать личность.
+        assert_eq!(app.get_nickname(), before);
+    }
+
+    #[test]
+    fn production_code_has_no_lock_unwrap() {
+        fn scan(dir: &std::path::Path, violations: &mut Vec<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    scan(&path, violations);
+                } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+                    let source = std::fs::read_to_string(&path).unwrap();
+                    let production = source
+                        .split_once("#[cfg(test)]")
+                        .map(|(production, _)| production)
+                        .unwrap_or(&source);
+                    for needle in [".lock().unwrap()", ".lock().expect("] {
+                        if production.contains(needle) {
+                            violations.push(format!("{}: contains {}", path.display(), needle));
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut violations = Vec::new();
+        scan(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut violations,
+        );
+        assert!(
+            violations.is_empty(),
+            "production code must handle poisoned locks explicitly: {violations:#?}"
+        );
     }
 
     #[cfg(unix)]
