@@ -2515,8 +2515,11 @@ fn draw_recovery_modal(frame: &mut Frame, state: &UiState) {
             )));
             lines.push(Line::from(""));
             let max_input = inner.width.saturating_sub(3) as usize;
+            // Фраза не отображается даже частично: в альтернативном экране
+            // она осталась бы видимой до закрытия окна.
+            let masked = "*".repeat(state.input.chars().count().min(max_input.max(1)));
             lines.push(Line::from(Span::styled(
-                format!("> {}", truncate_chars(&state.input, max_input.max(1))),
+                format!("> {}", masked),
                 Style::default().fg(Color::White),
             )));
         }
@@ -5517,7 +5520,9 @@ fn print_cli_help(program: &str) {
     println!("crossterm/ratatui и завершается с кодом 0 при успехе, 1 при ошибке.");
 }
 
-/// Читает строку с эхом (для мнемонической фразы и подтверждений).
+/// Читает строку с эхом (для подтверждений y/N).
+///
+/// Секреты (seed-фраза, пароли) читаются через [`read_secret_line`].
 fn prompt_line(prompt: &str) -> Result<String> {
     use std::io::Write;
 
@@ -5607,9 +5612,22 @@ fn run_recovery(base_dir: &str) -> Result<Vault> {
     }
 
     let identity = loop {
-        let phrase = prompt_line("Мнемоническая фраза BIP-39: ")?;
-        match Identity::from_mnemonic(&phrase, "") {
-            Ok(identity) => break identity,
+        // Seed-фраза — это идентичность: не показываем ни символы, ни длину.
+        let phrase = read_secret_line("Мнемоническая фраза BIP-39: ", SecretEcho::Hidden)?;
+        let identity = match Identity::from_mnemonic(phrase.as_str(), "") {
+            Ok(identity) => identity,
+            Err(e) => {
+                eprintln!("Ошибка: {:#}\nВведите фразу повторно.", e);
+                continue;
+            }
+        };
+
+        let confirm = read_secret_line("Повторите фразу: ", SecretEcho::Hidden)?;
+        match Identity::from_mnemonic(confirm.as_str(), "") {
+            Ok(confirmed) if confirmed.seed_phrase.expose() == identity.seed_phrase.expose() => {
+                break identity;
+            }
+            Ok(_) => eprintln!("Фразы не совпадают — попробуйте ещё раз."),
             Err(e) => eprintln!("Ошибка: {:#}\nВведите фразу повторно.", e),
         }
     };
@@ -5837,7 +5855,7 @@ async fn run_loop(
     }
 }
 
-/// Выключает raw mode после ввода пароля, в том числе при ошибке.
+/// Выключает raw mode после скрытого ввода, в том числе при ошибке.
 struct RawModeGuard;
 
 impl Drop for RawModeGuard {
@@ -5846,8 +5864,82 @@ impl Drop for RawModeGuard {
     }
 }
 
-/// Читает строку без эха, отображая `*` на каждый введённый символ.
-fn read_password(prompt: &str) -> Result<Zeroizing<String>> {
+/// Что показывать на экране при вводе секрета.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SecretEcho {
+    /// Ничего: seed-фраза не должна попадать ни на экран, ни в скроллбэк.
+    Hidden,
+    /// Один `*` на символ: мастер-пароль.
+    Masked,
+}
+
+impl SecretEcho {
+    /// Строка для только что введённого символа.
+    fn char(self) -> &'static str {
+        match self {
+            SecretEcho::Hidden => "",
+            SecretEcho::Masked => "*",
+        }
+    }
+
+    /// Стирание последнего символа: только если он был виден.
+    fn backspace(self) -> &'static str {
+        match self {
+            SecretEcho::Hidden => "",
+            SecretEcho::Masked => "\x08 \x08",
+        }
+    }
+}
+
+/// Одно действие в скрытом вводе.
+///
+/// Отдельный тип позволяет тестировать эхо и редактирование без терминала
+/// (мок-терминал: клавиши подаются напрямую, вывод пишется в `Vec<u8>`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SecretKey {
+    Char(char),
+    Backspace,
+    Enter,
+    Cancel,
+}
+
+/// Применяет клавишу к секретному буферу.
+///
+/// Возвращает `Ok(false)`, когда ввод завершён Enter. Само значение никогда
+/// не пишется в `out`: только маска, заданная [`SecretEcho`].
+fn apply_secret_key(
+    secret: &mut Zeroizing<String>,
+    echo: SecretEcho,
+    out: &mut dyn io::Write,
+    key: SecretKey,
+) -> Result<bool> {
+    match key {
+        SecretKey::Enter => {
+            write!(out, "\r\n")?;
+            Ok(false)
+        }
+        SecretKey::Cancel => {
+            write!(out, "\r\n")?;
+            Err(anyhow!("ввод отменён"))
+        }
+        SecretKey::Backspace => {
+            if secret.pop().is_some() {
+                write!(out, "{}", echo.backspace())?;
+            }
+            Ok(true)
+        }
+        SecretKey::Char(c) => {
+            secret.push(c);
+            write!(out, "{}", echo.char())?;
+            Ok(true)
+        }
+    }
+}
+
+/// Читает строку в raw mode, не показывая сам ввод.
+///
+/// Буфер возвращается в `Zeroizing`, поэтому затирается при drop (M-5).
+fn read_secret_line(prompt: &str, echo: SecretEcho) -> Result<Zeroizing<String>> {
     use std::io::Write;
 
     let mut stdout = io::stdout();
@@ -5856,54 +5948,47 @@ fn read_password(prompt: &str) -> Result<Zeroizing<String>> {
 
     enable_raw_mode()?;
     let _guard = RawModeGuard;
-    let mut password = Zeroizing::new(String::new());
+    let mut secret = Zeroizing::new(String::new());
 
     loop {
         match crossterm::event::read()? {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                match key.code {
-                    KeyCode::Enter => {
-                        write!(stdout, "\r\n")?;
-                        stdout.flush()?;
-                        break;
+                let key = match key.code {
+                    KeyCode::Enter => SecretKey::Enter,
+                    KeyCode::Esc => SecretKey::Cancel,
+                    KeyCode::Char('c') | KeyCode::Char('C') if ctrl => SecretKey::Cancel,
+                    KeyCode::Backspace => SecretKey::Backspace,
+                    KeyCode::Char(c) => SecretKey::Char(c),
+                    _ => continue,
+                };
+
+                let keep_going = match apply_secret_key(&mut secret, echo, &mut stdout, key) {
+                    Ok(keep_going) => keep_going,
+                    Err(e) => {
+                        let _ = stdout.flush();
+                        return Err(e);
                     }
-                    KeyCode::Esc => {
-                        write!(stdout, "\r\n")?;
-                        stdout.flush()?;
-                        return Err(anyhow!("ввод пароля отменён"));
-                    }
-                    KeyCode::Char('c') | KeyCode::Char('C') if ctrl => {
-                        write!(stdout, "\r\n")?;
-                        stdout.flush()?;
-                        return Err(anyhow!("ввод пароля прерван"));
-                    }
-                    KeyCode::Backspace => {
-                        if password.pop().is_some() {
-                            write!(stdout, "\x08 \x08")?;
-                            stdout.flush()?;
-                        }
-                    }
-                    KeyCode::Char(c) => {
-                        password.push(c);
-                        write!(stdout, "*")?;
-                        stdout.flush()?;
-                    }
-                    _ => {}
+                };
+                stdout.flush()?;
+                if !keep_going {
+                    return Ok(secret);
                 }
             }
             Event::Paste(text) => {
                 for c in text.chars().filter(|c| !c.is_control()) {
-                    password.push(c);
-                    write!(stdout, "*")?;
+                    apply_secret_key(&mut secret, echo, &mut stdout, SecretKey::Char(c))?;
                 }
                 stdout.flush()?;
             }
             _ => {}
         }
     }
+}
 
-    Ok(password)
+/// Читает мастер-пароль, маскируя ввод звёздочками.
+fn read_password(prompt: &str) -> Result<Zeroizing<String>> {
+    read_secret_line(prompt, SecretEcho::Masked)
 }
 
 /// Запрашивает мастер-пароль и открывает либо создаёт хранилище.
@@ -6213,5 +6298,112 @@ mod tests {
         assert!(parse_ttl_duration("abc").is_err());
         assert!(parse_ttl_duration("").is_err());
         assert_eq!(ttl_countdown(90, 66), "00:24");
+    }
+
+    // ============================================================
+    // L-6: скрытый ввод seed-фразы
+    // ============================================================
+
+    #[test]
+    fn hidden_seed_input_never_echoes_characters() {
+        let mut secret = Zeroizing::new(String::new());
+        let mut output = Vec::new();
+
+        for ch in "abandon ability able".chars() {
+            assert!(apply_secret_key(
+                &mut secret,
+                SecretEcho::Hidden,
+                &mut output,
+                SecretKey::Char(ch),
+            )
+            .unwrap());
+        }
+        assert!(apply_secret_key(
+            &mut secret,
+            SecretEcho::Hidden,
+            &mut output,
+            SecretKey::Backspace,
+        )
+        .unwrap());
+        assert!(!apply_secret_key(
+            &mut secret,
+            SecretEcho::Hidden,
+            &mut output,
+            SecretKey::Enter,
+        )
+        .unwrap());
+
+        assert_eq!(secret.as_str(), "abandon ability abl");
+        // Единственный вывод — перевод строки после Enter.
+        assert_eq!(output, b"\r\n");
+        assert!(!String::from_utf8_lossy(&output).contains("abandon"));
+    }
+
+    #[test]
+    fn masked_password_echoes_one_star_per_char() {
+        let mut secret = Zeroizing::new(String::new());
+        let mut output = Vec::new();
+
+        for ch in "abc".chars() {
+            apply_secret_key(
+                &mut secret,
+                SecretEcho::Masked,
+                &mut output,
+                SecretKey::Char(ch),
+            )
+            .unwrap();
+        }
+        apply_secret_key(
+            &mut secret,
+            SecretEcho::Masked,
+            &mut output,
+            SecretKey::Backspace,
+        )
+        .unwrap();
+        apply_secret_key(
+            &mut secret,
+            SecretEcho::Masked,
+            &mut output,
+            SecretKey::Enter,
+        )
+        .unwrap();
+
+        assert_eq!(secret.as_str(), "ab");
+        assert_eq!(output, b"***\x08 \x08\r\n");
+    }
+
+    #[test]
+    fn secret_cancel_does_not_echo_input() {
+        let mut secret = Zeroizing::new(String::new());
+        let mut output = Vec::new();
+
+        apply_secret_key(
+            &mut secret,
+            SecretEcho::Hidden,
+            &mut output,
+            SecretKey::Char('x'),
+        )
+        .unwrap();
+        let error = apply_secret_key(
+            &mut secret,
+            SecretEcho::Hidden,
+            &mut output,
+            SecretKey::Cancel,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "ввод отменён");
+        assert_eq!(output, b"\r\n");
+    }
+
+    #[test]
+    fn mnemonic_error_does_not_echo_phrase() {
+        // 12 x "abandon" — валидные слова, но неверная контрольная сумма.
+        let phrase = ["abandon"; 12].join(" ");
+        let error = Identity::from_mnemonic(&phrase, "")
+            .unwrap_err()
+            .to_string();
+
+        assert!(!error.contains("abandon"), "error leaked the phrase: {error}");
     }
 }

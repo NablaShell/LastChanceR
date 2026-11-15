@@ -198,6 +198,7 @@ On non-Unix platforms POSIX modes are unavailable; the client falls back to the 
 - `Identity` has a manual `Debug` that shows only public keys, the identity hash and timestamps. `Identity::clone()` is the single audited place where identity secrets are duplicated (used by the identity cache).
 - `RatchetState::to_bytes()` returns `SecretBytes`; `from_bytes()` takes ownership of the secret buffer. State loaded from `vault.dat` is wrapped in `SecretBytes` immediately, and error paths wipe intermediate JSON/hex buffers.
 - The listener receives the identity private key as `Arc<SecretBytes>` and holds no bare `Vec<u8>` copy; the buffer is wiped when the last `Arc` is dropped.
+- The BIP-39 recovery phrase and the master password are read with terminal echo disabled. The seed phrase is never displayed (not even its length), must be entered twice, and the input buffer is zeroized on drop; a TTY password is masked with `*`.
 - `RatchetState::with_root_key()` exposes the current root key only inside a closure instead of returning a copy.
 - `mlock`/`VirtualLock` is intentionally not used (no extra platform dependency): secrets can still be written to swap and core dumps. Use encrypted swap or a hardened environment if that threat is in scope. Disabling core dumps via `prctl(PR_SET_DUMPABLE, 0)` is also out of scope here.
 - A test (`tests/secret_hygiene.rs`) fails if `src/` reintroduces `private_key.clone()`, `seed_phrase.clone()`, `current_root_key` or similar secret copies.
@@ -651,6 +652,7 @@ v3 намеренно несовместим с v1/v2. После обновле
 - У `Identity` ручной `Debug`: выводятся только публичные ключи, identity hash и время. `Identity::clone()` — единственное проверяемое место дублирования секретов личности (используется кэшем менеджера).
 - `RatchetState::to_bytes()` возвращает `SecretBytes`, а `from_bytes()` принимает владение секретным буфером. Состояние, загруженное из `vault.dat`, сразу оборачивается в `SecretBytes`, а промежуточные JSON/hex-буферы затираются и на путях ошибки.
 - Listener получает приватный ключ личности как `Arc<SecretBytes>` и не держит голую копию `Vec<u8>`; буфер затирается при drop последнего `Arc`.
+- Seed-фраза BIP-39 и мастер-пароль читаются с отключённым эхом терминала. Seed-фраза не отображается (даже её длина), вводится дважды, а буфер ввода затирается при drop; пароль в TTY маскируется `*`.
 - `RatchetState::with_root_key()` отдаёт текущий корневой ключ только внутри замыкания, а не копией наружу.
 - `mlock`/`VirtualLock` намеренно не используется (чтобы не добавлять платформенную зависимость): секреты всё ещё могут попасть в swap и core dump. Если эта угроза входит в модель, используйте шифрованный swap или усиленное окружение. Отключение core dump через `prctl(PR_SET_DUMPABLE, 0)` в этот блок тоже не входит.
 - Тест `tests/secret_hygiene.rs` падает, если в `src/` снова появятся `private_key.clone()`, `seed_phrase.clone()`, `current_root_key` или похожие копии секретов.

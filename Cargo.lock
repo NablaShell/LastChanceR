@@ -1304,6 +1304,7 @@ dependencies = [
  "futures",
  "hex",
  "hkdf",
+ "libc",
  "log",
  "notify-rust",
  "rand",
