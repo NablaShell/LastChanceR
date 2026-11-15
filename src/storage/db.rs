@@ -130,6 +130,22 @@ pub struct FileRecord {
     pub uploaded_at: DateTime<Utc>,
 }
 
+/// M-C: tombstone уничтоженной сессии TTL-комнаты.
+///
+/// В зашифрованный `vault.dat` попадают только alias сессии (он и так
+/// передаётся в открытом заголовке), `SHA256(session_id)` и время ретирации.
+/// Сам `session_id`, `bootstrap_nonce`, DH/ratchet-ключи и содержимое
+/// сообщений здесь не хранятся.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TtlTombstone {
+    /// `HKDF(session_id, "route-v3")` — адрес retired-сессии.
+    pub session_alias: [u8; 16],
+    /// `SHA256(session_id)`.
+    pub session_id_hash: [u8; 32],
+    /// Unix seconds; используется для очистки по `TOMBSTONE_TTL`.
+    pub retired_at: u64,
+}
+
 // ============================================================
 // SNAPSHOT (то, что попадает внутрь шифротекста)
 // ============================================================
@@ -158,6 +174,10 @@ struct Snapshot {
     /// при reset удаляется, а tombstone должны пережить перезапуск.
     #[serde(default)]
     retired_ratchet_sessions: Vec<RetiredSessionRow>,
+    /// M-C: tombstone-хеши retired-сессий TTL-комнат. Поле появилось позже,
+    /// старые снимки читаются с пустым значением.
+    #[serde(default)]
+    ttl_tombstones: Vec<TtlTombstoneRow>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -230,6 +250,16 @@ struct RetiredSessionRow {
     room_hash: String,
     /// hex-кодированный `session_id` (16 байт).
     session_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TtlTombstoneRow {
+    /// hex-кодированный alias сессии (16 байт).
+    session_alias: String,
+    /// hex-кодированный `SHA256(session_id)` (32 байта).
+    session_id_hash: String,
+    #[serde(default)]
+    retired_at: u64,
 }
 
 // ============================================================
@@ -381,11 +411,20 @@ impl Storage {
                 PRIMARY KEY (room_hash, session_id)
             );
 
+            -- M-C: для TTL-комнат на диск пишутся только alias сессии и
+            -- SHA256(session_id). Сам session_id/ratchet здесь отсутствуют.
+            CREATE TABLE IF NOT EXISTS ttl_tombstones (
+                session_alias BLOB PRIMARY KEY,
+                session_id_hash BLOB NOT NULL,
+                retired_at INTEGER NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_messages_contact ON messages(contact_hash);
             CREATE INDEX IF NOT EXISTS idx_messages_room ON messages(room_hash);
             CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);
             CREATE INDEX IF NOT EXISTS idx_files_room ON files(room_hash);
             CREATE INDEX IF NOT EXISTS idx_files_uploaded ON files(uploaded_at);
+            CREATE INDEX IF NOT EXISTS idx_ttl_tombstones_retired ON ttl_tombstones(retired_at);
         ",
         )
         .map_err(|e| anyhow!("failed to create tables: {}", e))?;
@@ -705,6 +744,27 @@ impl Storage {
             rows
         };
 
+        let ttl_tombstones = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT session_alias, session_id_hash, retired_at
+                     FROM ttl_tombstones ORDER BY retired_at ASC, rowid ASC",
+                )
+                .map_err(|e| anyhow!("failed to prepare ttl tombstone dump: {}", e))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(TtlTombstoneRow {
+                        session_alias: hex::encode(row.get::<_, Vec<u8>>(0)?),
+                        session_id_hash: hex::encode(row.get::<_, Vec<u8>>(1)?),
+                        retired_at: row.get::<_, i64>(2)?.max(0) as u64,
+                    })
+                })
+                .map_err(|e| anyhow!("failed to dump ttl tombstones: {}", e))?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| anyhow!("failed to read ttl tombstones: {}", e))?;
+            rows
+        };
+
         Ok(Snapshot {
             contacts,
             rooms,
@@ -712,6 +772,7 @@ impl Storage {
             files,
             ratchet_states,
             retired_ratchet_sessions,
+            ttl_tombstones,
         })
     }
 
@@ -817,6 +878,23 @@ impl Storage {
                     params![retired.room_hash, session_id],
                 )
                 .map_err(|e| anyhow!("failed to restore retired session: {}", e))?;
+            }
+
+            for tombstone in &snapshot.ttl_tombstones {
+                let alias = hex::decode(&tombstone.session_alias)
+                    .map_err(|e| anyhow!("corrupted ttl tombstone alias: {}", e))?;
+                let hash = hex::decode(&tombstone.session_id_hash)
+                    .map_err(|e| anyhow!("corrupted ttl tombstone hash: {}", e))?;
+                if alias.len() != 16 || hash.len() != 32 {
+                    return Err(anyhow!("ttl tombstone fields have invalid lengths"));
+                }
+                tx.execute(
+                    "INSERT OR REPLACE INTO ttl_tombstones
+                        (session_alias, session_id_hash, retired_at)
+                     VALUES (?1, ?2, ?3)",
+                    params![alias, hash, tombstone.retired_at as i64],
+                )
+                .map_err(|e| anyhow!("failed to restore ttl tombstone: {}", e))?;
             }
 
             tx.commit()
@@ -1687,6 +1765,83 @@ impl Storage {
         self.persist_locked(&conn)
     }
 
+    /// M-C: сохраняет tombstone-хеши retired-сессий TTL-комнат.
+    ///
+    /// Таблица заменяется целиком: вызывающий уже применил
+    /// `TOMBSTONE_TTL`/`MAX_TTL_TOMBSTONES`. Внутри зашифрованного
+    /// `vault.dat` лежат только alias сессии и `SHA256(session_id)`.
+    pub fn save_ttl_tombstones(&self, tombstones: &[TtlTombstone]) -> Result<()> {
+        let mut conn = self.conn()?;
+        {
+            let tx = conn
+                .transaction()
+                .map_err(|e| anyhow!("failed to start ttl tombstone update: {}", e))?;
+            tx.execute("DELETE FROM ttl_tombstones", [])
+                .map_err(|e| anyhow!("failed to clear ttl tombstones: {}", e))?;
+
+            for tombstone in tombstones {
+                tx.execute(
+                    "INSERT OR REPLACE INTO ttl_tombstones
+                        (session_alias, session_id_hash, retired_at)
+                     VALUES (?1, ?2, ?3)",
+                    params![
+                        tombstone.session_alias.as_slice(),
+                        tombstone.session_id_hash.as_slice(),
+                        tombstone.retired_at as i64
+                    ],
+                )
+                .map_err(|e| anyhow!("failed to save ttl tombstone: {}", e))?;
+            }
+
+            tx.commit()
+                .map_err(|e| anyhow!("failed to commit ttl tombstones: {}", e))?;
+        }
+
+        self.persist_locked(&conn)
+    }
+
+    /// M-C: загружает tombstone-хеши TTL-сессий из `vault.dat`.
+    ///
+    /// Порядок — от старых к новым, чтобы вызывающий мог вытеснить
+    /// старейшие записи при переполнении.
+    pub fn load_ttl_tombstones(&self) -> Result<Vec<TtlTombstone>> {
+        let conn = self.conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT session_alias, session_id_hash, retired_at
+                 FROM ttl_tombstones ORDER BY retired_at ASC, rowid ASC",
+            )
+            .map_err(|e| anyhow!("failed to prepare ttl tombstone load: {}", e))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|e| anyhow!("failed to load ttl tombstones: {}", e))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| anyhow!("failed to read ttl tombstones: {}", e))?;
+
+        rows.into_iter()
+            .map(|(alias, hash, retired_at)| {
+                let session_alias: [u8; 16] = alias
+                    .try_into()
+                    .map_err(|_| anyhow!("ttl tombstone alias must be 16 bytes"))?;
+                let session_id_hash: [u8; 32] = hash
+                    .try_into()
+                    .map_err(|_| anyhow!("ttl tombstone hash must be 32 bytes"))?;
+                Ok(TtlTombstone {
+                    session_alias,
+                    session_id_hash,
+                    retired_at: retired_at.max(0) as u64,
+                })
+            })
+            .collect()
+    }
+
     /// Снимок состояния храповика из `vault.dat` (только для тестов).
     #[cfg(test)]
     pub(crate) fn persisted_ratchet_state_for_test(
@@ -1705,6 +1860,16 @@ impl Storage {
                     .map_err(|e| anyhow!("corrupted ratchet state in snapshot: {}", e))
             })
             .transpose()
+    }
+
+    /// Расшифрованный снимок vault в JSON (только для тестов M-C).
+    #[cfg(test)]
+    pub(crate) fn persisted_snapshot_json_for_test(&self) -> Result<String> {
+        let key = self.vault.key()?;
+        let data = self.safe_fs.safe_read_file(VAULT_FILE_NAME)?;
+        let snapshot = Self::decode_container(&key, &data)?;
+        serde_json::to_string(&snapshot)
+            .map_err(|e| anyhow!("failed to serialize decrypted snapshot: {}", e))
     }
 
     // ============================================================
@@ -2656,6 +2821,78 @@ mod tests {
             .load_retired_ratchet_sessions()
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn ttl_tombstones_survive_reopen_without_session_secrets() {
+        // M-C: на диск попадают только alias и SHA256(session_id), не
+        // session_id/ratchet/bootstrap_nonce.
+        let TestStorage { storage, dir } = setup();
+        let session_id = [0x42u8; 16];
+        let session_alias = crate::crypto::ratchet::session_alias(&session_id).unwrap();
+        let session_id_hash = crate::crypto::ratchet::session_id_hash(&session_id);
+        let tombstone = TtlTombstone {
+            session_alias,
+            session_id_hash,
+            retired_at: 1_700_000_000,
+        };
+
+        storage.save_ttl_tombstones(&[tombstone]).unwrap();
+
+        let key = storage.vault.key().unwrap();
+        let snapshot = Storage::decode_container(&key, &read_vault(dir.path())).unwrap();
+        assert_eq!(snapshot.ttl_tombstones.len(), 1);
+        assert_eq!(
+            snapshot.ttl_tombstones[0].session_alias,
+            hex::encode(session_alias)
+        );
+        assert_eq!(
+            snapshot.ttl_tombstones[0].session_id_hash,
+            hex::encode(session_id_hash)
+        );
+        assert!(snapshot.ratchet_states.is_empty());
+        assert!(snapshot.retired_ratchet_sessions.is_empty());
+
+        let base = dir.path().to_str().unwrap().to_string();
+        drop(storage);
+
+        let vault = Vault::unlock(&base, TEST_PASSWORD).unwrap();
+        let reopened = Storage::new(&base, vault).unwrap();
+        assert_eq!(reopened.load_ttl_tombstones().unwrap(), vec![tombstone]);
+
+        let decrypted = reopened.persisted_snapshot_json_for_test().unwrap();
+        assert!(decrypted.contains(&hex::encode(session_id_hash)));
+        assert!(
+            !decrypted.contains(&hex::encode(session_id)),
+            "raw session_id must never be persisted for TTL rooms"
+        );
+    }
+
+    #[test]
+    fn secure_remove_file_wipes_ttl_tombstones() {
+        // M-C/D-M-6: wipe удаляет vault.dat вместе с ttl_tombstones.
+        let TestStorage { storage, dir } = setup();
+        let tombstone = TtlTombstone {
+            session_alias: [1u8; 16],
+            session_id_hash: [2u8; 32],
+            retired_at: 1_700_000_000,
+        };
+        storage.save_ttl_tombstones(&[tombstone]).unwrap();
+        assert_eq!(storage.load_ttl_tombstones().unwrap().len(), 1);
+
+        let base = dir.path().to_str().unwrap().to_string();
+        let vault_path = dir.path().join(VAULT_FILE_NAME);
+        drop(storage);
+
+        secure_remove_file(&vault_path).unwrap();
+        assert!(!vault_path.exists());
+
+        let vault = Vault::unlock(&base, TEST_PASSWORD).unwrap();
+        let reopened = Storage::new(&base, vault).unwrap();
+        assert!(
+            reopened.load_ttl_tombstones().unwrap().is_empty(),
+            "wipe must remove persisted TTL tombstones"
+        );
     }
 
     #[test]

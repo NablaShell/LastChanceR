@@ -2,7 +2,7 @@
 use anyhow::{anyhow, Result};
 use ed25519_dalek::SigningKey;
 use log::{info, warn};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -17,7 +17,7 @@ use crate::identity::{
 };
 use crate::network::{Config, InboundRouter, Listener, Route, RoutingError, Sender};
 use crate::storage::{
-    Contact, Message, SafeFSOps, Storage, TOFU_CHANGED, TOFU_PENDING, TOFU_VERIFIED,
+    Contact, Message, SafeFSOps, Storage, TtlTombstone, TOFU_CHANGED, TOFU_PENDING, TOFU_VERIFIED,
 };
 use crate::storage::paths::create_private_file;
 use crate::types::{
@@ -107,6 +107,123 @@ pub struct ContactImportOutcome {
 /// в оперативной памяти и не сериализуется.
 type RetiredRatchetSessions = Arc<Mutex<HashMap<String, Vec<[u8; 16]>>>>;
 
+/// M-C: сколько жить tombstone-хешу retired-сессии TTL-комнаты.
+///
+/// Должно быть не меньше максимального окна, в котором атакующий может
+/// влить старый bootstrap-пакет. По истечении запись удаляется, и древний
+/// bootstrap снова становится replay-абельным (задокументированный residual).
+pub(crate) const TOMBSTONE_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// M-C: глобальный предел tombstone-записей.
+///
+/// При переполнении вытесняются старейшие записи (fail-open для
+/// доступности). Это возвращает residual для самых древних сессий, но не
+/// блокирует новые ретирации.
+pub(crate) const MAX_TTL_TOMBSTONES: usize = 1024;
+
+/// RAM-реестр tombstone-хешей retired-сессий TTL-комнат.
+///
+/// На диск (в зашифрованный `vault.dat`) попадают только alias сессии и
+/// `SHA256(session_id)`. `session_id`, `bootstrap_nonce` и ratchet-состояние
+/// в реестре отсутствуют.
+#[derive(Default)]
+struct TtlTombstoneRegistry {
+    /// От старых к новым, чтобы при переполнении вытеснять начало.
+    entries: Vec<TtlTombstone>,
+    hashes: HashSet<[u8; 32]>,
+    aliases: HashSet<[u8; 16]>,
+}
+
+impl TtlTombstoneRegistry {
+    /// Создаёт реестр из загруженных записей и применяет TTL/лимит.
+    ///
+    /// Возвращает `true`, если что-то было удалено (тогда вызывающий может
+    /// перезаписать vault очищенным набором).
+    fn from_entries(entries: Vec<TtlTombstone>, now: u64) -> (Self, bool) {
+        let mut registry = Self::default();
+        for entry in entries {
+            registry.insert(entry);
+        }
+        let pruned = registry.prune(now);
+        (registry, pruned)
+    }
+
+    fn insert(&mut self, entry: TtlTombstone) {
+        if self.hashes.insert(entry.session_id_hash) {
+            self.entries.push(entry);
+        }
+        self.aliases.insert(entry.session_alias);
+    }
+
+    /// Добавляет tombstone-и для уничтоженных `session_id`.
+    fn remember(
+        &mut self,
+        session_ids: impl IntoIterator<Item = [u8; 16]>,
+        now: u64,
+    ) -> Result<()> {
+        for session_id in session_ids {
+            let session_alias = ratchet::session_alias(&session_id)?;
+            let session_id_hash = ratchet::session_id_hash(&session_id);
+            self.insert(TtlTombstone {
+                session_alias,
+                session_id_hash,
+                retired_at: now,
+            });
+        }
+        self.prune(now);
+        Ok(())
+    }
+
+    /// Удаляет записи старше [`TOMBSTONE_TTL_SECS`] и вытесняет старейшие
+    /// сверх [`MAX_TTL_TOMBSTONES`]. Возвращает `true`, если набор изменился.
+    fn prune(&mut self, now: u64) -> bool {
+        let cutoff = now.saturating_sub(TOMBSTONE_TTL_SECS);
+        let before = self.entries.len();
+        self.entries.retain(|entry| entry.retired_at >= cutoff);
+        let mut changed = self.entries.len() != before;
+
+        if self.entries.len() > MAX_TTL_TOMBSTONES {
+            self.entries.sort_by_key(|entry| entry.retired_at);
+            let excess = self.entries.len() - MAX_TTL_TOMBSTONES;
+            self.entries.drain(..excess);
+            changed = true;
+        }
+
+        if changed {
+            self.rebuild_indexes();
+        }
+        changed
+    }
+
+    fn rebuild_indexes(&mut self) {
+        self.hashes = self
+            .entries
+            .iter()
+            .map(|entry| entry.session_id_hash)
+            .collect();
+        self.aliases = self
+            .entries
+            .iter()
+            .map(|entry| entry.session_alias)
+            .collect();
+    }
+
+    /// M-C: проверка при приёме bootstrap-пакета до создания новой сессии.
+    fn is_retired_session(&self, session_id_hash: &[u8; 32]) -> bool {
+        self.hashes.contains(session_id_hash)
+    }
+
+    /// Alias retired-сессии также отклоняется до AEAD: после рестарта
+    /// не-bootstrap пакет старой TTL-сессии не должен выглядеть как новый.
+    fn has_retired_alias(&self, session_alias: &[u8; 16]) -> bool {
+        self.aliases.contains(session_alias)
+    }
+
+    fn snapshot(&self) -> Vec<TtlTombstone> {
+        self.entries.clone()
+    }
+}
+
 pub struct App {
     config: RwLock<Config>,
     base_dir: String,
@@ -125,6 +242,11 @@ pub struct App {
     /// восстанавливается при старте. Запоздавший bootstrap-пакет старой
     /// сессии не должен приниматься как новая сессия (H-1/H-2).
     retired_ratchet_sessions: RetiredRatchetSessions,
+
+    /// M-C: tombstone-хеши retired-сессий TTL-комнат. Отдельный путь от
+    /// ratchet-состояния (H-3): на диск попадает только alias и
+    /// `SHA256(session_id)`, что восстанавливает анти-replay после рестарта.
+    ttl_tombstones: Arc<Mutex<TtlTombstoneRegistry>>,
 
     /// M-8: адресная таблица `alias -> room` и окно дедупликации доставки.
     /// Строится из ratchet-состояний; входящий пакет выбирает комнату по
@@ -421,6 +543,57 @@ fn remember_retired_sessions(
     Ok(())
 }
 
+/// M-C: добавляет tombstone-хеши уничтоженных сессий TTL-комнаты.
+fn remember_ttl_tombstones(
+    tombstones: &Arc<Mutex<TtlTombstoneRegistry>>,
+    session_ids: impl IntoIterator<Item = [u8; 16]>,
+) -> Result<()> {
+    let mut registry = tombstones
+        .lock()
+        .map_err(|_| anyhow!("ttl tombstone lock poisoned"))?;
+    registry.remember(session_ids, now_timestamp())
+}
+
+/// M-C: сохраняет tombstone-хеши в зашифрованный `vault.dat`.
+///
+/// Ошибка записи не отменяет tombstone в памяти: следующая TTL-ретирация
+/// повторит попытку, иначе residual вернулся бы раньше времени.
+fn persist_ttl_tombstones(
+    storage: &Storage,
+    tombstones: &Arc<Mutex<TtlTombstoneRegistry>>,
+) -> Result<()> {
+    let entries = tombstones
+        .lock()
+        .map_err(|_| anyhow!("ttl tombstone lock poisoned"))?
+        .snapshot();
+    storage.save_ttl_tombstones(&entries)
+}
+
+/// M-C: проверяет alias retired-сессии TTL-комнаты.
+///
+/// Вызывается после alias lookup и до AEAD/создания сессии. Poison
+/// считается отказом (fail-closed), иначе старый пакет мог бы пройти.
+fn ttl_tombstone_has_alias(
+    tombstones: &Arc<Mutex<TtlTombstoneRegistry>>,
+    alias: &[u8; ratchet::SESSION_ALIAS_SIZE],
+) -> Result<bool> {
+    let registry = tombstones
+        .lock()
+        .map_err(|_| anyhow!("ttl tombstone lock poisoned"))?;
+    Ok(registry.has_retired_alias(alias))
+}
+
+/// M-C: проверяет `SHA256(session_id)` bootstrap-пакета по tombstone-ам.
+fn ttl_tombstone_has_hash(
+    tombstones: &Arc<Mutex<TtlTombstoneRegistry>>,
+    session_id_hash: &[u8; 32],
+) -> Result<bool> {
+    let registry = tombstones
+        .lock()
+        .map_err(|_| anyhow!("ttl tombstone lock poisoned"))?;
+    Ok(registry.is_retired_session(session_id_hash))
+}
+
 /// Загружает состояние из `vault.dat` либо создаёт новую сессию.
 ///
 /// Для комнат с активным RAM-TTL диск не читается и не пишется.
@@ -594,11 +767,14 @@ fn shared_secret_for_room(
 /// известен. Здесь перебираются только HKDF-производные alias по контактам;
 /// AEAD не запускается ни для одного несовпавшего контакта. Обычные пакеты
 /// этот путь не используют.
+///
+/// M-C: вместе с комнатой и секретом возвращается `SHA256(session_id)`,
+/// чтобы проверить tombstone до создания новой сессии.
 fn resolve_bootstrap_room(
     alias: &[u8; ratchet::SESSION_ALIAS_SIZE],
     nonce: &[u8; ratchet::BOOTSTRAP_NONCE_SIZE],
     shared_secrets: &Arc<Mutex<HashMap<String, [u8; 32]>>>,
-) -> Option<(String, [u8; 32])> {
+) -> Option<(String, [u8; 32], [u8; 32])> {
     let secrets = match shared_secrets.lock() {
         Ok(secrets) => secrets,
         Err(_) => {
@@ -607,23 +783,27 @@ fn resolve_bootstrap_room(
         }
     };
     for (room, secret) in secrets.iter() {
-        if ratchet::bootstrap_session_alias(secret, nonce)
-            .ok()
-            .is_some_and(|candidate| &candidate == alias)
+        if let Ok((candidate_alias, session_id_hash)) =
+            ratchet::bootstrap_session_fingerprint(secret, nonce)
         {
-            return Some((room.clone(), *secret));
+            if &candidate_alias == alias {
+                return Some((room.clone(), *secret, session_id_hash));
+            }
         }
     }
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 fn clear_ratchet_state(
     ratchets: &Arc<Mutex<HashMap<String, RatchetState>>>,
     storage: &Arc<Storage>,
     retired_sessions: &RetiredRatchetSessions,
+    ttl_tombstones: &Arc<Mutex<TtlTombstoneRegistry>>,
     inbound_router: &Arc<Mutex<InboundRouter>>,
     room_ttls: &Arc<Mutex<HashMap<String, RoomTtl>>>,
     room_hash: &str,
+    retire_as_ttl: bool,
 ) {
     // Удаление из HashMap запускает Drop для Zeroizing-ключей. Перед этим
     // запоминаем id сессий, чтобы запоздавший пакет не был принят снова,
@@ -649,7 +829,9 @@ fn clear_ratchet_state(
         }
     };
 
-    if let Err(e) = remember_retired_sessions(retired_sessions, room_hash, session_ids) {
+    if let Err(e) =
+        remember_retired_sessions(retired_sessions, room_hash, session_ids.iter().copied())
+    {
         warn!(
             "Ratchet reset aborted for {}: {:#}",
             truncate_display(room_hash, 16),
@@ -669,11 +851,34 @@ fn clear_ratchet_state(
         }
     };
     router.retire_room(room_hash, &aliases);
+    drop(router);
 
-    // Сначала фиксируем tombstone-и, затем удаляем состояние: сбой записи
-    // оставляет старую сессию на диске, а не теряет защиту от replay.
-    let ttl_active = room_has_ttl(room_ttls, room_hash);
-    if let Err(e) = persist_retired_sessions(storage, retired_sessions, ttl_active, room_hash) {
+    // M-C: для TTL-комнаты на диск пишутся только alias и SHA256(session_id).
+    // Raw session_id и ratchet-состояние остаются в RAM (H-3).
+    let ttl_active = retire_as_ttl || room_has_ttl(room_ttls, room_hash);
+    if ttl_active {
+        if let Err(e) = remember_ttl_tombstones(ttl_tombstones, session_ids.iter().copied()) {
+            warn!(
+                "Failed to remember TTL tombstone for {}: {:#}",
+                truncate_display(room_hash, 16),
+                e
+            );
+            return;
+        }
+        if let Err(e) = persist_ttl_tombstones(storage, ttl_tombstones) {
+            warn!(
+                "Failed to persist TTL tombstones for {}: {:#}",
+                truncate_display(room_hash, 16),
+                e
+            );
+        }
+        // Raw session_id TTL-комнаты не должны оставаться на диске.
+        if let Err(e) = storage.delete_retired_ratchet_sessions(room_hash) {
+            warn!("Failed to delete retired ratchet sessions: {:#}", e);
+        }
+    } else if let Err(e) = persist_retired_sessions(storage, retired_sessions, false, room_hash) {
+        // Сначала фиксируем tombstone-и, затем удаляем состояние: сбой записи
+        // оставляет старую сессию на диске, а не теряет защиту от replay.
         warn!("Failed to persist retired ratchet sessions: {:#}", e);
         return;
     }
@@ -718,6 +923,24 @@ impl App {
                 Err(e) => warn!("Failed to load retired ratchet sessions: {:#}", e),
             }
             Arc::new(Mutex::new(sessions))
+        };
+
+        // M-C: tombstone-хеши TTL-сессий. TTL и лимит применяются уже при
+        // загрузке; если что-то удалено, очищенный набор сразу пишется назад.
+        let ttl_tombstones = {
+            let (registry, pruned) = match storage.load_ttl_tombstones() {
+                Ok(entries) => TtlTombstoneRegistry::from_entries(entries, now_timestamp()),
+                Err(e) => {
+                    warn!("Failed to load TTL tombstones: {:#}", e);
+                    TtlTombstoneRegistry::from_entries(Vec::new(), now_timestamp())
+                }
+            };
+            if pruned {
+                if let Err(e) = storage.save_ttl_tombstones(&registry.snapshot()) {
+                    warn!("Failed to persist pruned TTL tombstones: {:#}", e);
+                }
+            }
+            Arc::new(Mutex::new(registry))
         };
 
         // Initialize identity
@@ -914,6 +1137,7 @@ impl App {
             shared_secrets,
             ratchets,
             retired_ratchet_sessions,
+            ttl_tombstones,
             inbound_router,
             sender,
             listener,
@@ -946,6 +1170,7 @@ impl App {
         let room_ttls = self.room_ttls.clone();
         let ratchets = self.ratchets.clone();
         let retired_ratchet_sessions = self.retired_ratchet_sessions.clone();
+        let ttl_tombstones = self.ttl_tombstones.clone();
         let inbound_router = self.inbound_router.clone();
         let event_sender = self.event_sender.clone();
 
@@ -983,6 +1208,7 @@ impl App {
                                 &room_ttls,
                                 &ratchets,
                                 &retired_ratchet_sessions,
+                                &ttl_tombstones,
                                 &inbound_router,
                                 &identity_hash,
                                 &event_sender,
@@ -1022,12 +1248,14 @@ impl App {
         room_ttls: &Arc<Mutex<HashMap<String, RoomTtl>>>,
         ratchets: &Arc<Mutex<HashMap<String, RatchetState>>>,
         retired_ratchet_sessions: &RetiredRatchetSessions,
+        ttl_tombstones: &Arc<Mutex<TtlTombstoneRegistry>>,
         inbound_router: &Arc<Mutex<InboundRouter>>,
         identity_hash: &str,
         event_sender: &mpsc::UnboundedSender<AppEvent>,
     ) {
-        // M-8: порядок проверок до криптографии —
-        // version/размер → alias lookup → retired → dedup → AEAD → ratchet.
+        // M-8/M-C: порядок проверок до криптографии —
+        // version/размер → alias lookup → retired в памяти → tombstone
+        // TTL-сессии → dedup → AEAD → ratchet.
         let (info, route) = {
             let mut router = match inbound_router.lock() {
                 Ok(router) => router,
@@ -1045,9 +1273,32 @@ impl App {
             }
         };
 
-        let (from_hash, shared_secret) = match route {
+        // M-C: retired alias TTL-сессии может быть неизвестен роутеру после
+        // рестарта (ratchet-состояние живёт только в RAM). Tombstone-хеш
+        // восстанавливает этот адрес и отклоняет пакет до AEAD.
+        match ttl_tombstone_has_alias(ttl_tombstones, &info.alias) {
+            Ok(true) => {
+                warn!(
+                    "Incoming packet rejected: {} (ttl tombstone)",
+                    RoutingError::StaleSession
+                );
+                return;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                warn!("Incoming packet dropped: {:#}", e);
+                return;
+            }
+        }
+
+        let (from_hash, shared_secret, bootstrap_hash) = match route {
             Route::Active(room) => match shared_secret_for_room(&room, shared_secrets) {
-                Some(secret) => (room, secret),
+                Some(secret) => {
+                    let hash = info
+                        .bootstrap_nonce
+                        .and_then(|nonce| ratchet::bootstrap_session_id_hash(&secret, &nonce).ok());
+                    (room, secret, hash)
+                }
                 None => {
                     warn!(
                         "Incoming packet for {} has no shared secret",
@@ -1067,11 +1318,11 @@ impl App {
             Route::Unknown => {
                 // Первый пакет сессии: alias ещё никому не известен.
                 // Сравниваем только дешёвые HKDF-alias, без AEAD-перебора.
-                let resolved = info.bootstrap_nonce.and_then(|nonce| {
-                    resolve_bootstrap_room(&info.alias, &nonce, shared_secrets)
-                });
+                let resolved = info
+                    .bootstrap_nonce
+                    .and_then(|nonce| resolve_bootstrap_room(&info.alias, &nonce, shared_secrets));
                 match resolved {
-                    Some(room) => room,
+                    Some((room, secret, hash)) => (room, secret, Some(hash)),
                     None => {
                         warn!("Incoming packet rejected: {}", RoutingError::UnknownRoom);
                         return;
@@ -1079,6 +1330,26 @@ impl App {
                 }
             }
         };
+
+        // M-C: tombstone-проверка после alias lookup и до создания сессии.
+        // Пакет старой TTL-сессии после рестарта не должен выглядеть как
+        // новый bootstrap: session_id_hash уже известен из vault.
+        if let Some(hash) = bootstrap_hash {
+            match ttl_tombstone_has_hash(ttl_tombstones, &hash) {
+                Ok(true) => {
+                    warn!(
+                        "Incoming packet rejected: {} (ttl tombstone)",
+                        RoutingError::StaleSession
+                    );
+                    return;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    warn!("Incoming packet dropped: {:#}", e);
+                    return;
+                }
+            }
+        }
 
         let now = std::time::Instant::now();
         {
@@ -1159,6 +1430,7 @@ impl App {
             Ok(crypto::E2ePayload::SetTtl { seconds }) => {
                 // TTL-кэш — простое RAM-состояние: poison не должен
                 // превращаться в «TTL выключен» (H-3).
+                let was_ttl = room_has_ttl(room_ttls, &from_hash);
                 {
                     let mut ttls = room_ttls
                         .lock()
@@ -1180,14 +1452,18 @@ impl App {
                 }
 
                 // Смена режима TTL сбрасывает сессию храповика с обеих
-                // сторон: дальше состояние живёт только в RAM.
+                // сторон: дальше состояние живёт только в RAM. Даже при
+                // выключении TTL retiring-сессия была TTL-сессией, поэтому
+                // на диск пишется только её tombstone-хеш (M-C).
                 clear_ratchet_state(
                     ratchets,
                     storage,
                     retired_ratchet_sessions,
+                    ttl_tombstones,
                     inbound_router,
                     room_ttls,
                     &from_hash,
+                    was_ttl || seconds.is_some(),
                 );
 
                 let _ = event_sender.send(AppEvent::TtlChanged {
@@ -1198,13 +1474,16 @@ impl App {
                 return;
             }
             Ok(crypto::E2ePayload::RatchetReset) => {
+                let ttl_active = room_has_ttl(room_ttls, &from_hash);
                 clear_ratchet_state(
                     ratchets,
                     storage,
                     retired_ratchet_sessions,
+                    ttl_tombstones,
                     inbound_router,
                     room_ttls,
                     &from_hash,
+                    ttl_active,
                 );
                 info!(
                     "Ratchet session reset by peer for {}",
@@ -1721,6 +2000,15 @@ impl App {
     /// сессии не был принят как новая сессия даже после перезапуска.
     pub fn clear_ratchet(&self, room_hash: &str) -> Result<()> {
         let ttl_active = self.get_room_ttl(room_hash).is_some();
+        self.clear_ratchet_with_mode(room_hash, ttl_active)
+    }
+
+    /// [`Self::clear_ratchet`] с явным режимом ретирации.
+    ///
+    /// `retire_as_ttl` нужен при выключении TTL: к моменту сброса комната
+    /// уже не считается TTL-комнатой, но уничтожаемая сессия была TTL-сессией
+    /// и на диск должен попасть только её tombstone-хеш (M-C).
+    fn clear_ratchet_with_mode(&self, room_hash: &str, retire_as_ttl: bool) -> Result<()> {
         let (session_ids, aliases) = {
             // Fail-closed: при poison состояние неизвестно, поэтому не
             // удаляем ни диск, ни tombstone-и (H-1/H-2).
@@ -1738,7 +2026,11 @@ impl App {
                 None => (Vec::new(), Vec::new()),
             }
         };
-        remember_retired_sessions(&self.retired_ratchet_sessions, room_hash, session_ids)?;
+        remember_retired_sessions(
+            &self.retired_ratchet_sessions,
+            room_hash,
+            session_ids.iter().copied(),
+        )?;
 
         // M-8: старый alias больше не маршрутизируется ни в какую сессию,
         // а отклоняется как StaleSession до AEAD.
@@ -1751,12 +2043,26 @@ impl App {
 
         // Сначала tombstone-и, затем удаление состояния: при ошибке записи
         // старая сессия остаётся на диске, а не теряет replay-защиту.
-        persist_retired_sessions(
-            self.storage.as_ref(),
-            &self.retired_ratchet_sessions,
-            ttl_active,
-            room_hash,
-        )?;
+        let ttl_active = retire_as_ttl || self.get_room_ttl(room_hash).is_some();
+        if ttl_active {
+            remember_ttl_tombstones(&self.ttl_tombstones, session_ids.iter().copied())?;
+            // Ошибка записи не отменяет tombstone в памяти: следующая
+            // TTL-ретирация повторит попытку.
+            if let Err(e) = persist_ttl_tombstones(self.storage.as_ref(), &self.ttl_tombstones) {
+                warn!("Failed to persist TTL tombstones: {:#}", e);
+            }
+            // Raw session_id TTL-комнаты не должны оставаться на диске.
+            if let Err(e) = self.storage.delete_retired_ratchet_sessions(room_hash) {
+                warn!("Failed to delete retired ratchet sessions: {:#}", e);
+            }
+        } else {
+            persist_retired_sessions(
+                self.storage.as_ref(),
+                &self.retired_ratchet_sessions,
+                false,
+                room_hash,
+            )?;
+        }
         self.storage.delete_ratchet_state(room_hash)
     }
 
@@ -1767,6 +2073,23 @@ impl App {
     /// доступной, но только в оперативной памяти.
     fn enter_ram_ttl(&self, room_hash: &str) -> Result<()> {
         let retired = retired_sessions_for(&self.retired_ratchet_sessions, room_hash)?;
+
+        // M-C: raw tombstone-и, уже лежавшие в vault.dat, перед удалением
+        // конвертируются в хеши. Иначе включение TTL молча потеряло бы
+        // анти-replay для ранее сброшенных сессий после рестарта.
+        if !retired.is_empty() {
+            match remember_ttl_tombstones(&self.ttl_tombstones, retired.iter().copied()) {
+                Ok(()) => {
+                    if let Err(e) =
+                        persist_ttl_tombstones(self.storage.as_ref(), &self.ttl_tombstones)
+                    {
+                        warn!("Failed to persist TTL tombstones: {:#}", e);
+                    }
+                }
+                Err(e) => warn!("Failed to remember TTL tombstones: {:#}", e),
+            }
+        }
+
         {
             let mut states = self
                 .ratchets
@@ -1808,7 +2131,8 @@ impl App {
             router.register_state(room_hash, &aliases);
         }
 
-        // H-3: вместе с ключами с диска уходят и tombstone-и сессий.
+        // H-3: raw session_id уходят с диска, но tombstone-хеши TTL-сессий
+        // остаются (M-C): это не ratchet-состояние и не session_id.
         if let Err(e) = self.storage.delete_retired_ratchet_sessions(room_hash) {
             warn!("Failed to delete retired ratchet sessions: {:#}", e);
         }
@@ -1830,6 +2154,7 @@ impl App {
 
     /// Устанавливает односторонний RAM-TTL комнаты (только локально).
     pub fn set_room_ttl(&self, room_hash: &str, seconds: Option<u64>) -> Result<()> {
+        let was_ttl = self.get_room_ttl(room_hash).is_some();
         // TTL-кэш — простое RAM-состояние: после poison продолжаем с inner.
         let mut ttls = self
             .room_ttls
@@ -1856,8 +2181,9 @@ impl App {
             // удаляется с диска. Сбрасывать храповик не нужно.
             Some(_) => self.enter_ram_ttl(room_hash),
             // Выключение TTL: состояние затирается, следующая сессия
-            // начнётся заново.
-            None => self.clear_ratchet(room_hash),
+            // начнётся заново. Сессия была TTL-сессией, поэтому пишется
+            // только tombstone-хеш (M-C).
+            None => self.clear_ratchet_with_mode(room_hash, was_ttl),
         }
     }
 
@@ -1869,6 +2195,7 @@ impl App {
     /// записывается, а ошибка возвращается вызывающему.
     pub async fn set_synced_ttl(&self, room_hash: &str, seconds: Option<u64>) -> Result<()> {
         let payload = crypto::encode_set_ttl(seconds);
+        let was_ttl = self.get_room_ttl(room_hash).is_some();
 
         if seconds.is_some() {
             // Сначала переносим сессию в RAM и только затем включаем TTL,
@@ -1929,7 +2256,9 @@ impl App {
         }
 
         // Обе стороны начинают храповик заново после смены TTL-режима.
-        self.clear_ratchet(room_hash)
+        // При выключении TTL комната уже не TTL, но retiring-сессия была
+        // TTL-сессией: на диск попадает только tombstone-хеш (M-C).
+        self.clear_ratchet_with_mode(room_hash, was_ttl || seconds.is_some())
     }
 
     /// Сохраняет исходящее сообщение, делая его эфемерным при активном TTL.
@@ -3053,6 +3382,7 @@ mod tests {
             &app.room_ttls,
             &app.ratchets,
             &app.retired_ratchet_sessions,
+            &app.ttl_tombstones,
             &app.inbound_router,
             &app.identity.hash,
             &app.event_sender,
@@ -3221,6 +3551,7 @@ mod tests {
             &app.room_ttls,
             &app.ratchets,
             &app.retired_ratchet_sessions,
+            &app.ttl_tombstones,
             &app.inbound_router,
             &app.identity.hash,
             &app.event_sender,
@@ -3237,14 +3568,23 @@ mod tests {
     }
 
     #[test]
-    fn ttl_room_does_not_persist_retired_sessions() {
-        // H-3: включение RAM-TTL убирает с диска не только ключи, но и
-        // tombstone-и сессий.
-        let (app, _temp_dir, _receiver) = setup_test_app();
+    fn ttl_room_persists_only_tombstone_hash() {
+        // H-3 + M-C: включение RAM-TTL убирает с диска ratchet и raw
+        // session_id, но оставляет tombstone-хеш retired-сессии.
+        let (app, temp_dir, _receiver) = setup_test_app();
         let hash = app.identity.hash.clone();
 
         app.set_room_ttl(&hash, Some(30)).unwrap();
-        app.encrypt_with_ratchet(&hash, b"ttl-only").unwrap();
+        let bootstrap = app.encrypt_with_ratchet(&hash, b"ttl-only").unwrap();
+        let session_id = app
+            .ratchets
+            .lock()
+            .unwrap()
+            .get(&hash)
+            .unwrap()
+            .session_id();
+        let expected_hash = ratchet::session_id_hash(&session_id);
+        let expected_alias = ratchet::session_alias(&session_id).unwrap();
         app.clear_ratchet(&hash).unwrap();
 
         let persisted = app
@@ -3252,6 +3592,252 @@ mod tests {
             .load_retired_ratchet_sessions()
             .unwrap();
         assert!(persisted.iter().all(|(room_hash, _)| room_hash != &hash));
+        assert!(app
+            .get_storage()
+            .load_ratchet_state(&hash)
+            .unwrap()
+            .is_none());
+
+        let tombstones = app.get_storage().load_ttl_tombstones().unwrap();
+        assert_eq!(tombstones.len(), 1);
+        assert_eq!(tombstones[0].session_id_hash, expected_hash);
+        assert_eq!(tombstones[0].session_alias, expected_alias);
+
+        // В расшифрованном vault есть только hash; session_id и
+        // bootstrap_nonce не сохраняются.
+        let decrypted = app
+            .get_storage()
+            .persisted_snapshot_json_for_test()
+            .unwrap();
+        assert!(decrypted.contains(&hex::encode(expected_hash)));
+        assert!(!decrypted.contains(&hex::encode(session_id)));
+        assert!(decrypted.contains("\"ratchet_states\":[]"));
+        assert!(decrypted.contains("\"retired_ratchet_sessions\":[]"));
+        let bootstrap_nonce = &bootstrap[18..18 + ratchet::BOOTSTRAP_NONCE_SIZE];
+        assert!(!decrypted.contains(&hex::encode(bootstrap_nonce)));
+
+        // Vault остаётся читаемым после перезапуска.
+        let base_dir = temp_dir.path().to_str().unwrap().to_string();
+        drop(app);
+        let vault = Vault::unlock(&base_dir, "test-password").unwrap();
+        let (event_sender, _receiver) = mpsc::unbounded_channel();
+        let reopened = App::new(Config::default(), base_dir, vault, event_sender).unwrap();
+        assert_eq!(
+            reopened.ttl_tombstones.lock().unwrap().snapshot(),
+            vec![TtlTombstone {
+                session_alias: expected_alias,
+                session_id_hash: expected_hash,
+                retired_at: tombstones[0].retired_at,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn ttl_bootstrap_replay_is_stale_after_restart() {
+        // M-C probe: старый bootstrap TTL-сессии не должен приниматься
+        // после перезапуска как новая сессия (на старом коде тест падал:
+        // сообщение TOP-SECRET-1 доходило).
+        let (app, temp_dir, _receiver, hash) = setup_router_room();
+
+        app.set_room_ttl(&hash, Some(60)).unwrap();
+        let bootstrap = app
+            .encrypt_with_ratchet(&hash, &crypto::encode_text_payload("TOP-SECRET-1", None))
+            .unwrap();
+        assert_ne!(bootstrap[1] & ratchet::FLAG_BOOTSTRAP, 0);
+        let old_session = app
+            .ratchets
+            .lock()
+            .unwrap()
+            .get(&hash)
+            .unwrap()
+            .session_id();
+        let old_hash = ratchet::session_id_hash(&old_session);
+
+        // Рестарт-ретирация: TTL остаётся включённым, ratchet не пишется.
+        app.clear_ratchet(&hash).unwrap();
+        let base_dir = temp_dir.path().to_str().unwrap().to_string();
+        drop(app);
+
+        let vault = Vault::unlock(&base_dir, "test-password").unwrap();
+        let (event_sender, _receiver) = mpsc::unbounded_channel();
+        let reopened = App::new(Config::default(), base_dir, vault, event_sender).unwrap();
+        assert!(
+            reopened
+                .ttl_tombstones
+                .lock()
+                .unwrap()
+                .is_retired_session(&old_hash),
+            "tombstone hash must survive restart"
+        );
+
+        deliver_packet(&reopened, bootstrap).await;
+
+        assert!(
+            reopened.get_messages(&hash, 10).unwrap().is_empty(),
+            "replayed TTL bootstrap must not deliver TOP-SECRET-1"
+        );
+        assert!(
+            reopened.ratchets.lock().unwrap().get(&hash).is_none(),
+            "stale bootstrap must not create a new session"
+        );
+        let stats = reopened.inbound_router.lock().unwrap().stats();
+        assert_eq!(stats.decrypt_attempts, 0);
+    }
+
+    #[test]
+    fn non_ttl_retirement_does_not_write_ttl_tombstones() {
+        // M-C: единый механизм не включается для обычных комнат; H-2
+        // продолжает работать через retired_ratchet_sessions.
+        let (app, _temp_dir, _receiver) = setup_test_app();
+        let hash = app.identity.hash.clone();
+
+        app.encrypt_with_ratchet(&hash, b"normal").unwrap();
+        let session_id = app
+            .ratchets
+            .lock()
+            .unwrap()
+            .get(&hash)
+            .unwrap()
+            .session_id();
+        app.clear_ratchet(&hash).unwrap();
+
+        assert!(app.get_storage().load_ttl_tombstones().unwrap().is_empty());
+        assert!(app
+            .get_storage()
+            .load_retired_ratchet_sessions()
+            .unwrap()
+            .iter()
+            .any(|(room, id)| room == &hash && id == &session_id));
+    }
+
+    #[test]
+    fn ttl_tombstones_are_pruned_by_ttl_on_load() {
+        // M-C: запись старше TOMBSTONE_TTL удаляется при загрузке.
+        let (app, temp_dir, _receiver) = setup_test_app();
+        let now = now_timestamp();
+        let old = TtlTombstone {
+            session_alias: [1u8; 16],
+            session_id_hash: [2u8; 32],
+            retired_at: now.saturating_sub(TOMBSTONE_TTL_SECS + 60),
+        };
+        let fresh = TtlTombstone {
+            session_alias: [3u8; 16],
+            session_id_hash: [4u8; 32],
+            retired_at: now,
+        };
+        app.get_storage()
+            .save_ttl_tombstones(&[old, fresh])
+            .unwrap();
+        let base_dir = temp_dir.path().to_str().unwrap().to_string();
+        drop(app);
+
+        let vault = Vault::unlock(&base_dir, "test-password").unwrap();
+        let (event_sender, _receiver) = mpsc::unbounded_channel();
+        let reopened = App::new(Config::default(), base_dir, vault, event_sender).unwrap();
+
+        let entries = reopened.ttl_tombstones.lock().unwrap().snapshot();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].session_id_hash, fresh.session_id_hash);
+        assert_eq!(
+            reopened.get_storage().load_ttl_tombstones().unwrap(),
+            vec![fresh]
+        );
+    }
+
+    #[test]
+    fn ttl_tombstones_evict_oldest_over_limit() {
+        // M-C: при переполнении вытесняются старейшие записи (fail-open).
+        let now = now_timestamp();
+        let total = MAX_TTL_TOMBSTONES + 7;
+        let entries: Vec<TtlTombstone> = (0..total)
+            .map(|index| {
+                let seed = index as u64;
+                let mut alias = [0u8; 16];
+                alias[..8].copy_from_slice(&seed.to_le_bytes());
+                let mut hash = [0u8; 32];
+                hash[..8].copy_from_slice(&seed.to_le_bytes());
+                TtlTombstone {
+                    session_alias: alias,
+                    session_id_hash: hash,
+                    retired_at: now.saturating_sub((total - index) as u64),
+                }
+            })
+            .collect();
+
+        let (registry, _) = TtlTombstoneRegistry::from_entries(entries.clone(), now);
+        assert_eq!(registry.snapshot().len(), MAX_TTL_TOMBSTONES);
+        assert!(!registry.is_retired_session(&entries[0].session_id_hash));
+        assert!(registry.is_retired_session(&entries[total - 1].session_id_hash));
+
+        // Тот же набор после записи/загрузки сохраняет лимит.
+        let (app, temp_dir, _receiver) = setup_test_app();
+        app.get_storage().save_ttl_tombstones(&entries).unwrap();
+        let base_dir = temp_dir.path().to_str().unwrap().to_string();
+        drop(app);
+
+        let vault = Vault::unlock(&base_dir, "test-password").unwrap();
+        let (event_sender, _receiver) = mpsc::unbounded_channel();
+        let reopened = App::new(Config::default(), base_dir, vault, event_sender).unwrap();
+        assert_eq!(
+            reopened.ttl_tombstones.lock().unwrap().snapshot().len(),
+            MAX_TTL_TOMBSTONES
+        );
+        let persisted = reopened.get_storage().load_ttl_tombstones().unwrap();
+        assert_eq!(persisted.len(), MAX_TTL_TOMBSTONES);
+        assert!(!persisted
+            .iter()
+            .any(|entry| entry.session_id_hash == entries[0].session_id_hash));
+    }
+
+    #[tokio::test]
+    async fn foreign_alias_is_unknown_not_a_tombstone_match() {
+        // M-C §3.4: чужой alias отклоняется как UnknownRoom после alias
+        // lookup, а не как tombstone, и не доходит до AEAD.
+        let (app, _temp_dir, _receiver, hash) = setup_router_room();
+        app.ttl_tombstones.lock().unwrap().insert(TtlTombstone {
+            session_alias: [9u8; 16],
+            session_id_hash: [8u8; 32],
+            retired_at: now_timestamp(),
+        });
+
+        let mut packet = app.encrypt_with_ratchet(&hash, b"foreign").unwrap();
+        packet[2] ^= 0xff;
+        packet[1] &= !ratchet::FLAG_BOOTSTRAP;
+        deliver_packet(&app, packet).await;
+
+        assert!(app.get_messages(&hash, 10).unwrap().is_empty());
+        let stats = app.inbound_router.lock().unwrap().stats();
+        assert_eq!(stats.unknown_rooms, 1);
+        assert_eq!(stats.decrypt_attempts, 0);
+    }
+
+    #[test]
+    fn tampered_vault_with_ttl_tombstones_fails_closed() {
+        // M-C/L-4: подмена байта в vault ломает AEAD и открытие, без паники.
+        let (app, temp_dir, _receiver) = setup_test_app();
+        app.get_storage()
+            .save_ttl_tombstones(&[TtlTombstone {
+                session_alias: [5u8; 16],
+                session_id_hash: [6u8; 32],
+                retired_at: now_timestamp(),
+            }])
+            .unwrap();
+        let base_dir = temp_dir.path().to_str().unwrap().to_string();
+        drop(app);
+
+        let vault_path = temp_dir.path().join(crate::storage::VAULT_FILE_NAME);
+        let mut bytes = std::fs::read(&vault_path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        std::fs::write(&vault_path, bytes).unwrap();
+
+        let vault = Vault::unlock(&base_dir, "test-password").unwrap();
+        let (event_sender, _receiver) = mpsc::unbounded_channel();
+        let result = App::new(Config::default(), base_dir, vault, event_sender);
+        assert!(
+            result.is_err(),
+            "tampered vault must fail authentication instead of loading"
+        );
     }
 
     #[tokio::test]
@@ -3273,6 +3859,7 @@ mod tests {
             &app.room_ttls,
             &app.ratchets,
             &app.retired_ratchet_sessions,
+            &app.ttl_tombstones,
             &app.inbound_router,
             &app.identity.hash,
             &app.event_sender,
@@ -3301,6 +3888,7 @@ mod tests {
             &app.room_ttls,
             &app.ratchets,
             &app.retired_ratchet_sessions,
+            &app.ttl_tombstones,
             &app.inbound_router,
             &app.identity.hash,
             &app.event_sender,
@@ -3617,9 +4205,11 @@ mod tests {
             &app.ratchets,
             &app.storage,
             &app.retired_ratchet_sessions,
+            &app.ttl_tombstones,
             &app.inbound_router,
             &app.room_ttls,
             &hash,
+            false,
         );
 
         assert!(

@@ -26,6 +26,10 @@ First release with the hardened wire format and authenticated network API.
   block-aligned padded payloads and atomic private-file writes.
 - English/Russian interface, headless send mode, ephemeral message TTL,
   long-polling and SOCKS5/HTTP proxy support.
+- TTL rooms persist only an encrypted tombstone tuple (`session_alias`,
+  `SHA256(session_id)`, `retired_at`) so a retired bootstrap packet is rejected
+  as stale after a restart, without storing ratchet state (M-C). Tombstones
+  expire after 30 days and are capped at 1024 entries.
 - `SecretBytes` wrapper with zeroization and a hygiene test that forbids leaking
   secret copies in production code.
 

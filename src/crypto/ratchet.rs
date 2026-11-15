@@ -86,7 +86,7 @@ use chacha20poly1305::{
 use hkdf::Hkdf;
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -1420,6 +1420,43 @@ pub fn session_alias(id: &[u8; SESSION_ID_SIZE]) -> Result<[u8; SESSION_ALIAS_SI
     hkdf.expand(b"route-v3", &mut alias)
         .map_err(|e| anyhow!("session alias derivation failed: {}", e))?;
     Ok(alias)
+}
+
+/// `SHA256(session_id)` — единственное производное от `session_id`, которое
+/// M-C разрешает писать на диск для TTL-комнат.
+///
+/// Хеш не позволяет восстановить `session_id`, bootstrap-nonce или ключи
+/// храповика. Он используется только как tombstone: после рестарта старый
+/// bootstrap-пакет снова получит тот же хеш и будет отклонён как
+/// [`RatchetError::StaleSession`].
+pub fn session_id_hash(session_id: &[u8; SESSION_ID_SIZE]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(session_id);
+    hasher.finalize().into()
+}
+
+/// Хеш `session_id`, выведенного из bootstrap-nonce и общего секрета.
+pub fn bootstrap_session_id_hash(
+    shared_secret: &[u8; 32],
+    nonce: &[u8; BOOTSTRAP_NONCE_SIZE],
+) -> Result<[u8; 32]> {
+    let descriptor = SessionDescriptor::id_from_nonce(shared_secret, nonce)?;
+    Ok(session_id_hash(&descriptor.id))
+}
+
+/// Alias и `SHA256(session_id)` для bootstrap-пакета.
+///
+/// Оба значения выводятся за один HKDF-проход, чтобы `resolve_bootstrap_room`
+/// мог одновременно выбрать комнату и проверить tombstone-хеш.
+pub fn bootstrap_session_fingerprint(
+    shared_secret: &[u8; 32],
+    nonce: &[u8; BOOTSTRAP_NONCE_SIZE],
+) -> Result<([u8; SESSION_ALIAS_SIZE], [u8; 32])> {
+    let descriptor = SessionDescriptor::id_from_nonce(shared_secret, nonce)?;
+    Ok((
+        session_alias(&descriptor.id)?,
+        session_id_hash(&descriptor.id),
+    ))
 }
 
 /// Выводит alias сессии из общего секрета и bootstrap-nonce.
