@@ -156,6 +156,80 @@ fn truncate_utf8(value: &str, max: usize) -> String {
     value[..end].to_string()
 }
 
+/// Пишет файл через временный файл в том же каталоге.
+///
+/// На Unix временный файл создаётся с правами 0600; при ошибке он удаляется,
+/// а итоговый путь появляется только после успешного `rename` (M-6-friendly).
+fn write_file_atomically(path: &Path, data: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("download");
+    let temp_path = parent.join(format!(
+        ".{}.part-{}-{:016x}",
+        name,
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let mut file = options
+        .open(&temp_path)
+        .map_err(|e| anyhow!("create temporary file {}: {}", temp_path.display(), e))?;
+
+    let write_result = (|| -> Result<()> {
+        file.write_all(data)
+            .map_err(|e| anyhow!("write temporary file {}: {}", temp_path.display(), e))?;
+        file.sync_all()
+            .map_err(|e| anyhow!("sync temporary file {}: {}", temp_path.display(), e))
+    })();
+    drop(file);
+
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(e);
+    }
+
+    if let Err(first_error) = std::fs::rename(&temp_path, path) {
+        // Windows не перезаписывает существующий файл через rename.
+        if path.exists() {
+            let _ = std::fs::remove_file(path);
+            if std::fs::rename(&temp_path, path).is_err() {
+                let _ = std::fs::remove_file(&temp_path);
+                return Err(anyhow!(
+                    "replace {}: {}",
+                    path.display(),
+                    first_error
+                ));
+            }
+        } else {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(anyhow!("rename to {}: {}", path.display(), first_error));
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    Ok(())
+}
+
 /// Разворачивает `~` и `~/...` в домашнюю директорию пользователя.
 fn expand_tilde(raw: &str) -> PathBuf {
     if raw == "~" {
@@ -1672,16 +1746,11 @@ impl App {
                 }
             }
         }
-        if let Err(e) = std::fs::write(save_path, &file_data) {
+        if let Err(e) = write_file_atomically(std::path::Path::new(save_path), &file_data) {
             self.emit_event(AppEvent::DownloadError {
                 error: e.to_string(),
             });
             return Err(anyhow!("save failed: {}", e));
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(save_path, std::fs::Permissions::from_mode(0o600));
         }
 
         // Emit download completed event
@@ -2585,5 +2654,64 @@ mod tests {
             .load_retired_ratchet_sessions()
             .unwrap();
         assert!(persisted.iter().all(|(room_hash, _)| room_hash != &hash));
+    }
+
+    #[tokio::test]
+    async fn invalid_file_hash_message_is_rejected_before_db_write() {
+        let (app, _temp_dir, mut receiver) = setup_test_app();
+        let hash = app.identity.hash.clone();
+
+        // Инициализируем ratchet-сессию, чтобы пакет прошёл расшифровку.
+        app.encrypt_with_ratchet(&hash, b"prime").unwrap();
+        let text = "📎 File: evil.bin\nHash: not-a-valid-hex-hash";
+        let packet = app
+            .encrypt_with_ratchet(&hash, &crypto::encode_text_payload(text, None))
+            .unwrap();
+
+        let identity_pub_key = app.identity.get_public_key_hex();
+        App::handle_incoming_packet(
+            packet,
+            &app.shared_secrets,
+            &app.storage,
+            &app.room_ttls,
+            &app.ratchets,
+            &app.retired_ratchet_sessions,
+            &app.identity.hash,
+            &identity_pub_key,
+            &app.identity.private_key,
+            &app.event_sender,
+        )
+        .await;
+
+        assert!(
+            app.get_messages(&hash, 10).unwrap().is_empty(),
+            "invalid file hash must not reach the message table"
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "rejected packet must not be announced to the UI"
+        );
+    }
+
+    #[test]
+    fn atomic_file_write_leaves_no_partial_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("download.bin");
+        write_file_atomically(&path, b"payload").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"payload");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".part-"))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary file must be renamed/removed");
     }
 }

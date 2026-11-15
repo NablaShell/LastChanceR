@@ -175,6 +175,25 @@ The directory contains `identity.json`, `global.conf`, `vault.dat`, `vault.salt`
 - Download: `GET /download/<file_hash>`.
 - The download request has its own 300-second timeout; uploads are limited to 100 MB.
 
+### Response limits and input validation
+
+Untrusted identifiers (identity/contact hash from an invite, file hash from the server or a message) are parsed into `IdentityHash`/`FileHash`/`RoomId` at the boundary. Only exactly 64 ASCII hex characters are accepted; non-ASCII, short/long or non-hex input is rejected with a typed error before any byte slicing, database write or URL construction. UI/log output uses `truncate_display()` / `short_hash()`, which operate on characters and never split UTF-8.
+
+Response bodies are streamed with hard limits. The limits are inclusive: exactly `MAX_*` bytes are accepted, `MAX_* + 1` is rejected.
+
+| Limit | Value | Scope |
+| --- | --- | --- |
+| `MAX_MESSAGE_BODY` | 8 MiB | `/pull` multipart body |
+| `MAX_FILE_BODY` | 256 MiB | `/download` body |
+| `MAX_MULTIPART_PARTS` | 16 | parts per response |
+| `MAX_MULTIPART_HEADERS` | 32 | headers per part |
+| `MAX_MULTIPART_HEADER_BYTES` | 8 KiB | headers per part |
+| `MAX_MULTIPART_BOUNDARY` | 200 bytes | `boundary=` value |
+| `MAX_ERROR_BODY` | 64 KiB | `401`/`4xx`/`5xx` body |
+| `BODY_READ_TIMEOUT` | 60 s | the whole body, not one chunk |
+
+`Content-Length` is not trusted: a declared size above the limit is rejected before reading the body, a body that grows past the declared size is aborted, and a shorter body is an integrity error (fail-closed). Chunked responses are counted while reading and are never fully buffered past the limit. Downloads are decrypted in memory by the current crypto API, so they are bounded by `MAX_FILE_BODY` rather than streamed to disk. The decrypted file is written through a temporary file in the destination directory (mode `0600` on Unix) and atomically renamed on success; on error the temporary file is removed.
+
 ### Proxy and traffic masking
 
 `Proxy URL` in `/set` accepts an HTTP or SOCKS proxy. Empty input, `-` or `none` disables the proxy. A `socks5://` URL is automatically rewritten to `socks5h://`, so DNS resolution happens on the proxy side and the server hostname is not leaked to the local resolver.
@@ -556,6 +575,25 @@ lastchance://contact?hash=...&doc=<cbor-hex>&sig=<signature-hex>&x25519=...&ed25
 - Загрузка: `POST /upload` с `application/octet-stream`, `X-File-Name` и `Content-Length`; тело ответа — хеш файла.
 - Скачивание: `GET /download/<file_hash>`.
 - У скачивания отдельный таймаут 300 секунд; загрузка ограничена 100 МБ.
+
+### Лимиты и валидация ввода
+
+Недоверенные идентификаторы (identity/contact hash из invite, file hash от сервера или из сообщения) разбираются на границе в `IdentityHash`/`FileHash`/`RoomId`. Принимаются ровно 64 ASCII hex-символа; не-ASCII, короткая/длинная строка или не-hex отклоняются типизированной ошибкой до любых байтовых срезов, записи в БД и построения URL. Для UI/логов используются `truncate_display()` / `short_hash()`: они работают по символам и не рвут UTF-8.
+
+Тела ответов читаются потоково с жёсткими лимитами. Границы включительные: ровно `MAX_*` байт допустимо, `MAX_* + 1` — ошибка.
+
+| Лимит | Значение | Область |
+| --- | --- | --- |
+| `MAX_MESSAGE_BODY` | 8 МиБ | multipart-тело `/pull` |
+| `MAX_FILE_BODY` | 256 МиБ | тело `/download` |
+| `MAX_MULTIPART_PARTS` | 16 | частей на ответ |
+| `MAX_MULTIPART_HEADERS` | 32 | заголовков на часть |
+| `MAX_MULTIPART_HEADER_BYTES` | 8 КиБ | заголовки одной части |
+| `MAX_MULTIPART_BOUNDARY` | 200 байт | значение `boundary=` |
+| `MAX_ERROR_BODY` | 64 КиБ | тело `401`/`4xx`/`5xx` |
+| `BODY_READ_TIMEOUT` | 60 с | всё тело, а не отдельный chunk |
+
+`Content-Length` не считается доверенным: заявленный размер больше лимита отклоняется до чтения тела, рост тела сверх заявленного размера прерывается, а недобор считается ошибкой целостности (fail-closed). Chunked-ответы считаются по мере чтения и не буферизуются сверх лимита. Скачиваемый файл расшифровывается текущим crypto API целиком в памяти, поэтому ограничен `MAX_FILE_BODY`, а не потоковой записью на диск. Расшифрованный файл пишется через временный файл в каталоге назначения (права `0600` на Unix) и атомарно переименовывается только при успехе; при ошибке временный файл удаляется.
 
 ### Прокси и маскировка
 

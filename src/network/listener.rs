@@ -5,7 +5,12 @@ use reqwest::header::CONTENT_TYPE;
 use reqwest::Client;
 use std::sync::RwLock;
 use std::time::Duration;
-use crate::network::{build_http_client, Config};
+use crate::network::{
+    build_http_client, Config, BODY_READ_TIMEOUT, MAX_ERROR_BODY, MAX_FILE_BODY,
+    MAX_MESSAGE_BODY, MAX_MULTIPART_BOUNDARY, MAX_MULTIPART_HEADERS,
+    MAX_MULTIPART_HEADER_BYTES, MAX_MULTIPART_PARTS,
+};
+use crate::types::{truncate_display, FileHash};
 
 /// Один из допустимых размеров пакета (см. API.md §4.1).
 const ALLOWED_PACKET_SIZES: [usize; 4] = [256, 1024, 4096, 65536];
@@ -30,7 +35,95 @@ pub enum PullError {
     Server(u16, String),
     /// Нарушение протокола: неожиданный Content-Type, битый multipart.
     Protocol(String),
+    /// Тело ответа нарушило лимиты/целостность или не дочиталось.
+    Body(BodyError),
 }
+
+/// Тело ответа превысило жёсткий лимит.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PayloadTooLarge {
+    pub limit: usize,
+    pub declared: Option<u64>,
+}
+
+impl std::fmt::Display for PayloadTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.declared {
+            Some(declared) => write!(
+                f,
+                "payload too large: declared {} bytes, limit {} bytes",
+                declared, self.limit
+            ),
+            None => write!(f, "payload too large: limit {} bytes", self.limit),
+        }
+    }
+}
+
+impl std::error::Error for PayloadTooLarge {}
+
+/// Multipart-часть превысила один из лимитов парсера.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultipartLimitExceeded {
+    pub what: &'static str,
+    pub limit: usize,
+}
+
+impl std::fmt::Display for MultipartLimitExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "multipart {} limit exceeded ({})", self.what, self.limit)
+    }
+}
+
+impl std::error::Error for MultipartLimitExceeded {}
+
+/// Ошибка потокового чтения тела ответа.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BodyError {
+    PayloadTooLarge(PayloadTooLarge),
+    /// Фактическое тело не совпало с `Content-Length` (fail-closed).
+    ContentLengthMismatch { declared: u64, actual: u64 },
+    Timeout { seconds: u64 },
+    Network(String),
+    Multipart(MultipartError),
+}
+
+impl std::fmt::Display for BodyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BodyError::PayloadTooLarge(error) => write!(f, "{}", error),
+            BodyError::ContentLengthMismatch { declared, actual } => write!(
+                f,
+                "Content-Length mismatch: declared {}, received {}",
+                declared, actual
+            ),
+            BodyError::Timeout { seconds } => {
+                write!(f, "body read timed out after {} seconds", seconds)
+            }
+            BodyError::Network(message) => write!(f, "body read failed: {}", message),
+            BodyError::Multipart(error) => write!(f, "{}", error),
+        }
+    }
+}
+
+impl std::error::Error for BodyError {}
+
+/// Ошибка разбора multipart-ответа.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MultipartError {
+    Limit(MultipartLimitExceeded),
+    Malformed(String),
+}
+
+impl std::fmt::Display for MultipartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MultipartError::Limit(error) => write!(f, "{}", error),
+            MultipartError::Malformed(message) => write!(f, "malformed multipart: {}", message),
+        }
+    }
+}
+
+impl std::error::Error for MultipartError {}
 
 impl std::fmt::Display for PullError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -40,6 +133,7 @@ impl std::fmt::Display for PullError {
             PullError::Unauthorized(body) => write!(f, "unauthorized (401): {}", body),
             PullError::Server(code, body) => write!(f, "server returned {}: {}", code, body),
             PullError::Protocol(message) => write!(f, "{}", message),
+            PullError::Body(error) => write!(f, "{}", error),
         }
     }
 }
@@ -53,8 +147,101 @@ impl PullError {
         match self {
             PullError::Network(_) | PullError::RateLimited => true,
             PullError::Server(code, _) => *code >= 500,
-            PullError::Unauthorized(_) | PullError::Protocol(_) => false,
+            PullError::Body(BodyError::Network(_)) | PullError::Body(BodyError::Timeout { .. }) => {
+                true
+            }
+            PullError::Unauthorized(_)
+            | PullError::Protocol(_)
+            | PullError::Body(_) => false,
         }
+    }
+}
+
+/// Потоково читает тело ответа, не позволяя серверу исчерпать память.
+///
+/// Политика:
+/// - `Content-Length` больше лимита → ошибка до чтения тела;
+/// - суммарный размер ровно `limit` включительно разрешён;
+/// - превышение в chunked-ответе или несовпадение с `Content-Length`
+///   (в любую сторону) → ошибка, остаток тела не дочитывается;
+/// - таймаут покрывает всё чтение, а не отдельный chunk.
+async fn read_body_limited(
+    mut response: reqwest::Response,
+    limit: usize,
+    timeout: Duration,
+) -> std::result::Result<Vec<u8>, BodyError> {
+    let declared = response.content_length();
+    if let Some(declared) = declared {
+        if declared > limit as u64 {
+            return Err(BodyError::PayloadTooLarge(PayloadTooLarge {
+                limit,
+                declared: Some(declared),
+            }));
+        }
+    }
+
+    // Не аллоцируем по заявленному размеру: даже легитимные 256 MiB
+    // растут постепенно, а вредоносный Content-Length не резервирует память.
+    const INITIAL_CAPACITY: usize = 64 * 1024;
+    let initial_capacity = declared
+        .map(|value| value.min(INITIAL_CAPACITY as u64) as usize)
+        .unwrap_or(0);
+
+    let read = async move {
+        let mut body = Vec::with_capacity(initial_capacity);
+        loop {
+            let chunk = response
+                .chunk()
+                .await
+                .map_err(|e| BodyError::Network(e.to_string()))?;
+            let Some(chunk) = chunk else {
+                break;
+            };
+
+            let actual = body
+                .len()
+                .checked_add(chunk.len())
+                .ok_or(BodyError::PayloadTooLarge(PayloadTooLarge {
+                    limit,
+                    declared,
+                }))?;
+
+            if actual > limit {
+                return Err(BodyError::PayloadTooLarge(PayloadTooLarge {
+                    limit,
+                    declared,
+                }));
+            }
+
+            if let Some(declared) = declared {
+                if actual as u64 > declared {
+                    return Err(BodyError::ContentLengthMismatch {
+                        declared,
+                        actual: actual as u64,
+                    });
+                }
+            }
+
+            body.extend_from_slice(&chunk);
+        }
+
+        if let Some(declared) = declared {
+            if body.len() as u64 != declared {
+                return Err(BodyError::ContentLengthMismatch {
+                    declared,
+                    actual: body.len() as u64,
+                });
+            }
+        }
+
+        Ok(body)
+    };
+
+    match tokio::time::timeout(timeout, read).await {
+        Err(_) => Err(BodyError::Timeout {
+            seconds: timeout.as_secs(),
+        }),
+        Ok(result) => result,
     }
 }
 
@@ -154,12 +341,18 @@ impl Listener {
         }
 
         if status == reqwest::StatusCode::UNAUTHORIZED {
-            let body = response.text().await.unwrap_or_default();
+            let body = read_body_limited(response, MAX_ERROR_BODY, BODY_READ_TIMEOUT)
+                .await
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_default();
             return Err(PullError::Unauthorized(body));
         }
 
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
+            let body = read_body_limited(response, MAX_ERROR_BODY, BODY_READ_TIMEOUT)
+                .await
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_default();
             return Err(PullError::Server(status.as_u16(), body));
         }
 
@@ -171,22 +364,21 @@ impl Listener {
             .unwrap_or_default()
             .to_string();
 
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| PullError::Network(format!("read body: {}", e)))?;
-
         if !content_type.starts_with("multipart/") {
             // API.md гарантирует multipart на 200, но если сервер вернул
             // что-то иное — не молча делаем вид, что это один пакет.
             return Err(PullError::Protocol(format!(
                 "unexpected Content-Type on /pull: {:?}",
-                content_type
+                truncate_display(&content_type, 64)
             )));
         }
 
+        let bytes = read_body_limited(response, MAX_MESSAGE_BODY, BODY_READ_TIMEOUT)
+            .await
+            .map_err(PullError::Body)?;
+
         let messages = parse_multipart(&content_type, &bytes)
-            .map_err(|e| PullError::Protocol(e.to_string()))?;
+            .map_err(|e| PullError::Body(BodyError::Multipart(e)))?;
 
         // Валидация размеров (API.md §4.1: ровно 256/1024/4096/65536)
         for m in &messages {
@@ -206,6 +398,16 @@ impl Listener {
         if file_hash.is_empty() {
             return Err(anyhow!("empty file_hash"));
         }
+        // Идентификатор уходит в URL: принимаем только 64 hex-символа.
+        let bare_hash = file_hash.strip_prefix("sha256:").unwrap_or(file_hash);
+        let file_hash = FileHash::from_hex(bare_hash).map_err(|e| {
+            anyhow!(
+                "invalid file hash ({}…, {} chars): {}",
+                truncate_display(file_hash, 16),
+                file_hash.chars().count(),
+                e
+            )
+        })?;
 
         let config = self.current_config()?;
         let client = self.current_client()?;
@@ -225,11 +427,10 @@ impl Listener {
 
         match response.status().as_u16() {
             200 => {
-                let data = response
-                    .bytes()
+                let data = read_body_limited(response, MAX_FILE_BODY, BODY_READ_TIMEOUT)
                     .await
-                    .map_err(|e| anyhow!("read file data: {}", e))?;
-                Ok(data.to_vec())
+                    .map_err(|e| anyhow!("download body rejected: {}", e))?;
+                Ok(data)
             }
             404 => Err(anyhow!(
                 "file not found (already downloaded or expired)"
@@ -237,7 +438,10 @@ impl Listener {
             400 => Err(anyhow!("bad request (missing file hash)")),
             429 => Err(anyhow!("rate limited (429)")),
             code => {
-                let body = response.text().await.unwrap_or_default();
+                let body = read_body_limited(response, MAX_ERROR_BODY, BODY_READ_TIMEOUT)
+                    .await
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                    .unwrap_or_default();
                 Err(anyhow!("download failed: {} - {}", code, body))
             }
         }
@@ -249,22 +453,36 @@ impl Listener {
 // ---------------------------------------------------------------------------
 
 /// Извлекает `boundary` из `Content-Type: multipart/form-data; boundary=...`.
-fn extract_boundary(content_type: &str) -> Result<Vec<u8>> {
+fn extract_boundary(content_type: &str) -> Result<Vec<u8>, MultipartError> {
     // boundary может быть в кавычках: boundary="abc"
     for part in content_type.split(';') {
         let part = part.trim();
         if let Some(rest) = part.strip_prefix("boundary=") {
-            let b = rest.trim().trim_matches('"');
-            if b.is_empty() {
-                return Err(anyhow!("empty multipart boundary"));
+            let boundary = rest.trim().trim_matches('"');
+            if boundary.is_empty() {
+                return Err(MultipartError::Malformed("empty boundary".to_string()));
             }
-            return Ok(b.as_bytes().to_vec());
+            if boundary.len() > MAX_MULTIPART_BOUNDARY {
+                return Err(MultipartError::Limit(MultipartLimitExceeded {
+                    what: "boundary bytes",
+                    limit: MAX_MULTIPART_BOUNDARY,
+                }));
+            }
+            if boundary.bytes().any(|byte| byte == b'\r' || byte == b'\n') {
+                return Err(MultipartError::Malformed(
+                    "boundary contains CR/LF".to_string(),
+                ));
+            }
+            return Ok(boundary.as_bytes().to_vec());
         }
     }
-    Err(anyhow!("no boundary in Content-Type: {:?}", content_type))
+    Err(MultipartError::Malformed(format!(
+        "no boundary in Content-Type: {:?}",
+        truncate_display(content_type, 64)
+    )))
 }
 
-/// Разбирает multipart-тело ответа `/pull`.
+/// Разбирает multipart-тело ответа `/pull` с лимитами на части и заголовки.
 ///
 /// Формат (RFC 7578):
 ///   --boundary\r\n
@@ -274,7 +492,22 @@ fn extract_boundary(content_type: &str) -> Result<Vec<u8>> {
 ///   --boundary\r\n
 ///   ...
 ///   --boundary--\r\n
-fn parse_multipart(content_type: &str, body: &[u8]) -> Result<Vec<Vec<u8>>> {
+fn parse_multipart(content_type: &str, body: &[u8]) -> Result<Vec<Vec<u8>>, MultipartError> {
+    parse_multipart_with_limit(content_type, body, MAX_MESSAGE_BODY)
+}
+
+fn parse_multipart_with_limit(
+    content_type: &str,
+    body: &[u8],
+    max_body: usize,
+) -> Result<Vec<Vec<u8>>, MultipartError> {
+    if body.len() > max_body {
+        return Err(MultipartError::Limit(MultipartLimitExceeded {
+            what: "body bytes",
+            limit: max_body,
+        }));
+    }
+
     let boundary = extract_boundary(content_type)?;
 
     // Разделители: "\r\n--boundary" — между частями,
@@ -289,6 +522,8 @@ fn parse_multipart(content_type: &str, body: &[u8]) -> Result<Vec<Vec<u8>>> {
     leading.extend_from_slice(&boundary);
 
     let mut messages = Vec::new();
+    let mut parts_seen = 0usize;
+    let mut payload_total = 0usize;
     let mut pos;
 
     // Первый boundary
@@ -297,7 +532,9 @@ fn parse_multipart(content_type: &str, body: &[u8]) -> Result<Vec<Vec<u8>>> {
     } else if let Some(idx) = find_subsequence(body, &delimiter) {
         pos = idx + delimiter.len();
     } else {
-        return Err(anyhow!("multipart body has no boundary"));
+        return Err(MultipartError::Malformed(
+            "body has no boundary".to_string(),
+        ));
     }
 
     loop {
@@ -306,7 +543,19 @@ fn parse_multipart(content_type: &str, body: &[u8]) -> Result<Vec<Vec<u8>>> {
             break;
         }
         if body.get(pos..pos + 2) != Some(b"\r\n") {
-            return Err(anyhow!("malformed multipart: expected CRLF after boundary"));
+            return Err(MultipartError::Malformed(
+                "expected CRLF after boundary".to_string(),
+            ));
+        }
+
+        // Закрывающий boundary не считается частью, поэтому лимит
+        // проверяется только для реальных секций.
+        parts_seen += 1;
+        if parts_seen > MAX_MULTIPART_PARTS {
+            return Err(MultipartError::Limit(MultipartLimitExceeded {
+                what: "parts",
+                limit: MAX_MULTIPART_PARTS,
+            }));
         }
         pos += 2;
 
@@ -315,16 +564,52 @@ fn parse_multipart(content_type: &str, body: &[u8]) -> Result<Vec<Vec<u8>>> {
         // терминатор `\r\n\r\n` состоит из CRLF после boundary и пустой
         // строки заголовков. Иначе такой (валидный) multipart не разобрать.
         let headers_start = pos.saturating_sub(2);
-        let headers_end = find_subsequence(&body[headers_start..], b"\r\n\r\n")
-            .ok_or_else(|| anyhow!("multipart part has no header terminator"))?;
+        let headers_end = find_subsequence(&body[headers_start..], b"\r\n\r\n").ok_or_else(|| {
+            MultipartError::Malformed("part has no header terminator".to_string())
+        })?;
+
+        if headers_end > MAX_MULTIPART_HEADER_BYTES {
+            return Err(MultipartError::Limit(MultipartLimitExceeded {
+                what: "header bytes per part",
+                limit: MAX_MULTIPART_HEADER_BYTES,
+            }));
+        }
+
+        let header_block = &body[headers_start..headers_start + headers_end];
+        let header_count = header_block
+            .windows(2)
+            .filter(|window| window == b"\r\n")
+            .count();
+        if header_count > MAX_MULTIPART_HEADERS {
+            return Err(MultipartError::Limit(MultipartLimitExceeded {
+                what: "headers per part",
+                limit: MAX_MULTIPART_HEADERS,
+            }));
+        }
+
         let payload_start = headers_start + headers_end + 4;
 
         // Ищем следующий delimiter
-        let next = find_subsequence(&body[payload_start..], &delimiter)
-            .ok_or_else(|| anyhow!("multipart body ended without closing boundary"))?;
+        let next = find_subsequence(&body[payload_start..], &delimiter).ok_or_else(|| {
+            MultipartError::Malformed("body ended without closing boundary".to_string())
+        })?;
 
         let payload_end = payload_start + next;
-        if payload_end > payload_start {
+        let payload_len = payload_end - payload_start;
+        payload_total = payload_total.checked_add(payload_len).ok_or(
+            MultipartError::Limit(MultipartLimitExceeded {
+                what: "payload bytes",
+                limit: max_body,
+            }),
+        )?;
+        if payload_total > max_body {
+            return Err(MultipartError::Limit(MultipartLimitExceeded {
+                what: "payload bytes",
+                limit: max_body,
+            }));
+        }
+
+        if payload_len > 0 {
             messages.push(body[payload_start..payload_end].to_vec());
         }
 
@@ -338,9 +623,23 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+
+    // Пропускаем несовпавшие позиции по первому байту boundary, а не
+    // запускаем `windows()`-сравнение на каждом смещении.
+    let first = needle[0];
+    let mut start = 0usize;
+    while start + needle.len() <= haystack.len() {
+        let offset = haystack[start..].iter().position(|&byte| byte == first)?;
+        let candidate = start + offset;
+        if candidate + needle.len() > haystack.len() {
+            return None;
+        }
+        if &haystack[candidate..candidate + needle.len()] == needle {
+            return Some(candidate);
+        }
+        start = candidate + 1;
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -375,5 +674,223 @@ mod tests {
         let ct = r#"multipart/form-data; boundary="abc""#;
         let parts = parse_multipart(ct, body).unwrap();
         assert_eq!(parts, vec![b"X".to_vec()]);
+    }
+
+    async fn spawn_raw_response(
+        response: Vec<u8>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request).await;
+            let _ = stream.write_all(&response).await;
+            let _ = stream.shutdown().await;
+        });
+        (format!("http://{}", addr), handle)
+    }
+
+    #[tokio::test]
+    async fn content_length_above_limit_is_rejected_before_body() {
+        let (url, server) = spawn_raw_response(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 999999\r\nConnection: close\r\n\r\n".to_vec(),
+        )
+        .await;
+        let response = reqwest::Client::new().get(&url).send().await.unwrap();
+
+        let error = read_body_limited(response, 32, BODY_READ_TIMEOUT)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            BodyError::PayloadTooLarge(PayloadTooLarge {
+                limit: 32,
+                declared: Some(999999)
+            })
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn chunked_body_over_limit_is_aborted() {
+        let (url, server) = spawn_raw_response(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n5\r\nworld\r\n0\r\n\r\n".to_vec(),
+        )
+        .await;
+        let response = reqwest::Client::new().get(&url).send().await.unwrap();
+
+        let error = read_body_limited(response, 8, BODY_READ_TIMEOUT)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            BodyError::PayloadTooLarge(PayloadTooLarge { limit: 8, .. })
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn body_limit_is_inclusive() {
+        let (url, server) = spawn_raw_response(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n5\r\nworld\r\n0\r\n\r\n".to_vec(),
+        )
+        .await;
+        let response = reqwest::Client::new().get(&url).send().await.unwrap();
+        let body = read_body_limited(response, 10, BODY_READ_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(body, b"helloworld");
+        server.await.unwrap();
+
+        let (url, server) = spawn_raw_response(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n5\r\nworld\r\n0\r\n\r\n".to_vec(),
+        )
+        .await;
+        let response = reqwest::Client::new().get(&url).send().await.unwrap();
+        assert!(read_body_limited(response, 9, BODY_READ_TIMEOUT)
+            .await
+            .is_err());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn truncated_body_is_rejected() {
+        let (url, server) = spawn_raw_response(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nhello"
+                .to_vec(),
+        )
+        .await;
+        let response = reqwest::Client::new().get(&url).send().await.unwrap();
+
+        assert!(read_body_limited(response, 64, BODY_READ_TIMEOUT)
+            .await
+            .is_err());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn slow_body_hits_timeout() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n")
+                .await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        });
+
+        let response = reqwest::Client::new()
+            .get(format!("http://{}", addr))
+            .send()
+            .await
+            .unwrap();
+        let error = read_body_limited(response, 64, Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, BodyError::Timeout { .. }));
+        server.abort();
+    }
+
+    #[test]
+    fn multipart_rejects_too_many_parts() {
+        let mut body = String::new();
+        for index in 0..=MAX_MULTIPART_PARTS {
+            body.push_str(&format!("--X\r\n\r\npart-{}\r\n", index));
+        }
+        body.push_str("--X--\r\n");
+
+        match parse_multipart("multipart/form-data; boundary=X", body.as_bytes()) {
+            Err(MultipartError::Limit(error)) => assert_eq!(error.what, "parts"),
+            other => panic!("expected parts limit, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn multipart_accepts_exactly_max_parts() {
+        let mut body = String::new();
+        for index in 0..MAX_MULTIPART_PARTS {
+            body.push_str(&format!("--X\r\n\r\npart-{}\r\n", index));
+        }
+        body.push_str("--X--\r\n");
+
+        let parts = parse_multipart("multipart/form-data; boundary=X", body.as_bytes()).unwrap();
+        assert_eq!(parts.len(), MAX_MULTIPART_PARTS);
+    }
+
+    #[test]
+    fn multipart_rejects_oversized_headers() {
+        let body = format!(
+            "--X\r\nX-Big: {}\r\n\r\npayload\r\n--X--\r\n",
+            "a".repeat(MAX_MULTIPART_HEADER_BYTES)
+        );
+        match parse_multipart("multipart/form-data; boundary=X", body.as_bytes()) {
+            Err(MultipartError::Limit(error)) => {
+                assert_eq!(error.what, "header bytes per part")
+            }
+            other => panic!("expected header bytes limit, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn multipart_rejects_too_many_headers() {
+        let mut body = String::from("--X\r\n");
+        for index in 0..=MAX_MULTIPART_HEADERS {
+            body.push_str(&format!("X-Header-{}: v\r\n", index));
+        }
+        body.push_str("\r\npayload\r\n--X--\r\n");
+
+        match parse_multipart("multipart/form-data; boundary=X", body.as_bytes()) {
+            Err(MultipartError::Limit(error)) => assert_eq!(error.what, "headers per part"),
+            other => panic!("expected headers limit, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn multipart_rejects_body_over_limit() {
+        let body = b"--X\r\n\r\npayload\r\n--X--\r\n";
+        match parse_multipart_with_limit("multipart/form-data; boundary=X", body, 8) {
+            Err(MultipartError::Limit(error)) => assert_eq!(error.what, "body bytes"),
+            other => panic!("expected body limit, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn multipart_rejects_oversized_boundary() {
+        let boundary = "b".repeat(MAX_MULTIPART_BOUNDARY + 1);
+        let content_type = format!("multipart/form-data; boundary={}", boundary);
+        match parse_multipart(&content_type, b"--x--\r\n") {
+            Err(MultipartError::Limit(error)) => assert_eq!(error.what, "boundary bytes"),
+            other => panic!("expected boundary limit, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn multipart_rejects_garbage_without_panicking() {
+        for (content_type, body) in [
+            ("multipart/form-data", &b"garbage"[..]),
+            ("multipart/form-data; boundary=", &b"garbage"[..]),
+            (
+                "multipart/form-data; boundary=X",
+                &b"--X\r\nno terminator"[..],
+            ),
+            ("multipart/form-data; boundary=X", &b"--X\r\n\r\npayload"[..]),
+        ] {
+            assert!(matches!(
+                parse_multipart(content_type, body),
+                Err(MultipartError::Malformed(_))
+            ));
+        }
     }
 }
