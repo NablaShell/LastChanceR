@@ -35,7 +35,15 @@ pub const MIN_PASSWORD_LEN: usize = 8;
 
 const SALT_LEN: usize = 32;
 const NONCE_LEN: usize = 24;
-const FILE_MAGIC: &[u8] = b"LCVAULT1";
+/// Открытый форматный тег файлового конверта.
+///
+/// Тег **не аутентифицирует** данные и не является доказательством, что
+/// перед нами vault: он лишь позволяет отличить наш конверт от legacy
+/// plaintext. Подделка тега не даёт ничего без корректного AEAD-тега, а
+/// соль и параметры KDF связаны с данными через AAD. Исторический суффикс
+/// `1` — часть фиксированного тега; версия формата, участвующая в
+/// аутентификации, хранится отдельно в `HEADER_VERSION`.
+const FILE_FORMAT_TAG: &[u8] = b"LCVAULT1";
 /// Домен аутентифицируемого заголовка. Заголовок не хранится на диске:
 /// он заново собирается из `vault.salt` и параметров KDF при открытии.
 const HEADER_LABEL: &[u8] = b"lastchance:vault-header";
@@ -199,8 +207,8 @@ pub fn derive_new(password: &str) -> Result<(Vec<u8>, MasterKey)> {
 /// Шифрует файл целиком: `LCVAULT1 || nonce || ciphertext || tag`.
 pub fn seal_file(key: &MasterKey, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
     let sealed = key.encrypt(plaintext, aad)?;
-    let mut out = Vec::with_capacity(FILE_MAGIC.len() + sealed.len());
-    out.extend_from_slice(FILE_MAGIC);
+    let mut out = Vec::with_capacity(FILE_FORMAT_TAG.len() + sealed.len());
+    out.extend_from_slice(FILE_FORMAT_TAG);
     out.extend_from_slice(&sealed);
     Ok(out)
 }
@@ -208,14 +216,17 @@ pub fn seal_file(key: &MasterKey, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8
 /// Расшифровывает файл, созданный [`seal_file`].
 pub fn open_file(key: &MasterKey, aad: &[u8], data: &[u8]) -> Result<Vec<u8>> {
     let sealed = data
-        .strip_prefix(FILE_MAGIC)
+        .strip_prefix(FILE_FORMAT_TAG)
         .ok_or_else(|| anyhow!("файл не зашифрован или повреждён"))?;
     key.decrypt(sealed, aad)
 }
 
-/// Проверяет, что файл зашифрован нашим форматом.
+/// Проверяет наличие форматного тега (не аутентификация).
+///
+/// Результат означает только «файл похож на наш конверт», но не
+/// подтверждает его подлинность: это делает AEAD при [`open_file`].
 pub fn is_sealed(data: &[u8]) -> bool {
-    data.starts_with(FILE_MAGIC)
+    data.starts_with(FILE_FORMAT_TAG)
 }
 
 /// Проверяет, что значение колонки SQLite уже зашифровано.
