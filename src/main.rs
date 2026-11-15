@@ -5511,8 +5511,13 @@ fn print_cli_help(program: &str) {
     println!();
     println!("Переменные окружения:");
     println!("  LASTCHANCE_DIR        Каталог профиля, если не задан --profile-dir");
+    println!("  LASTCHANCE_PASS_FILE  Файл с мастер-паролем (режим 0600);");
+    println!("                        приоритетнее LASTCHANCE_PASS");
     println!("  LASTCHANCE_PASS       Мастер-пароль для headless-режима;");
-    println!("                        без него пароль запрашивается скрыто в TTY");
+    println!("                        виден в /proc/<pid>/environ, поэтому");
+    println!("                        используйте только в отдельном UID/контейнере;");
+    println!("                        без этих переменных пароль запрашивается");
+    println!("                        скрыто в TTY");
     println!();
     println!("  -h, --help            Показать эту справку");
     println!();
@@ -5667,23 +5672,147 @@ fn run_recovery(base_dir: &str) -> Result<Vault> {
     Ok(vault)
 }
 
+/// Переменная с мастер-паролем в окружении (совместимость).
+const PASS_ENV: &str = "LASTCHANCE_PASS";
+/// Переменная с путём к файлу мастер-пароля (предпочтительный способ).
+const PASS_FILE_ENV: &str = "LASTCHANCE_PASS_FILE";
+
+/// Читает мастер-пароль из файла.
+///
+/// На Unix файл должен быть приватным: любые биты group/other запрещены
+/// (`0600` и строже). Один завершающий перевод строки отбрасывается, чтобы
+/// `echo secret > file` работал предсказуемо. Значение возвращается в
+/// `Zeroizing` и никогда не печатается.
+fn read_password_file(path: &std::path::Path) -> Result<Zeroizing<String>> {
+    let metadata = std::fs::metadata(path).map_err(|e| {
+        anyhow!(
+            "{}: cannot stat {}: {}",
+            PASS_FILE_ENV,
+            path.display(),
+            e
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(anyhow!(
+            "{}: {} is not a regular file",
+            PASS_FILE_ENV,
+            path.display()
+        ));
+    }
+    // Пароль — одна короткая строка; не читаем произвольный файл целиком.
+    const MAX_PASSWORD_FILE_BYTES: u64 = 4096;
+    if metadata.len() > MAX_PASSWORD_FILE_BYTES {
+        return Err(anyhow!(
+            "{}: {} is larger than {} bytes",
+            PASS_FILE_ENV,
+            path.display(),
+            MAX_PASSWORD_FILE_BYTES
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(anyhow!(
+                "{}: {} has mode {:04o}; expected 0600 (no group/other access)",
+                PASS_FILE_ENV,
+                path.display(),
+                mode
+            ));
+        }
+    }
+
+    let mut file = std::fs::File::open(path).map_err(|e| {
+        anyhow!(
+            "{}: cannot open {}: {}",
+            PASS_FILE_ENV,
+            path.display(),
+            e
+        )
+    })?;
+    let mut password = Zeroizing::new(String::new());
+    file.read_to_string(&mut password).map_err(|e| {
+        anyhow!(
+            "{}: cannot read {} as UTF-8: {}",
+            PASS_FILE_ENV,
+            path.display(),
+            e
+        )
+    })?;
+
+    let len = password.trim_end_matches(['\r', '\n']).len();
+    password.truncate(len);
+    Ok(password)
+}
+
+/// Выбирает мастер-пароль из явных источников.
+///
+/// Приоритет: `LASTCHANCE_PASS_FILE` > `LASTCHANCE_PASS`. Значения не
+/// попадают ни в предупреждения, ни в ошибки; предупреждения — только про
+/// сам источник и путь. `warnings` вынесен параметром, чтобы тесты могли
+/// убедиться, что секрет туда не утекает.
+fn resolve_headless_password(
+    file: Option<PathBuf>,
+    env_password: Option<Zeroizing<String>>,
+    warnings: &mut dyn io::Write,
+) -> Result<Zeroizing<String>> {
+    if let Some(path) = file {
+        if env_password.is_some() {
+            let _ = writeln!(
+                warnings,
+                "warning: {} is ignored because {} is set",
+                PASS_ENV, PASS_FILE_ENV
+            );
+        }
+        return read_password_file(&path);
+    }
+
+    if let Some(password) = env_password {
+        let _ = writeln!(
+            warnings,
+            "warning: {} is visible in /proc/<pid>/environ to the same UID; prefer {} with mode 0600",
+            PASS_ENV, PASS_FILE_ENV
+        );
+        return Ok(password);
+    }
+
+    Err(anyhow!(
+        "{} / {} is not set and stdin is not an interactive TTY",
+        PASS_ENV,
+        PASS_FILE_ENV
+    ))
+}
+
 /// Читает мастер-пароль для headless-режима.
 ///
-/// Приоритет: `LASTCHANCE_PASS`, затем скрытый ввод, если stdin — TTY.
-/// Без TTY возвращаем чистую ошибку (main завершится с кодом 1).
+/// Приоритет: `LASTCHANCE_PASS_FILE`, затем `LASTCHANCE_PASS`, затем скрытый
+/// ввод, если stdin — TTY. Без TTY возвращаем чистую ошибку (main завершится
+/// с кодом 1).
 fn read_headless_password() -> Result<Zeroizing<String>> {
     use std::io::IsTerminal;
 
-    if let Some(raw) = std::env::var_os("LASTCHANCE_PASS") {
-        let password = raw
-            .into_string()
-            .map_err(|_| anyhow!("LASTCHANCE_PASS is not valid UTF-8"))?;
-        return Ok(Zeroizing::new(password));
+    let file = std::env::var_os(PASS_FILE_ENV).map(PathBuf::from);
+    let env_password = match std::env::var_os(PASS_ENV) {
+        Some(raw) => Some(Zeroizing::new(
+            raw.into_string()
+                .map_err(|_| anyhow!("{} is not valid UTF-8", PASS_ENV))?,
+        )),
+        None => None,
+    };
+
+    if file.is_some() || env_password.is_some() {
+        let mut stderr = io::stderr();
+        return resolve_headless_password(file, env_password, &mut stderr);
     }
 
     if !io::stdin().is_terminal() {
         return Err(anyhow!(
-            "LASTCHANCE_PASS is not set and stdin is not an interactive TTY"
+            "{} / {} is not set and stdin is not an interactive TTY",
+            PASS_ENV,
+            PASS_FILE_ENV
         ));
     }
 
@@ -6405,5 +6534,125 @@ mod tests {
             .to_string();
 
         assert!(!error.contains("abandon"), "error leaked the phrase: {error}");
+    }
+
+    // ============================================================
+    // L-5: мастер-пароль из файла и окружения
+    // ============================================================
+
+    fn write_password_file(
+        dir: &std::path::Path,
+        name: &str,
+        contents: &str,
+        mode: u32,
+    ) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        path
+    }
+
+    #[test]
+    fn password_file_is_read_and_trailing_newline_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_password_file(dir.path(), "pass", "file secret \r\n", 0o600);
+        let mut warnings = Vec::new();
+
+        let password = resolve_headless_password(Some(path), None, &mut warnings).unwrap();
+
+        assert_eq!(password.as_str(), "file secret ");
+        assert!(warnings.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn password_file_rejects_group_or_world_access() {
+        let dir = tempfile::tempdir().unwrap();
+
+        for mode in [0o640, 0o604, 0o666] {
+            let path = write_password_file(dir.path(), "pass", "file-secret\n", mode);
+            let mut warnings = Vec::new();
+            let error = resolve_headless_password(Some(path), None, &mut warnings)
+                .unwrap_err()
+                .to_string();
+
+            assert!(error.contains("0600"), "mode {mode:04o}: {error}");
+            assert!(!error.contains("file-secret"));
+        }
+    }
+
+    #[test]
+    fn password_file_wins_over_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_password_file(dir.path(), "pass", "file-secret\n", 0o600);
+        let mut warnings = Vec::new();
+
+        let password = resolve_headless_password(
+            Some(path),
+            Some(Zeroizing::new("env-secret".to_string())),
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert_eq!(password.as_str(), "file-secret");
+        let warnings = String::from_utf8(warnings).unwrap();
+        assert!(warnings.contains("ignored"), "{warnings}");
+        assert!(!warnings.contains("file-secret"));
+        assert!(!warnings.contains("env-secret"));
+    }
+
+    #[test]
+    fn environment_password_still_works_and_warns_without_value() {
+        let mut warnings = Vec::new();
+
+        let password = resolve_headless_password(
+            None,
+            Some(Zeroizing::new("env-secret".to_string())),
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert_eq!(password.as_str(), "env-secret");
+        let warnings = String::from_utf8(warnings).unwrap();
+        assert!(warnings.contains("/proc/<pid>/environ"), "{warnings}");
+        assert!(!warnings.contains("env-secret"));
+    }
+
+    #[test]
+    fn missing_password_file_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut warnings = Vec::new();
+
+        let error = resolve_headless_password(
+            Some(dir.path().join("missing")),
+            None,
+            &mut warnings,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("LASTCHANCE_PASS_FILE"), "{error}");
+    }
+
+    #[test]
+    fn password_file_must_be_regular() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut warnings = Vec::new();
+
+        let error = resolve_headless_password(
+            Some(dir.path().to_path_buf()),
+            None,
+            &mut warnings,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("not a regular file"), "{error}");
     }
 }

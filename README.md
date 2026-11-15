@@ -421,7 +421,15 @@ echo "secret text" | LASTCHANCE_PASS=secret lastchance --to alice --send -
 LASTCHANCE_PASS=secret lastchance --to alice --file ./report.pdf
 ```
 
-`--to` accepts a contact name from the local database, an identity hash or a full `lastchance://contact?...` link. `--send -` reads the message from stdin so the text does not appear in `ps aux`. The master password is taken from `LASTCHANCE_PASS`; without it, an interactive TTY is prompted with hidden input. Headless mode exits with code `0` on success and `1` on error.
+`--to` accepts a contact name from the local database, an identity hash or a full `lastchance://contact?...` link. `--send -` reads the message from stdin so the text does not appear in `ps aux`. Headless mode exits with code `0` on success and `1` on error.
+
+The master password is taken from these sources, in priority order:
+
+1. `LASTCHANCE_PASS_FILE=/path/to/password` — read from a file that must be private. On Unix the client rejects any file with group or other permission bits (`0600` or stricter), strips trailing newline characters and never prints the contents. The path itself is not secret.
+2. `LASTCHANCE_PASS=secret` — kept for compatibility. The value is part of the process environment: the same UID (and root) can read it via `/proc/<pid>/environ`, and it may also leak into shell history, process listings, crash dumps or logs of a supervisor. Use it only when the client runs under a dedicated UID, container or VM. With a shared UID prefer `LASTCHANCE_PASS_FILE`, or systemd credentials (`LoadCredentialEncrypted=` and `LASTCHANCE_PASS_FILE=$CREDENTIALS_DIRECTORY/lastchance-pass`).
+3. If neither variable is set, an interactive TTY is prompted with hidden input.
+
+When both variables are set, `LASTCHANCE_PASS_FILE` wins; `LASTCHANCE_PASS` is ignored and a warning is printed. Neither warning contains the password value, and the value is never logged.
 
 A `lastchance://contact?...` link passed as a command-line argument is imported as a contact.
 
@@ -457,6 +465,7 @@ On first launch you will be asked to create a master password. On later launches
 - Alias routing leaves no durable server-side trace beyond delivery: the client keeps the alias table only in RAM, rebuilds it from `vault.dat` on startup and forgets retired aliases on contact deletion. Duplicate-delivery keys are held for 300 seconds (maximum 8192) and are not persisted.
 - Local metadata such as contact hashes, public keys and timestamps is not encrypted; message bodies, nicknames and file names are.
 - The seed phrase is the identity. Anyone who obtains it can impersonate you and read your chats. The master password protects local data only; there is no password recovery.
+- `LASTCHANCE_PASS` is exposed to every process that can read the client's environment (`/proc/<pid>/environ` for the same UID, and root). Prefer `LASTCHANCE_PASS_FILE` with mode `0600` or systemd credentials; use the environment variable only under a dedicated UID, container or VM.
 - The code has not been audited. The protocol and the storage format may change.
 - When HTTPS URLs are used, TLS is provided by `reqwest` defaults; no certificate pinning is implemented.
 
@@ -867,7 +876,15 @@ echo "секретный текст" | LASTCHANCE_PASS=secret lastchance --to al
 LASTCHANCE_PASS=secret lastchance --to alice --file ./report.pdf
 ```
 
-`--to` принимает имя контакта из локальной базы, identity_hash или полную ссылку `lastchance://contact?...`. `--send -` читает сообщение из stdin, чтобы текст не светился в `ps aux`. Мастер-пароль берётся из `LASTCHANCE_PASS`; без него в интерактивном TTY запрашивается скрытый ввод. Headless-режим завершается с кодом `0` при успехе и `1` при ошибке.
+`--to` принимает имя контакта из локальной базы, identity_hash или полную ссылку `lastchance://contact?...`. `--send -` читает сообщение из stdin, чтобы текст не светился в `ps aux`. Headless-режим завершается с кодом `0` при успехе и `1` при ошибке.
+
+Мастер-пароль берётся из следующих источников (по приоритету):
+
+1. `LASTCHANCE_PASS_FILE=/path/to/password` — читается из приватного файла. На Unix клиент отвергает файл с любыми битами group/other (`0600` или строже), отбрасывает завершающие переводы строк и никогда не печатает содержимое. Сам путь секретом не является.
+2. `LASTCHANCE_PASS=secret` — оставлен для совместимости. Значение находится в окружении процесса: тот же UID (и root) может прочитать его через `/proc/<pid>/environ`; оно также может попасть в историю shell, список процессов, core dump или логи супервизора. Используйте его только когда клиент работает в отдельном UID, контейнере или VM. При общем UID предпочтительны `LASTCHANCE_PASS_FILE` или systemd credentials (`LoadCredentialEncrypted=` и `LASTCHANCE_PASS_FILE=$CREDENTIALS_DIRECTORY/lastchance-pass`).
+3. Если не задана ни одна переменная, в интерактивном TTY запрашивается скрытый ввод.
+
+Если заданы обе переменные, побеждает `LASTCHANCE_PASS_FILE`; `LASTCHANCE_PASS` игнорируется с предупреждением. Ни одно предупреждение не содержит значения пароля, и значение никогда не логируется.
 
 Ссылка `lastchance://contact?...`, переданная аргументом командной строки, импортируется как контакт.
 
@@ -899,6 +916,7 @@ chmod +x lastchance-linux-x86_64
 - Адресация по alias не оставляет долговременного следа на сервере сверх факта доставки: таблица alias живёт только в RAM, пересобирается из `vault.dat` при старте, а retired-alias забываются при удалении контакта. Ключи дедупликации хранятся 300 секунд (максимум 8192) и не персистятся.
 - Локальные метаданные (хеши контактов, публичные ключи, время) не шифруются; тела сообщений, ники и имена файлов — шифруются.
 - Seed-фраза — это идентичность. Тот, кто её получил, может выдать себя за вас и читать ваши чаты. Мастер-пароль защищает только локальные данные; восстановления пароля нет.
+- `LASTCHANCE_PASS` виден любому процессу, который может прочитать окружение клиента (`/proc/<pid>/environ` для того же UID и для root). Предпочитайте `LASTCHANCE_PASS_FILE` с режимом `0600` или systemd credentials; используйте переменную окружения только в отдельном UID, контейнере или VM.
 - Код не проходил аудит. Протокол и формат хранилища могут меняться.
 - Если используются HTTPS-адреса, TLS обеспечивается настройками `reqwest` по умолчанию; certificate pinning не реализован.
 
