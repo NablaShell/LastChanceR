@@ -162,7 +162,9 @@ impl PullError {
 /// - превышение в chunked-ответе или несовпадение с `Content-Length`
 ///   (в любую сторону) → ошибка, остаток тела не дочитывается;
 /// - таймаут покрывает всё чтение, а не отдельный chunk.
-async fn read_body_limited(
+///
+/// Общая для `listener` и `sender`: ответ `/upload` тоже недоверенный.
+pub(crate) async fn read_body_limited(
     mut response: reqwest::Response,
     limit: usize,
     timeout: Duration,

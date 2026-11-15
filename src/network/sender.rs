@@ -6,10 +6,15 @@ use std::collections::HashMap;
 use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 use crate::identity::hash_ed25519_public;
+use crate::network::listener::read_body_limited;
 use crate::network::{auth, build_http_client, Config, BODY_READ_TIMEOUT, MAX_ERROR_BODY};
 use crate::types::{truncate_display, FileHash};
 
 const MAX_UPLOAD_SIZE: usize = crate::crypto::FILE_MAX_ENVELOPE;
+/// Успешный `/upload` возвращает один hex-хеш (64 символа). Лимит с запасом
+/// на whitespace, но жёсткий: тело 200 — такой же недоверенный ввод, как и
+/// тело ошибки, и не должно читаться без границ (M-A).
+const MAX_UPLOAD_HASH_BODY: usize = 1024;
 // Один клиент на всё; таймаут 120s покрывает upload до 128 MiB.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -356,27 +361,7 @@ impl Sender {
             .map_err(|e| anyhow!("upload request failed: {}", e))?;
 
         match response.status().as_u16() {
-            200 => {
-                let file_hash = response
-                    .text()
-                    .await
-                    .map_err(|e| anyhow!("read response: {}", e))?;
-                let file_hash = file_hash.trim();
-                if file_hash.is_empty() {
-                    return Err(anyhow!("server returned empty file hash"));
-                }
-                // Хеш от сервера — недоверенный ввод. Приводим к
-                // каноническому lower-case hex до использования в UI/URL.
-                let file_hash = FileHash::from_hex(file_hash).map_err(|e| {
-                    anyhow!(
-                        "server returned invalid file hash ({}…, {} chars): {}",
-                        truncate_display(file_hash, 16),
-                        file_hash.chars().count(),
-                        e
-                    )
-                })?;
-                Ok(file_hash.to_string())
-            }
+            200 => read_upload_hash(response).await,
             411 => Err(anyhow!("missing Content-Length")),
             413 => Err(anyhow!("file too large (413)")),
             429 => Err(anyhow!("rate limited (429)")),
@@ -386,6 +371,35 @@ impl Sender {
             }
         }
     }
+}
+
+/// Разбирает тело успешного `/upload`: ограниченное чтение, затем строгая
+/// проверка hex-хеша. Ошибки чтения (в т.ч. превышение лимита) фатальны —
+/// тело 200 не должно читаться до EOF.
+async fn read_upload_hash(response: reqwest::Response) -> Result<String> {
+    let body = read_body_limited(response, MAX_UPLOAD_HASH_BODY, BODY_READ_TIMEOUT)
+        .await
+        .map_err(|e| anyhow!("read response: {}", e))?;
+
+    // Валидный хеш — только ASCII hex; произвольные байты в сообщение об
+    // ошибке не попадают.
+    let body = std::str::from_utf8(&body)
+        .map_err(|_| anyhow!("server returned non-UTF-8 file hash"))?;
+    let file_hash = body.trim();
+    if file_hash.is_empty() {
+        return Err(anyhow!("server returned empty file hash"));
+    }
+    // Хеш от сервера — недоверенный ввод. Приводим к
+    // каноническому lower-case hex до использования в UI/URL.
+    let file_hash = FileHash::from_hex(file_hash).map_err(|e| {
+        anyhow!(
+            "server returned invalid file hash ({}…, {} chars): {}",
+            truncate_display(file_hash, 16),
+            file_hash.chars().count(),
+            e
+        )
+    })?;
+    Ok(file_hash.to_string())
 }
 
 /// Читает тело ошибки с жёстким лимитом (M-2), не доверяя Content-Length.
@@ -773,5 +787,153 @@ mod tests {
         let headers = server.await.expect("server task");
         let forbidden = format!("x-{}-name", "file");
         assert!(!headers.contains(&forbidden), "headers: {}", headers);
+    }
+
+    const UPLOAD_HASH: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn upload_config(addr: std::net::SocketAddr) -> Config {
+        Config {
+            file_server_url: format!("http://{}", addr),
+            ..Config::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_success_body_at_limit_is_accepted() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        // Хеш + whitespace ровно до MAX_UPLOAD_HASH_BODY байт.
+        let body = format!(
+            "{}{}",
+            UPLOAD_HASH,
+            " ".repeat(MAX_UPLOAD_HASH_BODY - UPLOAD_HASH.len())
+        );
+        assert_eq!(body.len(), MAX_UPLOAD_HASH_BODY);
+
+        let payload = body.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let _ = read_request(&mut stream).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                payload.len(),
+                payload
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        });
+
+        let sender = Sender::new(&upload_config(addr)).expect("sender");
+        let hash = sender
+            .upload_file(b"encrypted envelope")
+            .await
+            .expect("body of exactly the limit is allowed");
+        assert_eq!(hash, UPLOAD_HASH);
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn upload_success_body_over_limit_is_rejected() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let body = format!(
+            "{}{}",
+            UPLOAD_HASH,
+            " ".repeat(MAX_UPLOAD_HASH_BODY + 1 - UPLOAD_HASH.len())
+        );
+        assert_eq!(body.len(), MAX_UPLOAD_HASH_BODY + 1);
+
+        let payload = body.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let _ = read_request(&mut stream).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                payload.len(),
+                payload
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        });
+
+        let sender = Sender::new(&upload_config(addr)).expect("sender");
+        let error = sender
+            .upload_file(b"encrypted envelope")
+            .await
+            .expect_err("body over the limit must be rejected");
+        assert!(
+            format!("{}", error).contains("payload too large"),
+            "unexpected error: {}",
+            error
+        );
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn upload_chunked_endless_body_is_rejected() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let written = Arc::new(AtomicUsize::new(0));
+        let counter = written.clone();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let _ = read_request(&mut stream).await;
+            if stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .is_err()
+            {
+                return;
+            }
+
+            let chunk = vec![b'a'; 64 * 1024];
+            let mut frame = Vec::with_capacity(chunk.len() + 16);
+            frame.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            frame.extend_from_slice(&chunk);
+            frame.extend_from_slice(b"\r\n");
+
+            // Никогда не завершаем поток: клиент обязан оборвать чтение по
+            // лимиту, а не накапливать тело до OOM.
+            for _ in 0..4096 {
+                if stream.write_all(&frame).await.is_err() {
+                    break;
+                }
+                counter.fetch_add(frame.len(), Ordering::SeqCst);
+            }
+            let _ = stream.shutdown().await;
+        });
+
+        let sender = Sender::new(&upload_config(addr)).expect("sender");
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            sender.upload_file(b"encrypted envelope"),
+        )
+        .await
+        .expect("endless body must not hang")
+        .expect_err("endless body must be rejected");
+        assert!(
+            format!("{}", error).contains("payload too large"),
+            "unexpected error: {}",
+            error
+        );
+
+        server.await.expect("server task");
+        assert!(
+            written.load(Ordering::SeqCst) < 4 * 1024 * 1024,
+            "client kept reading past the limit instead of closing: {} bytes written",
+            written.load(Ordering::SeqCst)
+        );
     }
 }
