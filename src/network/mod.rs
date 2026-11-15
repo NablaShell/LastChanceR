@@ -72,9 +72,11 @@ mod tests {
     #[test]
     fn file_body_limit_matches_file_envelope_limit() {
         assert_eq!(MAX_FILE_BODY, crate::crypto::FILE_MAX_ENVELOPE);
-        assert!(
-            MAX_FILE_BODY < 256 * 1024 * 1024,
-            "the old 256 MiB limit would download envelopes the client cannot accept"
-        );
+        const {
+            assert!(
+                MAX_FILE_BODY < 256 * 1024 * 1024,
+                "the old 256 MiB limit would download envelopes the client cannot accept"
+            );
+        }
     }
 }
