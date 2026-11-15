@@ -1,0 +1,7 @@
+# cargo-deny configuration.
+# CI runs `cargo deny check advisories`; other checks (licenses, bans,
+# sources) are intentionally not enabled yet.
+
+[advisories]
+version = 2
+yanked = "deny"

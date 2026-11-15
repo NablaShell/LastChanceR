@@ -1,0 +1,37 @@
+name: Supply chain audit
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  schedule:
+    # Weekly run catches advisories published after the last commit.
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Скачать код репозитория
+        uses: actions/checkout@v4
+
+      - name: Установить Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Кэшировать cargo registry и target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Установить cargo-audit и cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
+
+      - name: Проверить уязвимости и unmaintained-крейты
+        run: cargo audit --deny warnings
+
+      - name: Проверить advisory-базу через cargo-deny
+        run: cargo deny check advisories
