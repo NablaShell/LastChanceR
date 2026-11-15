@@ -93,7 +93,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, Zeroizing};
 
 use super::secret::SecretBytes;
-use super::ALLOWED_TOTAL_SIZES;
+use super::{validate_x25519_peer, ALLOWED_TOTAL_SIZES};
 
 /// Версия wire-формата пакета. v1/v2 не поддерживаются (fail-closed).
 pub const PROTOCOL_VERSION: u8 = 3;
@@ -496,11 +496,17 @@ impl KeyPair {
         }
     }
 
-    fn diffie_hellman(&self, peer: &[u8; 32]) -> [u8; 32] {
+    fn diffie_hellman(&self, peer: &[u8; 32]) -> Result<[u8; 32]> {
+        validate_x25519_peer(peer)?;
+
         let secret = StaticSecret::from(*self.private);
-        secret
-            .diffie_hellman(&PublicKey::from(*peer))
-            .to_bytes()
+        let shared = secret.diffie_hellman(&PublicKey::from(*peer));
+        if !shared.was_contributory() {
+            return Err(anyhow!(
+                "invalid X25519 peer key: shared secret is all-zero (low-order point)"
+            ));
+        }
+        Ok(shared.to_bytes())
     }
 }
 
@@ -727,7 +733,7 @@ impl Session {
 
         // Новая эпоха: пробуем все локальные приватные ключи из окна.
         for keypair in self.local_key_candidates() {
-            let dh = keypair.diffie_hellman(&header.dh_pub);
+            let dh = keypair.diffie_hellman(&header.dh_pub)?;
             let root_key =
                 derive_epoch_root(&self.root, dh, &keypair.public, &header.dh_pub)?;
             let chain_key = derive_chain_key(&root_key, &header.dh_pub, &keypair.public)?;
@@ -847,7 +853,7 @@ impl Session {
         };
 
         let previous_chain_len = self.send_epochs.back().map(|epoch| epoch.index).unwrap_or(0);
-        let dh = keypair.diffie_hellman(&target);
+        let dh = keypair.diffie_hellman(&target)?;
         let root_key = derive_epoch_root(&self.root, dh, &keypair.public, &target)?;
         let chain_key = derive_chain_key(&root_key, &keypair.public, &target)?;
 
@@ -1852,6 +1858,19 @@ mod tests {
 
     fn assert_error(error: &anyhow::Error, expected: RatchetError) {
         assert_eq!(error.downcast_ref::<RatchetError>(), Some(&expected), "{:#}", error);
+    }
+
+    #[test]
+    fn ratchet_dh_rejects_low_order_peer_without_panicking() {
+        let keypair = KeyPair::generate();
+
+        assert!(keypair.diffie_hellman(&[0u8; 32]).is_err());
+        let mut one = [0u8; 32];
+        one[0] = 1;
+        assert!(keypair.diffie_hellman(&one).is_err());
+
+        let peer = KeyPair::generate();
+        assert!(keypair.diffie_hellman(&peer.public).is_ok());
     }
 
     #[test]

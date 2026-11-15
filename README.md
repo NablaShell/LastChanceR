@@ -6,7 +6,7 @@ I didn't feel like writing up the details, so this is a very rough version. I’
 
 LastChance is a privacy-focused messenger written in Rust. It has no GUI: the client is a lightweight terminal UI (TUI) built with `ratatui` and `crossterm`. The network core and cryptography are kept separate from the interface, so the same engine can be used by another frontend later.
 
-This is still early software. The code is not audited, the protocol is not final, and you should not rely on it for life-critical secrecy yet.
+This is still early software. The code is not audited, the protocol is not final, and you should not rely on it for life-critical secrecy yet. The current release is `1.0.0`; see [`CHANGELOG.md`](CHANGELOG.md) for the change history.
 
 ---
 
@@ -14,7 +14,7 @@ This is still early software. The code is not audited, the protocol is not final
 
 - End-to-end encrypted one-to-one text chat over your own HTTP server.
 - A separate file-transfer contour: files are encrypted locally, uploaded to a file server, and the chat only carries a file hash.
-- Fixed-size padded packets for text messages.
+- Bucket-padded text packets whose size is randomized inside the bucket.
 - Identity based on a BIP-39 seed phrase, X25519 for key exchange and Ed25519 for authentication.
 - Encrypted local storage protected by a master password (Argon2id + XChaCha20-Poly1305).
 - HTTP long-polling for incoming messages.
@@ -40,9 +40,11 @@ The crate is split into a reusable core library and a thin TUI binary:
 | `src/network/sender.rs` | `POST /push/<hash>`, file upload |
 | `src/network/listener.rs` | Long-poll `GET /pull/<hash>`, multipart parsing, file download |
 | `src/network/auth.rs` | Canonical request signatures, nonce cache and server-side verification |
+| `src/network/routing.rs` | `alias -> room` table, retired aliases and `(alias, nonce)` deduplication |
 | `src/storage/` | Safe filesystem operations and the encrypted local vault |
 | `src/vault.rs` | Master-key derivation and local encryption |
 | `src/app.rs` | Core application logic, events, contacts, sending/receiving |
+| `src/cli.rs` | Headless argument parsing without TUI dependencies |
 | `src/main.rs` | Terminal UI, commands, modals and startup flow |
 
 Message flow:
@@ -91,7 +93,7 @@ lastchance://contact?hash=...&doc=<cbor-hex>&sig=<signature-hex>&x25519=...&ed25
 ### Message encryption
 
 - Each contact has a static shared secret: `X25519(my_private, their_public)` followed by HKDF-SHA256 with the `ECDH_v1` label. It seeds the Double Ratchet session.
-- ECDH rejects invalid curve points: an all-zero X25519 output (low-order point) aborts the key agreement instead of producing a shared secret.
+- Every ECDH path first calls `validate_x25519_peer()`, which masks the ignored high bit (RFC 7748) and rejects all seven canonical low-order X25519 points (`0`, `1`, the two points of order 8, `p - 1`, `p` and `p + 1`). This check is shared by the static contact secret and every ratchet DH step; the resulting shared secret is also required to be contributory, so an all-zero output aborts the key agreement instead of producing a key.
 - Messages use a Double Ratchet over X25519 ephemeral DH steps, HKDF-SHA256 (`RootKey`, `ChainKey`, `MessageKey`) and XChaCha20-Poly1305 with a fresh 24-byte nonce.
 - Wire format v3 is `version (1) || flags (1) || session_alias (16) || [bootstrap_nonce (32)] || nonce (24) || encrypted_header (60) || ciphertext || tag (16)`. The `bootstrap_nonce` field is present only in the first session packet (`flags & 1`); later packets omit it.
 - `session_id` is not transmitted. Both sides derive it as `HKDF(ikm = shared_secret, salt = bootstrap_nonce, info = "session-id-v3")`; the open header carries `session_alias = HKDF(ikm = session_id, info = "route-v3")`. The alias is stable inside one session and is not the session id.
@@ -140,7 +142,7 @@ The text server and the file server are separate URLs configured independently.
 
 ### Wire format v3 release note (breaking)
 
-v3 is intentionally incompatible with v1/v2. After upgrading, old ratchet state is ignored (the client starts a fresh session), v2 packets are rejected with `UnsupportedVersion`, and old file blobs cannot be decrypted. Both peers must upgrade together; there is no downgrade path. The change removes the unauthenticated legacy decrypt path, hides ratchet counters and `dh_pub`, replaces the open `session_id` with an alias, and binds file metadata into AEAD.
+LastChance `1.0.0` speaks wire format v3. It is intentionally incompatible with v1/v2: after upgrading, old ratchet state is ignored (the client starts a fresh session), v2 packets are rejected with `UnsupportedVersion`, and old file blobs cannot be decrypted. Clients running `0.4.x` or older cannot exchange messages with `1.0.0`; both peers must upgrade together and there is no downgrade path. The change removes the unauthenticated legacy decrypt path, hides ratchet counters and `dh_pub`, replaces the open `session_id` with an alias, and binds file metadata into AEAD.
 
 ### What the servers can see
 
@@ -164,9 +166,9 @@ On first launch the client asks for a master password (minimum 8 characters). Th
 - A legacy plaintext `user.db` is imported on first open, after which `user.db`, `user.db-wal` and `user.db-shm` are overwritten with zeros and deleted.
 - Files created by the client are written with mode `0600` on Unix; a read-only fallback is used where POSIX permissions are unavailable.
 
-`/passwd` verifies the old password, re-encrypts `identity.json`, `global.conf` and all sensitive database fields, replaces the in-memory key and only then writes the new salt/check files. If a step fails, the client tries to roll the old key back.
+`/passwd` verifies the old password, re-encrypts `identity.json`, `global.conf` and the whole `vault.dat` container, replaces the in-memory key and only then writes the new salt/check files. If a step fails, the client tries to roll the old key back.
 
-Contact hashes, public keys, room hashes, message direction/status and timestamps remain plaintext metadata inside the local database; they are needed for lookups and ordering.
+All local database metadata — contact hashes, public keys, room hashes, message direction/status and timestamps — lives inside the encrypted `vault.dat` container and is not stored in plaintext on disk; it is decrypted into the in-memory SQLite database only for lookups and ordering.
 
 The data directory is chosen in this order:
 
@@ -464,7 +466,8 @@ On first launch you will be asked to create a master password. On later launches
 - The shared secret is static per contact and seeds every ratchet session. Each session adds fresh `bootstrap_nonce` entropy and ephemeral DH epochs, so session keys are not reused and captured packets cannot be replayed into a new session. Bootstrap keys are nevertheless derived from the long-term shared secret: an attacker who records a session's first packet and later obtains that secret can recompute its bootstrap root. There is no post-compromise security, and true first-message forward secrecy would require an interactive prekey/response handshake. For normal rooms destroyed session ids are persisted in `vault.dat`, so replay of a reset session stays blocked across restarts. For RAM-TTL rooms the list of destroyed session ids lives only in RAM (for the lifetime of the process), so after a client restart a replayed first packet is indistinguishable from first contact (the same TOFU boundary as the very first session). The per-session `dh_pub` registry is bounded to 128 keys: beyond that horizon an ancient key would again look new, but its local DH private key has already left the 5-epoch send window, so the packet still cannot be decrypted. The old v2 header had no epoch counter, so a genuine first-seen `dh_pub` from an older epoch could be accepted as a new epoch and move `remote_pub` back to that authentic key. In v3 the header carries an authenticated `epoch_id` inside the AEAD, and stale epochs are detected before any key agreement, so this limited denial-of-progress no longer applies; v1/v2 packets are rejected outright.
 - The server still learns the recipient identity hash, traffic timing, packet size class and the file blob size. The per-session alias allows grouping packets that belong to the same ratchet session, but not identifying the contact or the `session_id`. Use Tor/I2P and your own servers if that metadata matters to you.
 - Alias routing leaves no durable server-side trace beyond delivery: the client keeps the alias table only in RAM, rebuilds it from `vault.dat` on startup and forgets retired aliases on contact deletion. Duplicate-delivery keys are held for 300 seconds (maximum 8192) and are not persisted.
-- Local metadata such as contact hashes, public keys and timestamps is not encrypted; message bodies, nicknames and file names are.
+- Local metadata such as contact hashes, public keys and timestamps is encrypted at rest together with the rest of `vault.dat`, but it remains available in plaintext in process memory; message bodies, nicknames and file names are encrypted end to end.
+- Lock poisoning is handled explicitly instead of with `unwrap()`. A poisoned replay-protection state (retired sessions, ratchet, routing table or shared-secret cache) makes the client drop the incoming packet or abort a ratchet reset with a warning instead of treating the state as empty. The TTL RAM cache is recovered with `into_inner()` because it carries no security decision, while a poisoned database lock is a hard error.
 - The seed phrase is the identity. Anyone who obtains it can impersonate you and read your chats. The master password protects local data only; there is no password recovery.
 - `LASTCHANCE_PASS` is exposed to every process that can read the client's environment (`/proc/<pid>/environ` for the same UID, and root). Prefer `LASTCHANCE_PASS_FILE` with mode `0600` or systemd credentials; use the environment variable only under a dedicated UID, container or VM.
 - The code has not been audited. The protocol and the storage format may change.
@@ -480,13 +483,13 @@ Security reports, fuzzing, protocol review and UI improvements are welcome.
 
 LastChance — мессенджер на Rust с фокусом на приватность. GUI нет: клиент — лёгкий терминальный интерфейс (TUI) на `ratatui` и `crossterm`. Сетевое ядро и криптография отделены от интерфейса, поэтому тот же движок можно позже подключить к другому фронтенду.
 
-Это ранняя версия. Код не проходил аудит, протокол ещё не финальный, и полагаться на него для критически важной секретности пока не стоит.
+Это ранняя версия. Код не проходил аудит, протокол ещё не финальный, и полагаться на него для критически важной секретности пока не стоит. Текущий релиз — `1.0.0`; история изменений — в [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Что умеет
 
 - Сквозное (E2E) шифрование личных текстовых чатов через ваш собственный HTTP-сервер.
 - Отдельный файловый контур: файл шифруется локально, загружается на файловый сервер, а в чат уходит только хеш.
-- Текстовые пакеты фиксированного размера с паддингом.
+- Текстовые пакеты с паддингом по bucket-сетке и случайным размером внутри bucket.
 - Идентичность на основе BIP-39 seed-фразы, X25519 для обмена ключами и Ed25519 для аутентификации.
 - Зашифрованное локальное хранилище с мастер-паролем (Argon2id + XChaCha20-Poly1305).
 - HTTP Long-Polling для входящих сообщений.
@@ -508,9 +511,11 @@ LastChance — мессенджер на Rust с фокусом на прива�
 | `src/network/sender.rs` | `POST /push/<hash>`, загрузка файлов |
 | `src/network/listener.rs` | Long-poll `GET /pull/<hash>`, разбор multipart, скачивание файлов |
 | `src/network/auth.rs` | Канонические подписи запросов, nonce-кэш и серверная проверка |
+| `src/network/routing.rs` | Таблица `alias -> комната`, retired-alias и дедупликация `(alias, nonce)` |
 | `src/storage/` | Безопасная работа с ФС и зашифрованное локальное хранилище |
 | `src/vault.rs` | Вывод мастер-ключа и локальное шифрование |
 | `src/app.rs` | Ядро приложения, события, контакты, отправка и приём |
+| `src/cli.rs` | Разбор аргументов headless-режима без зависимостей от TUI |
 | `src/main.rs` | Терминальный интерфейс, команды, модальные окна, запуск |
 
 Поток сообщения:
@@ -557,7 +562,7 @@ lastchance://contact?hash=...&doc=<cbor-hex>&sig=<signature-hex>&x25519=...&ed25
 ### Шифрование сообщений
 
 - Для каждого контакта вычисляется статический общий секрет: `X25519(мой_private, его_public)`, затем HKDF-SHA256 с меткой `ECDH_v1`. Он инициализирует сессию Double Ratchet.
-- ECDH отклоняет некорректные точки: полностью нулевой выход X25519 (точка малого порядка) прерывает согласование ключа вместо выдачи общего секрета.
+- Любой путь ECDH сначала вызывает `validate_x25519_peer()`: функция маскирует игнорируемый старший бит (RFC 7748) и отклоняет все семь канонических точек малого порядка X25519 (`0`, `1`, две точки порядка 8, `p - 1`, `p` и `p + 1`). Проверка общая для статического контактного секрета и каждого DH-шага храповика; кроме того, общий секрет обязан быть вкладным (`was_contributory()`), поэтому нулевой выход прерывает согласование ключа вместо выдачи ключа.
 - Сообщения используют Double Ratchet поверх эфемерных X25519 DH-шагов, HKDF-SHA256 (`RootKey`, `ChainKey`, `MessageKey`) и XChaCha20-Poly1305 со свежим 24-байтным nonce.
 - Wire-format v3: `version (1) || flags (1) || session_alias (16) || [bootstrap_nonce (32)] || nonce (24) || encrypted_header (60) || ciphertext || tag (16)`. Поле `bootstrap_nonce` присутствует только в первом пакете сессии (`flags & 1`), остальные пакеты его не несут.
 - `session_id` не передаётся. Обе стороны выводят его как `HKDF(ikm = shared_secret, salt = bootstrap_nonce, info = "session-id-v3")`; в открытом заголовке едет `session_alias = HKDF(ikm = session_id, info = "route-v3")`. Alias стабилен внутри сессии и не равен `session_id`.
@@ -606,7 +611,7 @@ inner = name_len (u16) || name || size (u64) || padded_size (u64) || payload || 
 
 ### Release note: wire-format v3 (breaking)
 
-v3 намеренно несовместим с v1/v2. После обновления старое состояние храповика игнорируется (клиент начинает новую сессию), пакеты v2 отклоняются с `UnsupportedVersion`, а старые файловые блоки не расшифровываются. Обе стороны должны обновиться вместе; пути downgrade нет. Изменение удаляет неаутентифицированный legacy-путь расшифровки, скрывает счётчики храповика и `dh_pub`, заменяет открытый `session_id` на alias и привязывает метаданные файлов к AEAD.
+LastChance `1.0.0` использует wire-format v3. Он намеренно несовместим с v1/v2: после обновления старое состояние храповика игнорируется (клиент начинает новую сессию), пакеты v2 отклоняются с `UnsupportedVersion`, а старые файловые блоки не расшифровываются. Клиенты `0.4.x` и старше не могут обмениваться сообщениями с `1.0.0`; обе стороны должны обновиться вместе, пути downgrade нет. Изменение удаляет неаутентифицированный legacy-путь расшифровки, скрывает счётчики храповика и `dh_pub`, заменяет открытый `session_id` на alias и привязывает метаданные файлов к AEAD.
 
 ### Что видят серверы
 
@@ -916,7 +921,8 @@ chmod +x lastchance-linux-x86_64
 - Общий секрет статический для каждого контакта и инициализирует каждую сессию Double Ratchet. Свежий `bootstrap_nonce` и эфемерные DH-эпохи не дают переиспользовать ключи между сессиями и воспроизводить старые пакеты в новую сессию. Однако bootstrap-ключи по-прежнему выводятся из долговременного общего секрета: перехвативший первый пакет сессии и позже получивший этот секрет сможет восстановить её bootstrap-root. Post-compromise security отсутствует; настоящая forward secrecy на первом сообщении требует интерактивного prekey/ответного хендшейка. Для обычных комнат уничтоженные `session_id` пишутся в `vault.dat`, поэтому replay сброшенной сессии блокируется и после перезапуска. Для RAM-TTL комнат список уничтоженных `session_id` живёт только в RAM (в пределах жизни процесса), поэтому после перезапуска клиента повторно поданный первый пакет неотличим от первого контакта (та же граница TOFU, что и у самой первой сессии). Реестр `dh_pub` ограничен 128 ключами на сессию: за этим горизонтом древний ключ снова выглядит новым, но его локальный DH-приватный ключ уже покинул окно отправки в 5 эпох, поэтому расшифровать пакет всё равно не получится. В старом заголовке v2 не было счётчика эпох, поэтому подлинный впервые увиденный `dh_pub` старой эпохи мог приниматься как новая эпоха и сдвигать `remote_pub` на этот подлинный ключ. В v3 аутентифицированный `epoch_id` едет внутри AEAD, а устаревшие эпохи отсекаются до любого согласования ключей, поэтому этот ограниченный отказ в продвижении больше не применим; пакеты v1/v2 отклоняются целиком.
 - Сервер по-прежнему узнаёт хеш получателя, тайминг, класс размера пакета и размер файлового блока. Alias в пределах сессии позволяет группировать пакеты одной ratchet-сессии, но не идентифицировать контакт или `session_id`. Если это важно, используйте Tor/I2P и собственные серверы.
 - Адресация по alias не оставляет долговременного следа на сервере сверх факта доставки: таблица alias живёт только в RAM, пересобирается из `vault.dat` при старте, а retired-alias забываются при удалении контакта. Ключи дедупликации хранятся 300 секунд (максимум 8192) и не персистятся.
-- Локальные метаданные (хеши контактов, публичные ключи, время) не шифруются; тела сообщений, ники и имена файлов — шифруются.
+- Локальные метаданные (хеши контактов, публичные ключи, время) шифруются на диске вместе с остальным `vault.dat`, но остаются открытыми в памяти процесса; тела сообщений, ники и имена файлов шифруются сквозным образом.
+- Poison блокировок обрабатывается явно, без `unwrap()`. Если отравлено состояние replay-защиты (retired-сессии, храповик, таблица маршрутизации или кэш общих секретов), клиент отбрасывает входящий пакет или прерывает сброс храповика с предупреждением, а не считает состояние пустым. RAM-кэш TTL восстанавливается через `into_inner()`, потому что не принимает защитных решений, а poison блокировки базы — жёсткая ошибка.
 - Seed-фраза — это идентичность. Тот, кто её получил, может выдать себя за вас и читать ваши чаты. Мастер-пароль защищает только локальные данные; восстановления пароля нет.
 - `LASTCHANCE_PASS` виден любому процессу, который может прочитать окружение клиента (`/proc/<pid>/environ` для того же UID и для root). Предпочитайте `LASTCHANCE_PASS_FILE` с режимом `0600` или systemd credentials; используйте переменную окружения только в отдельном UID, контейнере или VM.
 - Код не проходил аудит. Протокол и формат хранилища могут меняться.
