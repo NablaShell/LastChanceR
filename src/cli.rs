@@ -13,14 +13,12 @@ pub struct HeadlessArgs {
     pub to: Option<String>,
     /// Текст сообщения; `-` означает чтение из stdin.
     pub send: Option<String>,
-    /// Необязательный путь к файлу для зашифрованной отправки.
-    pub file: Option<String>,
 }
 
 impl HeadlessArgs {
     /// Включён ли headless-режим (передан хотя бы один из его флагов).
     pub fn is_active(&self) -> bool {
-        self.to.is_some() || self.send.is_some() || self.file.is_some()
+        self.to.is_some() || self.send.is_some()
     }
 
     /// Читать ли текст сообщения из stdin.
@@ -35,11 +33,11 @@ impl HeadlessArgs {
         }
 
         if self.to.as_deref().map(str::trim).unwrap_or_default().is_empty() {
-            return Err(anyhow!("--to is required together with --send/--file"));
+            return Err(anyhow!("--to is required together with --send"));
         }
 
-        if self.send.is_none() && self.file.is_none() {
-            return Err(anyhow!("--to requires --send <text|-> or --file <path>"));
+        if self.send.is_none() {
+            return Err(anyhow!("--to requires --send <text|->"));
         }
 
         Ok(())
@@ -88,7 +86,6 @@ pub fn parse_headless_args(args: &[String]) -> Result<HeadlessArgs> {
     let parsed = HeadlessArgs {
         to: parse_flag_value(args, "--to")?,
         send: parse_flag_value(args, "--send")?,
-        file: parse_flag_value(args, "--file")?,
     };
     parsed.validate()?;
     Ok(parsed)
@@ -114,7 +111,6 @@ mod tests {
         assert!(parsed.is_active());
         assert_eq!(parsed.to.as_deref(), Some("alice"));
         assert_eq!(parsed.send.as_deref(), Some("hello world"));
-        assert_eq!(parsed.file, None);
         assert!(!parsed.reads_stdin());
     }
 
@@ -128,11 +124,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_equals_form_and_file() {
+    fn parses_equals_form() {
         let parsed = parse_headless_args(&args(&[
             "--to=lastchance://contact?hash=x",
             "--send=hi",
-            "--file=/tmp/report.pdf",
         ]))
         .unwrap();
 
@@ -141,14 +136,13 @@ mod tests {
             Some("lastchance://contact?hash=x")
         );
         assert_eq!(parsed.send.as_deref(), Some("hi"));
-        assert_eq!(parsed.file.as_deref(), Some("/tmp/report.pdf"));
     }
 
     #[test]
     fn headless_requires_recipient_and_payload() {
         assert!(parse_headless_args(&args(&["--send", "hi"])).is_err());
         assert!(parse_headless_args(&args(&["--to", "alice"])).is_err());
-        assert!(parse_headless_args(&args(&["--to", "alice", "--file", ""])).is_err());
+        assert!(parse_headless_args(&args(&["--to", "alice", "--send", ""])).is_err());
     }
 
     #[test]

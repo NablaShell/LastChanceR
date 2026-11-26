@@ -7,6 +7,7 @@ pub mod crypto;
 pub mod i18n;
 pub mod identity;
 pub mod network;
+pub mod p2p;
 pub mod storage;
 pub mod types;
 pub mod vault;

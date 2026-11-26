@@ -3,7 +3,6 @@ use anyhow::{anyhow, Result};
 use ed25519_dalek::SigningKey;
 use log::{info, warn};
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -11,19 +10,18 @@ use tokio::sync::mpsc;
 use crate::crypto;
 use crate::crypto::ratchet::{self, RatchetState, Role as RatchetRole};
 use crate::crypto::secret::{SecretBytes, SharedSecret};
-use crate::i18n::{tr, Lang};
+use crate::i18n::tr;
 use crate::identity::{
     hash_ed25519_public, Identity, IdentityDoc, IdentityInvite, IdentityManager,
 };
-use crate::network::{Config, InboundRouter, Listener, Route, RoutingError, Sender};
+use crate::network::{Config, InboundRouter, Route, RoutingError};
+use crate::p2p::{
+    bind_inbound_listener, outbox_backoff_secs, serve_inbound, P2pSender, TorControlConnection,
+};
 use crate::storage::{
     Contact, Message, SafeFSOps, Storage, TtlTombstone, TOFU_CHANGED, TOFU_PENDING, TOFU_VERIFIED,
 };
-use crate::storage::paths::create_private_file;
-use crate::types::{
-    normalize_file_id, parse_file_notification_checked, sanitize_display_text, truncate_display,
-    FileHash,
-};
+use crate::types::{truncate_display, OnionAddress};
 use crate::vault::{self, MasterKey, Vault};
 
 // ============================================================
@@ -54,30 +52,15 @@ pub enum AppEvent {
     ContactImportError {
         error: String,
     },
-    UploadStarted {
-        file_name: String,
+    /// Состояние подключения к Tor ControlPort и публикации `.onion`-сервиса.
+    TorStatusChanged {
+        connected: bool,
+        onion_addr: Option<String>,
+        error: Option<String>,
     },
-    UploadProgress {
-        status: String,
-        progress: i32,
-    },
-    UploadCompleted {
-        file_name: String,
-        file_hash: String,
-        /// Случайный `file_id` конверта (32 hex-символа): попадает в
-        /// E2E-уведомление и проверяется при скачивании.
-        file_id: String,
-        file_size: Option<i64>,
-    },
-    UploadError {
-        error: String,
-    },
-    DownloadStarted,
-    DownloadCompleted {
-        file_path: String,
-    },
-    DownloadError {
-        error: String,
+    /// Изменилось число сообщений, ожидающих отправки в Outbox.
+    OutboxUpdated {
+        pending: usize,
     },
 }
 
@@ -246,7 +229,7 @@ impl TtlTombstoneRegistry {
 type SharedSecretMap = HashMap<String, SharedSecret>;
 
 pub struct App {
-    config: RwLock<Config>,
+    config: Arc<RwLock<Config>>,
     base_dir: String,
 
     storage: Arc<Storage>,
@@ -274,8 +257,15 @@ pub struct App {
     /// alias без перебора контактов.
     inbound_router: Arc<Mutex<InboundRouter>>,
 
-    sender: Arc<Sender>,
-    listener: Arc<Listener>,
+    p2p_sender: Arc<P2pSender>,
+    own_onion: Arc<RwLock<Option<OnionAddress>>>,
+    tor_connected: Arc<RwLock<bool>>,
+    local_p2p_port: Arc<RwLock<Option<u16>>>,
+    outbox_notify: Arc<tokio::sync::Notify>,
+    tor_reload_notify: Arc<tokio::sync::Notify>,
+
+    #[cfg(test)]
+    test_peer_overrides: Arc<Mutex<HashMap<String, std::net::SocketAddr>>>,
 
     signing_key: SigningKey,
     ed25519_pub_key_hex: String,
@@ -308,179 +298,6 @@ fn truncate_utf8(value: &str, max: usize) -> String {
         end -= 1;
     }
     value[..end].to_string()
-}
-
-/// Пишет файл через временный файл в том же каталоге.
-///
-/// На Unix временный файл создаётся с правами 0600; при ошибке он удаляется,
-/// а итоговый путь появляется только после успешного `rename` (M-6-friendly).
-fn write_file_atomically(path: &Path, data: &[u8]) -> Result<()> {
-    use std::io::Write;
-
-    let parent = match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    };
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("download");
-    let temp_path = parent.join(format!(
-        ".{}.part-{}-{:016x}",
-        name,
-        std::process::id(),
-        rand::random::<u64>()
-    ));
-
-    let mut file = create_private_file(&temp_path, 0o600)
-        .map_err(|e| anyhow!("create temporary file {}: {}", temp_path.display(), e))?;
-
-    let write_result = (|| -> Result<()> {
-        file.write_all(data)
-            .map_err(|e| anyhow!("write temporary file {}: {}", temp_path.display(), e))?;
-        file.sync_all()
-            .map_err(|e| anyhow!("sync temporary file {}: {}", temp_path.display(), e))
-    })();
-    drop(file);
-
-    if let Err(e) = write_result {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(e);
-    }
-
-    if let Err(first_error) = std::fs::rename(&temp_path, path) {
-        // Windows не перезаписывает существующий файл через rename.
-        if path.exists() {
-            let _ = std::fs::remove_file(path);
-            if std::fs::rename(&temp_path, path).is_err() {
-                let _ = std::fs::remove_file(&temp_path);
-                return Err(anyhow!(
-                    "replace {}: {}",
-                    path.display(),
-                    first_error
-                ));
-            }
-        } else {
-            let _ = std::fs::remove_file(&temp_path);
-            return Err(anyhow!("rename to {}: {}", path.display(), first_error));
-        }
-    }
-
-    // Права 0600 уже выставлены на временном файле до записи данных и
-    // сохраняются при rename.
-
-    Ok(())
-}
-
-/// Разворачивает `~` и `~/...` в домашнюю директорию пользователя.
-fn expand_tilde(raw: &str) -> PathBuf {
-    if raw == "~" {
-        if let Some(home) = dirs::home_dir() {
-            return home;
-        }
-    } else if let Some(rest) = raw.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
-    }
-    PathBuf::from(raw)
-}
-
-/// Запрещённые для отправки системные директории.
-fn is_protected_system_path(path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        const BLOCKED: &[&str] = &["/etc", "/proc", "/sys", "/dev", "/boot", "/run"];
-        if BLOCKED.iter().any(|dir| path.starts_with(dir)) {
-            return true;
-        }
-    }
-
-    #[cfg(windows)]
-    {
-        let windows = std::env::var_os("SystemRoot")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("C:\\Windows"));
-        let windows = std::fs::canonicalize(&windows).unwrap_or(windows);
-        if path.starts_with(&windows) {
-            return true;
-        }
-    }
-
-    false
-}
-
-/// Разрешает путь отправки относительно PWD, а не каталога данных.
-///
-/// Поддерживает абсолютные пути и `~/`. Возвращает канонизированный путь,
-/// проверяет, что это обычный файл, и (без `force`) блокирует системные папки.
-fn resolve_upload_path(raw: &str, force: bool, lang: Lang) -> Result<PathBuf> {
-    let texts = lang.texts();
-    let expanded = expand_tilde(raw);
-    let path = if expanded.is_absolute() {
-        expanded
-    } else {
-        std::env::current_dir()
-            .map_err(|e| anyhow!("{}", tr(texts.cwd_failed, &[&e.to_string()])))?
-            .join(expanded)
-    };
-
-    let metadata = match std::fs::metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(anyhow!(
-                "{}",
-                tr(texts.file_not_found, &[&path.display().to_string()])
-            ));
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            return Err(anyhow!(
-                "{}",
-                tr(texts.permission_denied, &[&path.display().to_string()])
-            ));
-        }
-        Err(e) => {
-            return Err(anyhow!(
-                "{}",
-                tr(
-                    texts.stat_failed,
-                    &[&path.display().to_string(), &e.to_string()]
-                )
-            ));
-        }
-    };
-
-    if !metadata.is_file() {
-        return Err(anyhow!(
-            "{}",
-            tr(texts.not_regular_file, &[&path.display().to_string()])
-        ));
-    }
-
-    let canonical = std::fs::canonicalize(&path).map_err(|e| {
-        anyhow!(
-            "{}",
-            tr(
-                texts.resolve_path_failed,
-                &[&path.display().to_string(), &e.to_string()]
-            )
-        )
-    })?;
-
-    if !force && is_protected_system_path(&canonical) {
-        return Err(anyhow!(
-            "{}",
-            tr(
-                texts.system_path_forbidden,
-                &[&canonical.display().to_string(), raw]
-            )
-        ));
-    }
-
-    // Возвращаем исходный (но уже абсолютный) путь: имя файла и открытие
-    // должны соответствовать тому, что ввёл пользователь; canonical нужен
-    // только для проверки системных директорий.
-    Ok(path)
 }
 
 /// Роль стороны в Double Ratchet. Обе стороны сравнивают одинаковые hash,
@@ -1008,9 +825,27 @@ impl App {
         let signing_key = SigningKey::from_bytes(&signing_key_bytes);
         let ed25519_pub_key_hex = identity.get_ed25519_public_key_hex();
 
-        // Initialize network
-        let sender = Arc::new(Sender::new(&config)?);
-        let listener = Arc::new(Listener::new(&config)?);
+        // Initialize P2P sender and load persistent .onion address if stored.
+        let p2p_sender = Arc::new(P2pSender::new(&config));
+        let stored_onion = match storage.load_tor_service() {
+            Ok(Some(creds)) => match OnionAddress::from_service_id(&creds.service_id) {
+                Ok(addr) => Some(addr),
+                Err(e) => {
+                    warn!("Ignoring invalid stored Tor ServiceID: {}", e);
+                    None
+                }
+            },
+            Ok(None) => None,
+            Err(e) => {
+                warn!("Failed to load Tor hidden service credentials: {:#}", e);
+                None
+            }
+        };
+        let own_onion = Arc::new(RwLock::new(stored_onion));
+        let tor_connected = Arc::new(RwLock::new(false));
+        let local_p2p_port = Arc::new(RwLock::new(None));
+        let outbox_notify = Arc::new(tokio::sync::Notify::new());
+        let tor_reload_notify = Arc::new(tokio::sync::Notify::new());
 
         // Load shared secrets
         let shared_secrets = Arc::new(Mutex::new(HashMap::new()));
@@ -1168,7 +1003,7 @@ impl App {
         );
 
         Ok(Self {
-            config: RwLock::new(config),
+            config: Arc::new(RwLock::new(config)),
             base_dir,
             storage,
             identity_manager,
@@ -1178,8 +1013,14 @@ impl App {
             retired_ratchet_sessions,
             ttl_tombstones,
             inbound_router,
-            sender,
-            listener,
+            p2p_sender,
+            own_onion,
+            tor_connected,
+            local_p2p_port,
+            outbox_notify,
+            tor_reload_notify,
+            #[cfg(test)]
+            test_peer_overrides: Arc::new(Mutex::new(HashMap::new())),
             signing_key,
             ed25519_pub_key_hex,
             current_room_hash,
@@ -1195,15 +1036,17 @@ impl App {
     }
 
     pub async fn start(&self) -> Result<()> {
-        info!("App started");
+        info!("App started (P2P Tor mode)");
 
-        // Start message listener
-        let listener = self.listener.clone();
+        // 1. Локальный TCP-слушатель для входящих кадров от Tor hidden service.
+        let cfg = self.get_config();
+        let (listener, local_port) = bind_inbound_listener(cfg.effective_p2p_local_port()).await?;
+        if let Ok(mut guard) = self.local_p2p_port.write() {
+            *guard = Some(local_port);
+        }
+        info!("P2P inbound listener bound on 127.0.0.1:{}", local_port);
+
         let identity_hash = self.identity.hash.clone();
-        // X-Identity-Key должен содержать hex(ed25519 public key), а не hash:
-        // сервер сам считает SHA256(decoded_key) и сравнивает с target_hash.
-        let ed25519_pub_key_hex = self.ed25519_pub_key_hex.clone();
-        let signing_key = self.signing_key.clone();
         let shared_secrets = self.shared_secrets.clone();
         let storage = self.storage.clone();
         let room_ttls = self.room_ttls.clone();
@@ -1213,66 +1056,77 @@ impl App {
         let inbound_router = self.inbound_router.clone();
         let event_sender = self.event_sender.clone();
 
-        tokio::spawn(async move {
-            // Пауза только перед повтором после ошибки: 1s -> 2s -> 5s -> 15s.
-            const BACKOFF: [Duration; 4] = [
-                Duration::from_secs(1),
-                Duration::from_secs(2),
-                Duration::from_secs(5),
-                Duration::from_secs(15),
-            ];
-            // Не-ретраибельные ошибки (401, протокол) не должны вызывать
-            // busy-loop, поэтому повторяем их с максимальной паузой.
-            const NON_RETRYABLE_DELAY: Duration = Duration::from_secs(15);
+        tokio::spawn(serve_inbound(listener, move |packet| {
+            let shared_secrets = shared_secrets.clone();
+            let storage = storage.clone();
+            let room_ttls = room_ttls.clone();
+            let ratchets = ratchets.clone();
+            let retired_ratchet_sessions = retired_ratchet_sessions.clone();
+            let ttl_tombstones = ttl_tombstones.clone();
+            let inbound_router = inbound_router.clone();
+            let identity_hash = identity_hash.clone();
+            let event_sender = event_sender.clone();
 
-            let mut backoff_index = 0usize;
+            async move {
+                Self::handle_incoming_packet(
+                    packet,
+                    &shared_secrets,
+                    &storage,
+                    &room_ttls,
+                    &ratchets,
+                    &retired_ratchet_sessions,
+                    &ttl_tombstones,
+                    &inbound_router,
+                    &identity_hash,
+                    &event_sender,
+                )
+                .await;
+            }
+        }));
+
+        // 2. Управление Tor ControlPort (`ADD_ONION`) и поддержка живучести скрытого сервиса.
+        let tor_storage = self.storage.clone();
+        let own_onion = self.own_onion.clone();
+        let tor_connected = self.tor_connected.clone();
+        let tor_reload = self.tor_reload_notify.clone();
+        let tor_outbox_notify = self.outbox_notify.clone();
+        let tor_events = self.event_sender.clone();
+        tokio::spawn(run_tor_control_loop(
+            self.config.clone(),
+            local_port,
+            tor_storage,
+            own_onion,
+            tor_connected,
+            tor_reload,
+            tor_outbox_notify,
+            tor_events,
+        ));
+
+        // 3. Фоновый воркер зашифрованной очереди Outbox.
+        let outbox_storage = self.storage.clone();
+        let outbox_sender = self.p2p_sender.clone();
+        let outbox_notify = self.outbox_notify.clone();
+        let outbox_events = self.event_sender.clone();
+        #[cfg(test)]
+        let test_overrides = self.test_peer_overrides.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
-                match listener
-                    .pull_messages_with_auth(
-                        &identity_hash,
-                        &ed25519_pub_key_hex,
-                        &signing_key,
-                    )
-                    .await
-                {
-                    Ok(messages) => {
-                        backoff_index = 0;
-
-                        for packet in messages {
-                            Self::handle_incoming_packet(
-                                packet,
-                                &shared_secrets,
-                                &storage,
-                                &room_ttls,
-                                &ratchets,
-                                &retired_ratchet_sessions,
-                                &ttl_tombstones,
-                                &inbound_router,
-                                &identity_hash,
-                                &event_sender,
-                            )
-                            .await;
-                        }
-
-                        // 200 OK и 204 No Content не требуют паузы: следующий
-                        // long-poll запрос уходит сразу же.
-                    }
-                    Err(e) => {
-                        warn!("Pull error: {}", e);
-
-                        let delay = if e.is_retryable() {
-                            let delay = BACKOFF[backoff_index.min(BACKOFF.len() - 1)];
-                            backoff_index = (backoff_index + 1).min(BACKOFF.len() - 1);
-                            delay
-                        } else {
-                            NON_RETRYABLE_DELAY
-                        };
-
-                        info!("Pull retry in {:?}", delay);
-                        tokio::time::sleep(delay).await;
-                    }
+                tokio::select! {
+                    _ = outbox_notify.notified() => {}
+                    _ = interval.tick() => {}
                 }
+
+                let _ = flush_outbox_once(
+                    &outbox_storage,
+                    &outbox_sender,
+                    &outbox_events,
+                    #[cfg(test)]
+                    &test_overrides,
+                )
+                .await;
             }
         });
 
@@ -1612,17 +1466,6 @@ impl App {
                 return;
             }
             Ok(crypto::E2ePayload::Text { text, ttl_seconds }) => {
-                // Файловое уведомление приходит внутри расшифрованного
-                // текста, но hash всё равно недоверенный. Проверяем до
-                // сохранения ratchet/message, чтобы отбросить пакет целиком.
-                if let Err(e) = parse_file_notification_checked(&text) {
-                    warn!(
-                        "Rejected file notification from {}: invalid file hash: {}",
-                        truncate_display(&from_hash, 16),
-                        e
-                    );
-                    return;
-                }
                 if let Some(bytes) = ratchet_update.take() {
                     if let Err(e) = persist_ratchet(
                         room_has_ttl(room_ttls, &from_hash),
@@ -1697,7 +1540,57 @@ impl App {
             "hash": self.identity.hash,
             "publicKey": self.identity.get_public_key_hex(),
             "ed25519PublicKey": self.ed25519_pub_key_hex,
+            "onion": self.own_onion_addr(),
+            "torConnected": self.is_tor_connected(),
+            "outboxPending": self.outbox_pending_count(),
         })
+    }
+
+    /// Текущий локальный `.onion` v3-адрес (загруженный из `vault.dat` или выданный Tor).
+    pub fn own_onion_addr(&self) -> Option<String> {
+        let guard = match self.own_onion.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.as_ref().map(|addr| addr.as_str().to_string())
+    }
+
+    /// Признак активного подключения к Tor ControlPort и опубликованного сервиса.
+    pub fn is_tor_connected(&self) -> bool {
+        match self.tor_connected.read() {
+            Ok(guard) => *guard,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
+
+    /// Число зашифрованных пакетов, ожидающих доставки в очереди Outbox.
+    pub fn outbox_pending_count(&self) -> usize {
+        self.storage.count_outbox().unwrap_or(0)
+    }
+
+    fn local_p2p_port_value(&self) -> Option<u16> {
+        match self.local_p2p_port.read() {
+            Ok(guard) => *guard,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
+
+    #[cfg(test)]
+    fn set_own_onion_for_test(&self, addr: OnionAddress) {
+        let mut guard = match self.own_onion.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard = Some(addr);
+    }
+
+    #[cfg(test)]
+    fn set_peer_override_for_test(&self, room_hash: &str, addr: std::net::SocketAddr) {
+        let mut guard = self
+            .test_peer_overrides
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.insert(room_hash.to_string(), addr);
     }
 
     /// Seed-фраза вынесена из `/profile` в модальное окно `/recovery`,
@@ -1759,10 +1652,14 @@ impl App {
     fn current_identity_doc(&self) -> Result<IdentityDoc> {
         let nickname = self.current_nickname();
         let nickname = truncate_utf8(&nickname, crate::identity::MAX_NICKNAME_BYTES);
+        let onion = self.own_onion_addr().ok_or_else(|| {
+            anyhow!("own Tor .onion address is not ready yet; wait for Tor ControlPort (ADD_ONION)")
+        })?;
 
         IdentityDoc::from_slices(
             &self.identity.ed25519_public_key,
             &self.identity.public_key,
+            &onion,
             Some(nickname),
             self.identity.created_at.max(0) as u64,
         )
@@ -1783,6 +1680,7 @@ impl App {
             "hash": invite.hash_hex(),
             "x25519": hex::encode(invite.doc.x25519_pub),
             "ed25519": hex::encode(invite.doc.ed25519_pub),
+            "onion": invite.onion_addr(),
             "nickname": invite.display_nickname(),
             "fingerprint": invite.fingerprint_hex(),
             "identityDoc": doc_hex,
@@ -1840,10 +1738,11 @@ impl App {
             crypto::generate_shared_key(self.identity.private_key.expose(), &pub_key)?;
 
         let nickname = invite.display_nickname();
-        self.storage.upsert_verified_contact(
+        self.storage.upsert_p2p_contact(
             &hash,
             &pub_key,
             &ed25519,
+            invite.onion_addr(),
             &fingerprint,
             &tofu_state,
             &nickname,
@@ -1928,6 +1827,10 @@ impl App {
         if current.as_str() == contact_hash {
             current.clear();
         }
+
+        self.emit_event(AppEvent::OutboxUpdated {
+            pending: self.outbox_pending_count(),
+        });
 
         Ok(())
     }
@@ -2022,21 +1925,123 @@ impl App {
         Ok(())
     }
 
+    fn resolve_recipient_onion(&self, room_hash: &str) -> Result<String> {
+        if room_hash == self.identity.hash {
+            if let Some(onion) = self.own_onion_addr() {
+                return Ok(onion);
+            }
+        } else {
+            let contact = self.storage.get_contact(room_hash)?;
+            if let Some(raw) = contact.onion_addr.as_deref() {
+                let normalized = OnionAddress::parse(raw)?;
+                return Ok(normalized.as_str().to_string());
+            }
+        }
+
+        #[cfg(test)]
+        {
+            let overrides = self
+                .test_peer_overrides
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if overrides.contains_key(room_hash) {
+                return Ok(OnionAddress::test_v3_from_seed(1).to_string());
+            }
+        }
+
+        Err(anyhow!(
+            "contact {} has no P2P .onion address",
+            truncate_display(room_hash, 16)
+        ))
+    }
+
+    async fn send_packet_to_peer(&self, room_hash: &str, packet: &[u8]) -> Result<()> {
+        #[cfg(test)]
+        {
+            let override_addr = {
+                let overrides = self
+                    .test_peer_overrides
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                overrides.get(room_hash).copied()
+            };
+            if let Some(addr) = override_addr {
+                return self.p2p_sender.send_packet_direct(addr, packet).await;
+            }
+        }
+
+        if room_hash == self.identity.hash {
+            if let Some(port) = self.local_p2p_port_value() {
+                let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+                return self.p2p_sender.send_packet_direct(addr, packet).await;
+            }
+        }
+
+        let onion_str = self.resolve_recipient_onion(room_hash)?;
+        let onion = OnionAddress::parse(&onion_str)?;
+        self.p2p_sender.send_packet(&onion, packet).await
+    }
+
+    /// Проверяет наличие P2P-назначения для комнаты до сдвига храповика.
+    fn ensure_p2p_target_available(&self, room_hash: &str) -> Result<()> {
+        if room_hash == self.identity.hash && self.local_p2p_port_value().is_some() {
+            return Ok(());
+        }
+        let _ = self.resolve_recipient_onion(room_hash)?;
+        Ok(())
+    }
+
     pub async fn send_message(&self, room_hash: &str, text: &str) -> Result<()> {
         let ttl = self.get_room_ttl(room_hash);
+        let ttl_active = ttl.is_some();
 
         // Односторонний `/ttl` остаётся локальным: TTL не передаётся
         // собеседнику. Двусторонний `/ttl-syn` едет в метаданных текста.
         let wire_ttl = ttl.filter(|value| value.synced).and_then(|value| value.seconds);
         let payload = crypto::encode_text_payload(text, wire_ttl);
 
+        // H-3: для RAM-TTL комнат (и прямого self-chat при отсутствии `.onion`)
+        // отправляем напрямую без записи зашифрованного конверта в `vault.dat`.
+        if ttl_active || (room_hash == self.identity.hash && self.local_p2p_port_value().is_some())
+        {
+            self.ensure_p2p_target_available(room_hash)?;
+            let packet = self.encrypt_with_ratchet(room_hash, &payload)?;
+            self.send_packet_to_peer(room_hash, &packet).await?;
+            return self.store_outgoing_message(room_hash, text);
+        }
+
+        let recipient_onion = self.resolve_recipient_onion(room_hash)?;
         let packet = self.encrypt_with_ratchet(room_hash, &payload)?;
+        let now_unix = i64::try_from(now_timestamp()).unwrap_or(i64::MAX);
+        self.storage
+            .enqueue_outbox(room_hash, &recipient_onion, &packet, now_unix)?;
+        self.store_outgoing_message(room_hash, text)?;
+        self.emit_event(AppEvent::OutboxUpdated {
+            pending: self.outbox_pending_count(),
+        });
+        self.outbox_notify.notify_one();
 
-        self.sender
-            .send_message(room_hash, &packet, &self.signing_key)
-            .await?;
+        Ok(())
+    }
 
+    /// Немедленная синхронная отправка сообщения (для одноразового headless-режима `--send`).
+    pub async fn send_message_direct(&self, room_hash: &str, text: &str) -> Result<()> {
+        self.ensure_p2p_target_available(room_hash)?;
+        let payload = crypto::encode_text_payload(text, None);
+        let packet = self.encrypt_with_ratchet(room_hash, &payload)?;
+        self.send_packet_to_peer(room_hash, &packet).await?;
         self.store_outgoing_message(room_hash, text)
+    }
+
+    #[cfg(test)]
+    async fn flush_outbox_for_test(&self) -> Result<usize> {
+        flush_outbox_once(
+            &self.storage,
+            &self.p2p_sender,
+            &self.event_sender,
+            &self.test_peer_overrides,
+        )
+        .await
     }
 
     /// Шифрует полезную нагрузку текущей эпохой Double Ratchet.
@@ -2105,11 +2110,10 @@ impl App {
 
     /// Принудительно сбрасывает сессию храповика и уведомляет собеседника.
     pub async fn reset_ratchet_with_peer(&self, room_hash: &str) -> Result<()> {
+        self.ensure_p2p_target_available(room_hash)?;
         let payload = crypto::encode_ratchet_reset();
         let packet = self.encrypt_with_ratchet(room_hash, &payload)?;
-        self.sender
-            .send_message(room_hash, &packet, &self.signing_key)
-            .await?;
+        self.send_packet_to_peer(room_hash, &packet).await?;
         self.clear_ratchet(room_hash)
     }
 
@@ -2182,6 +2186,19 @@ impl App {
                 false,
                 room_hash,
             )?;
+        }
+        if self
+            .storage
+            .has_pending_outbox_for_room(room_hash)
+            .unwrap_or(false)
+        {
+            if let Ok(removed) = self.storage.clear_room_outbox(room_hash) {
+                if removed > 0 {
+                    self.emit_event(AppEvent::OutboxUpdated {
+                        pending: self.outbox_pending_count(),
+                    });
+                }
+            }
         }
         self.storage.delete_ratchet_state(room_hash)
     }
@@ -2346,10 +2363,7 @@ impl App {
             }
 
             let packet = self.encrypt_with_ratchet(room_hash, &payload)?;
-            if let Err(e) = self
-                .sender
-                .send_message(room_hash, &packet, &self.signing_key)
-                .await
+            if let Err(e) = self.send_packet_to_peer(room_hash, &packet).await
             {
                 // TTL намеренно не откатываем: сессия уже переключена в RAM,
                 // а на диске ratchet-состояния быть не должно (H-3).
@@ -2392,10 +2406,7 @@ impl App {
                 previous
             };
 
-            if let Err(e) = self
-                .sender
-                .send_message(room_hash, &packet, &self.signing_key)
-                .await
+            if let Err(e) = self.send_packet_to_peer(room_hash, &packet).await
             {
                 if let Some(value) = previous {
                     self.room_ttls
@@ -2433,10 +2444,7 @@ impl App {
         let payload = crypto::encode_set_ttl(ttl.seconds);
         let packet = self.encrypt_with_ratchet(room_hash, &payload)?;
 
-        if let Err(e) = self
-            .sender
-            .send_message(room_hash, &packet, &self.signing_key)
-            .await
+        if let Err(e) = self.send_packet_to_peer(room_hash, &packet).await
         {
             return Ok(TtlSyncOutcome::LocalOnly {
                 error: format!("{:#}", e),
@@ -2485,274 +2493,6 @@ impl App {
     /// (удобно для детерминированных тестов).
     pub fn purge_expired_messages_at(&self, now: u64) -> Result<usize> {
         Ok(self.storage.purge_expired_messages(now)?.len())
-    }
-
-    pub async fn send_file_native(
-        &self,
-        room_hash: &str,
-        file_path: &str,
-        force: bool,
-    ) -> Result<()> {
-        use std::io::Read;
-
-        let lang = self.get_config().lang;
-        let texts = lang.texts();
-
-        // Путь читается из PWD (или абсолютный/~/), а не из каталога данных.
-        let path = resolve_upload_path(file_path, force, lang)?;
-        let file_name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| anyhow!("{}", texts.invalid_file_path))?;
-        // Имя из файловой системы может содержать ESC/bidi-управление.
-        // Санитизируем его до шифрования, уведомления и записи в БД.
-        let file_name = sanitize_display_text(file_name);
-
-        // Emit upload started event
-        self.emit_event(AppEvent::UploadStarted {
-            file_name: file_name.clone(),
-        });
-
-        // Open file
-        let mut file = match std::fs::File::open(&path) {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                return Err(anyhow!(
-                    "{}",
-                    tr(texts.permission_denied, &[&path.display().to_string()])
-                ));
-            }
-            Err(e) => {
-                return Err(anyhow!(
-                    "{}",
-                    tr(
-                        texts.open_file_failed,
-                        &[&path.display().to_string(), &e.to_string()]
-                    )
-                ));
-            }
-        };
-        let mut file_data = Vec::new();
-        file.read_to_end(&mut file_data)
-            .map_err(|e| anyhow!("failed to read file: {}", e))?;
-
-        let file_size = file_data.len() as i64;
-
-        // Emit progress event
-        self.emit_event(AppEvent::UploadProgress {
-            status: texts.upload_encrypting.to_string(),
-            progress: 30,
-        });
-
-        // Encrypt file in the v3 envelope: name and real size are inside
-        // AEAD, and AAD binds file_id/room/sender/recipient. Секрет остаётся
-        // в кэше: замыкание получает ссылку, копия не создаётся.
-        let encrypted_data = self.with_shared_secret(room_hash, |shared_secret| {
-            crypto::encrypt_file_v3(
-                &file_data,
-                &file_name,
-                shared_secret.expose(),
-                room_hash,
-                &self.identity.hash,
-                room_hash,
-            )
-        })?;
-
-        // Идентификатор известен из открытого заголовка конверта; он
-        // уйдёт в E2E-уведомление, чтобы получатель мог отличить этот
-        // конверт от любого другого валидного файла той же комнаты.
-        let file_id = crypto::file_envelope_id(&encrypted_data)
-            .ok_or_else(|| anyhow!("encrypted file envelope has no file id"))?;
-        let file_id_hex = hex::encode(file_id);
-
-        // Emit progress event
-        self.emit_event(AppEvent::UploadProgress {
-            status: texts.upload_sending.to_string(),
-            progress: 60,
-        });
-
-        // Upload file
-        let file_hash = match self
-            .sender
-            .upload_file(&encrypted_data, &self.signing_key)
-            .await {
-            Ok(hash) => hash,
-            Err(e) => {
-                self.emit_event(AppEvent::UploadError {
-                    error: e.to_string(),
-                });
-                return Err(anyhow!("upload failed: {}", e));
-            }
-        };
-
-        // Save file record (TTL-комнаты не пишут метаданные на диск, H-3).
-        let is_ephemeral = self.get_room_ttl(room_hash).is_some();
-        self.storage.save_file_record(
-            &file_hash,
-            room_hash,
-            &file_name,
-            file_size,
-            is_ephemeral,
-        )?;
-
-        // Emit progress event
-        self.emit_event(AppEvent::UploadProgress {
-            status: texts.upload_finished.to_string(),
-            progress: 100,
-        });
-
-        // Emit upload completed event
-        self.emit_event(AppEvent::UploadCompleted {
-            file_name: file_name.clone(),
-            file_hash: file_hash.clone(),
-            file_id: file_id_hex.clone(),
-            file_size: Some(file_size),
-        });
-
-        // Send file notification message
-        let message_text = texts
-            .file_notification
-            .replacen("{}", &file_name, 1)
-            .replacen("{}", &humanize_bytes(file_size as u64), 1)
-            .replacen("{}", &file_hash, 1)
-            .replacen("{}", &file_id_hex, 1);
-
-        self.send_message(room_hash, &message_text).await?;
-
-        Ok(())
-    }
-
-    pub async fn download_and_save_file(
-        &self,
-        room_hash: &str,
-        file_hash: &str,
-        file_id: Option<&str>,
-        save_path: &str,
-    ) -> Result<()> {
-        // Хеш приходит из сообщения/UI и уходит в URL: валидируем до сети.
-        let bare_hash = file_hash.strip_prefix("sha256:").unwrap_or(file_hash);
-        let expected_hash = FileHash::from_hex(bare_hash).map_err(|e| {
-            anyhow!(
-                "invalid file hash ({}…): {}",
-                truncate_display(file_hash, 16),
-                e
-            )
-        })?;
-        let expected_file_id =
-            match file_id {
-                Some(id) => Some(normalize_file_id(id).map_err(|e| {
-                    anyhow!("invalid file id ({}…): {}", truncate_display(id, 16), e)
-                })?),
-                None => None,
-            };
-
-        // Emit download started event
-        self.emit_event(AppEvent::DownloadStarted);
-
-        // Download encrypted file
-        let encrypted_data = match self
-            .listener
-            .download_file(file_hash, &self.signing_key)
-            .await {
-            Ok(data) => data,
-            Err(e) => {
-                self.emit_event(AppEvent::DownloadError {
-                    error: e.to_string(),
-                });
-                return Err(anyhow!("download failed: {}", e));
-            }
-        };
-
-        // Транспортная целостность: сервер обязан вернуть ровно тот
-        // конверт, чей sha256 записан в E2E-уведомлении. Проверка стоит
-        // до AEAD/дешифровки и отсекает подмену «другого файла по тому же
-        // URL». Аутентичность привязки к уведомлению даёт file_id ниже.
-        let downloaded_hash = crate::network::auth::body_hash(&encrypted_data);
-        if downloaded_hash != expected_hash.to_string() {
-            let error = format!(
-                "file hash mismatch: expected {}, got {}",
-                expected_hash,
-                truncate_display(&downloaded_hash, 16)
-            );
-            self.emit_event(AppEvent::DownloadError {
-                error: error.clone(),
-            });
-            return Err(anyhow!(
-                "downloaded envelope failed integrity check: {}",
-                error
-            ));
-        }
-
-        // Shared secret берём именно у комнаты файла: /dl может найти файл
-        // среди полученных за сессию, не переключая активную комнату.
-        // Decrypt file. AAD canonicalises the identity pair, so the same
-        // call works for sent and received files in this room.
-        let file = match self.with_shared_secret(room_hash, |shared_secret| {
-            crypto::decrypt_file_v3(
-                &encrypted_data,
-                shared_secret.expose(),
-                room_hash,
-                &self.identity.hash,
-                room_hash,
-            )
-        }) {
-            Ok(file) => file,
-            Err(e) => {
-                self.emit_event(AppEvent::DownloadError {
-                    error: e.to_string(),
-                });
-                return Err(anyhow!("decryption failed: {}", e));
-            }
-        };
-
-        // `file_hash` покрывает байты конверта, но не доказывает, что это
-        // файл из уведомления, если хеш когда-либо придёт из другого
-        // источника. `file_id` из E2E-текста связан с AAD и различает два
-        // валидных конверта одной пары/комнаты.
-        if let Some(expected_id) = expected_file_id.as_deref() {
-            let actual_id = hex::encode(file.file_id);
-            if actual_id != expected_id {
-                let error = format!(
-                    "file id mismatch: expected {}, got {}",
-                    truncate_display(expected_id, 16),
-                    truncate_display(&actual_id, 16)
-                );
-                self.emit_event(AppEvent::DownloadError {
-                    error: error.clone(),
-                });
-                return Err(anyhow!(
-                    "downloaded file does not match file notification: {}",
-                    error
-                ));
-            }
-        }
-        let file_data = file.data;
-
-        // Save file. Путь выбирает пользователь (например, ./downloads/...),
-        // поэтому пишем напрямую: SafeFSOps ограничивает запись каталогом данных.
-        if let Some(parent) = std::path::Path::new(save_path).parent() {
-            if !parent.as_os_str().is_empty() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
-                    self.emit_event(AppEvent::DownloadError {
-                        error: e.to_string(),
-                    });
-                    return Err(anyhow!("create directory failed: {}", e));
-                }
-            }
-        }
-        if let Err(e) = write_file_atomically(std::path::Path::new(save_path), &file_data) {
-            self.emit_event(AppEvent::DownloadError {
-                error: e.to_string(),
-            });
-            return Err(anyhow!("save failed: {}", e));
-        }
-
-        // Emit download completed event
-        self.emit_event(AppEvent::DownloadCompleted {
-            file_path: save_path.to_string(),
-        });
-
-        Ok(())
     }
 
     /// Выполняет `f` с общим секретом комнаты.
@@ -2855,21 +2595,23 @@ impl App {
         }
     }
 
-    /// Сохраняет новые сетевые параметры и сразу применяет их в работающих
-    /// `Sender`/`Listener`, не требуя перезапуска клиента.
+    /// Сохраняет новые сетевые P2P-параметры и сразу применяет их в
+    /// `P2pSender` и фоновом цикле Tor ControlPort.
     pub fn update_config(&self, mut config: Config) -> Result<()> {
         config.normalize();
         config.validate()?;
         config.save(&self.base_dir, &self.vault)?;
 
-        self.sender.update_config(&config)?;
-        self.listener.update_config(&config)?;
+        self.p2p_sender.update_config(&config)?;
 
         let mut guard = self
             .config
             .write()
             .map_err(|_| anyhow!("{}", config.lang.texts().config_lock_failed))?;
         *guard = config;
+        drop(guard);
+
+        self.tor_reload_notify.notify_one();
 
         Ok(())
     }
@@ -2935,19 +2677,199 @@ fn show_system_notification(appname: &str, title: &str, body: &str) -> Result<()
 }
 
 // ============================================================
-// UTILITY FUNCTIONS
+// P2P BACKGROUND WORKERS
 // ============================================================
 
-fn humanize_bytes(bytes: u64) -> String {
-    if bytes < 1024 {
-        format!("{} B", bytes)
-    } else if bytes < 1024 * 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
-    } else if bytes < 1024 * 1024 * 1024 {
-        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
-    } else {
-        format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+fn set_tor_connected_flag(flag: &Arc<RwLock<bool>>, connected: bool) {
+    match flag.write() {
+        Ok(mut guard) => *guard = connected,
+        Err(poisoned) => *poisoned.into_inner() = connected,
     }
+}
+
+fn current_onion_string(own_onion: &Arc<RwLock<Option<OnionAddress>>>) -> Option<String> {
+    let guard = match own_onion.read() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.as_ref().map(|addr| addr.as_str().to_string())
+}
+
+/// Поддерживает подключение к Tor ControlPort, публикует постоянный `.onion`
+/// скрытый сервис через `ADD_ONION` и переподключается при сбое или смене конфига.
+#[allow(clippy::too_many_arguments)]
+async fn run_tor_control_loop(
+    config: Arc<RwLock<Config>>,
+    local_port: u16,
+    storage: Arc<Storage>,
+    own_onion: Arc<RwLock<Option<OnionAddress>>>,
+    tor_connected: Arc<RwLock<bool>>,
+    tor_reload: Arc<tokio::sync::Notify>,
+    outbox_notify: Arc<tokio::sync::Notify>,
+    event_sender: mpsc::UnboundedSender<AppEvent>,
+) {
+    loop {
+        let cfg = match config.read() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let control_addr = cfg.effective_tor_control_addr();
+        let cookie_path = cfg.effective_tor_cookie_path();
+        let onion_port = cfg.effective_p2p_onion_port();
+
+        let connect_result = async {
+            let mut conn = TorControlConnection::connect(&control_addr).await?;
+            let info = conn.protocol_info().await?;
+            conn.authenticate(&info, cookie_path.as_deref()).await?;
+
+            let stored = storage.load_tor_service()?;
+            let existing_key = stored.as_ref().map(|creds| &creds.private_key);
+            let service = conn
+                .add_onion(existing_key, onion_port, local_port)
+                .await?;
+
+            if let Some(ref private_key) = service.private_key {
+                if let Err(e) = storage.save_tor_service(&service.service_id, private_key.expose())
+                {
+                    warn!("Failed to persist Tor ED25519-V3 key to vault: {:#}", e);
+                }
+            }
+
+            Ok::<_, anyhow::Error>((conn, service.onion_address))
+        }
+        .await;
+
+        match connect_result {
+            Ok((mut conn, onion_address)) => {
+                let onion_str = onion_address.as_str().to_string();
+                match own_onion.write() {
+                    Ok(mut guard) => *guard = Some(onion_address),
+                    Err(poisoned) => *poisoned.into_inner() = Some(onion_address),
+                }
+                set_tor_connected_flag(&tor_connected, true);
+                let _ = event_sender.send(AppEvent::TorStatusChanged {
+                    connected: true,
+                    onion_addr: Some(onion_str.clone()),
+                    error: None,
+                });
+                info!(
+                    "Tor hidden service ready: {}:{} -> 127.0.0.1:{}",
+                    onion_str, onion_port, local_port
+                );
+                outbox_notify.notify_one();
+
+                let mut keepalive = tokio::time::interval(Duration::from_secs(20));
+                keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                keepalive.tick().await;
+
+                loop {
+                    tokio::select! {
+                        _ = tor_reload.notified() => {
+                            info!("Tor config reloaded, re-registering ControlPort session");
+                            break;
+                        }
+                        _ = keepalive.tick() => {
+                            if let Err(e) = conn.ping().await {
+                                warn!("Tor ControlPort keepalive failed: {:#}", e);
+                                set_tor_connected_flag(&tor_connected, false);
+                                let _ = event_sender.send(AppEvent::TorStatusChanged {
+                                    connected: false,
+                                    onion_addr: current_onion_string(&own_onion),
+                                    error: Some(format!("{:#}", e)),
+                                });
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                set_tor_connected_flag(&tor_connected, false);
+                warn!("Tor ControlPort unavailable ({}): {:#}", control_addr, e);
+                let _ = event_sender.send(AppEvent::TorStatusChanged {
+                    connected: false,
+                    onion_addr: current_onion_string(&own_onion),
+                    error: Some(format!("{:#}", e)),
+                });
+
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                    _ = tor_reload.notified() => {}
+                }
+            }
+        }
+    }
+}
+
+/// Одна попытка доставки созревших зашифрованных конвертов из очереди Outbox.
+async fn flush_outbox_once(
+    storage: &Arc<Storage>,
+    sender: &Arc<P2pSender>,
+    event_sender: &mpsc::UnboundedSender<AppEvent>,
+    #[cfg(test)] test_overrides: &Arc<Mutex<HashMap<String, std::net::SocketAddr>>>,
+) -> Result<usize> {
+    let now_unix = i64::try_from(now_timestamp()).unwrap_or(i64::MAX);
+    let due = storage.due_outbox_items(now_unix)?;
+    if due.is_empty() {
+        return Ok(0);
+    }
+
+    let mut delivered = 0usize;
+    let mut failed_rooms = HashSet::new();
+
+    for item in due {
+        if failed_rooms.contains(&item.room_hash) {
+            continue;
+        }
+
+        #[cfg(test)]
+        let override_addr = {
+            let guard = test_overrides
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.get(&item.room_hash).copied()
+        };
+
+        let send_res = {
+            #[cfg(test)]
+            if let Some(addr) = override_addr {
+                sender.send_packet_direct(addr, &item.packet).await
+            } else {
+                match OnionAddress::parse(&item.recipient_onion) {
+                    Ok(target) => sender.send_packet(&target, &item.packet).await,
+                    Err(e) => Err(anyhow!("invalid recipient onion address: {}", e)),
+                }
+            }
+            #[cfg(not(test))]
+            match OnionAddress::parse(&item.recipient_onion) {
+                Ok(target) => sender.send_packet(&target, &item.packet).await,
+                Err(e) => Err(anyhow!("invalid recipient onion address: {}", e)),
+            }
+        };
+
+        match send_res {
+            Ok(()) => {
+                storage.delete_outbox_item(item.id)?;
+                delivered += 1;
+            }
+            Err(e) => {
+                failed_rooms.insert(item.room_hash.clone());
+                let next_attempts = item.attempts.saturating_add(1);
+                let delay = outbox_backoff_secs(next_attempts);
+                let _ = storage.mark_outbox_retry(
+                    item.id,
+                    next_attempts,
+                    now_unix.saturating_add(delay),
+                    &format!("{:#}", e),
+                );
+            }
+        }
+    }
+
+    let pending = storage.count_outbox().unwrap_or(0);
+    let _ = event_sender.send(AppEvent::OutboxUpdated { pending });
+
+    Ok(delivered)
 }
 
 #[cfg(test)]
@@ -2973,9 +2895,8 @@ mod tests {
         (app, temp_dir, event_receiver)
     }
 
-    /// Минимальный HTTP-stub для проверки успешной/неуспешной отправки
-    /// без реальной сети.
-    async fn spawn_http_stub(status: &'static str) -> String {
+    /// Минимальный P2P-stub: принимает один фрейм и возвращает `FRAME_ACK`.
+    async fn spawn_p2p_ack_stub() -> std::net::SocketAddr {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -2984,90 +2905,54 @@ mod tests {
         let addr = listener.local_addr().unwrap();
 
         tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut buf = [0u8; 4096];
-            let mut data = Vec::new();
-            let header_end = loop {
-                let n = stream.read(&mut buf).await.unwrap();
-                if n == 0 {
-                    break data.len();
-                }
-                data.extend_from_slice(&buf[..n]);
-                if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
-                    break pos + 4;
-                }
-            };
-
-            let headers = String::from_utf8_lossy(&data[..header_end]).to_ascii_lowercase();
-            let content_length = headers
-                .lines()
-                .find_map(|line| line.strip_prefix("content-length:"))
-                .and_then(|value| value.trim().parse::<usize>().ok())
-                .unwrap_or(0);
-            let mut remaining = content_length.saturating_sub(data.len().saturating_sub(header_end));
-            while remaining > 0 {
-                let n = stream.read(&mut buf).await.unwrap();
-                if n == 0 {
-                    break;
-                }
-                remaining = remaining.saturating_sub(n);
-            }
-
-            let response =
-                format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-            let _ = stream.write_all(response.as_bytes()).await;
-            let _ = stream.shutdown().await;
-        });
-
-        format!("http://{addr}")
-    }
-
-    /// HTTP-stub файлового сервера: на любой GET отвечает заданным телом.
-    /// Нужен для проверки подмены конверта по `/download/<hash>`.
-    async fn spawn_file_stub(body: Vec<u8>) -> String {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     break;
                 };
-                let mut buf = [0u8; 4096];
-                let mut data = Vec::new();
-                loop {
-                    let n = match stream.read(&mut buf).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => n,
+                tokio::spawn(async move {
+                    let Ok(len) = stream.read_u32().await else {
+                        return;
                     };
-                    data.extend_from_slice(&buf[..n]);
-                    if data.windows(4).any(|w| w == b"\r\n\r\n") {
-                        break;
+                    let mut buf = vec![0u8; len as usize];
+                    if stream.read_exact(&mut buf).await.is_ok() {
+                        let _ = stream.write_all(&crate::p2p::FRAME_ACK).await;
+                        let _ = stream.shutdown().await;
                     }
-                }
-
-                let headers = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                let _ = stream.write_all(headers.as_bytes()).await;
-                let _ = stream.write_all(&body).await;
-                let _ = stream.shutdown().await;
+                });
             }
         });
 
-        format!("http://{addr}")
+        addr
+    }
+
+    /// P2P-stub, обрывающий соединение без `FRAME_ACK` для проверки отказов/очереди.
+    async fn spawn_p2p_reject_stub() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                drop(stream);
+            }
+        });
+
+        addr
     }
 
     fn test_invite_variant(seed: u8, x_seed: u8, nickname: &str) -> IdentityInvite {
         let signing_key = SigningKey::from_bytes(&[seed; 32]);
         let x_secret = X25519Secret::from([x_seed; 32]);
         let x_public = X25519PublicKey::from(&x_secret);
+        let onion = OnionAddress::test_v3_from_seed(seed);
         let doc = IdentityDoc::from_slices(
             signing_key.verifying_key().as_bytes(),
             x_public.as_bytes(),
+            onion.as_str(),
             Some(nickname.to_string()),
             u64::from(seed),
         )
@@ -3141,94 +3026,6 @@ mod tests {
     }
 
     #[test]
-    fn test_humanize_bytes() {
-        assert_eq!(humanize_bytes(0), "0 B");
-        assert_eq!(humanize_bytes(512), "512 B");
-        assert_eq!(humanize_bytes(1024), "1.0 KB");
-        assert_eq!(humanize_bytes(1024 * 1024), "1.0 MB");
-        assert_eq!(humanize_bytes(1024 * 1024 * 1024), "1.0 GB");
-    }
-
-    /// M-B: сервер отдаёт валидный конверт *другого* файла.
-    ///
-    /// 1. По URL с hash(A) приходит B — отказ по sha256 до дешифровки.
-    /// 2. Хеш совпадает с B, но file_id в E2E-уведомлении от A — отказ
-    ///    после дешифровки, потому что file_id входит в AAD конверта.
-    #[tokio::test]
-    async fn download_rejects_substituted_envelope_by_hash_and_file_id() {
-        let (app, temp_dir, _receiver) = setup_test_app();
-        let room = app.identity.hash.clone();
-        let secret = app.shared_secret_for_test(&room);
-
-        let envelope_a = crypto::encrypt_file_v3(
-            b"contents of A",
-            "a.txt",
-            secret.expose(),
-            &room,
-            &room,
-            &room,
-        )
-        .unwrap();
-        let envelope_b = crypto::encrypt_file_v3(
-            b"contents of B",
-            "b.txt",
-            secret.expose(),
-            &room,
-            &room,
-            &room,
-        )
-        .unwrap();
-        let hash_a = crate::network::auth::body_hash(&envelope_a);
-        let hash_b = crate::network::auth::body_hash(&envelope_b);
-        let id_a = hex::encode(crypto::file_envelope_id(&envelope_a).unwrap());
-        let id_b = hex::encode(crypto::file_envelope_id(&envelope_b).unwrap());
-        assert_ne!(hash_a, hash_b);
-        assert_ne!(id_a, id_b);
-
-        // Сервер отвечает байтами B на любой GET /download/<hash>.
-        let stub = spawn_file_stub(envelope_b).await;
-        app.update_config(Config {
-            file_server_url: stub,
-            ..Config::default()
-        })
-        .unwrap();
-
-        // 1. hash(A) в URL, но сервер вернул B: отказ до AEAD.
-        let out_a = temp_dir.path().join("substituted_a.bin");
-        let err = app
-            .download_and_save_file(&room, &hash_a, Some(&id_a), out_a.to_str().unwrap())
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("hash mismatch"),
-            "unexpected error: {:#}",
-            err
-        );
-        assert!(!out_a.exists());
-
-        // 2. Хеш B настоящий, но file_id принадлежит A: ловится только
-        //    после decrypt_file_v3, до записи на диск.
-        let out_b = temp_dir.path().join("substituted_b.bin");
-        let err = app
-            .download_and_save_file(&room, &hash_b, Some(&id_a), out_b.to_str().unwrap())
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("file id mismatch"),
-            "unexpected error: {:#}",
-            err
-        );
-        assert!(!out_b.exists());
-
-        // 3. Контроль: совпадающие hash и file_id принимаются.
-        let out_ok = temp_dir.path().join("accepted.bin");
-        app.download_and_save_file(&room, &hash_b, Some(&id_b), out_ok.to_str().unwrap())
-            .await
-            .unwrap();
-        assert_eq!(std::fs::read(&out_ok).unwrap(), b"contents of B");
-    }
-
-    #[test]
     fn test_get_profile() {
         let (app, _temp_dir, _receiver) = setup_test_app();
 
@@ -3237,6 +3034,8 @@ mod tests {
         assert!(profile["hash"].is_string());
         assert!(profile["publicKey"].is_string());
         assert!(profile["ed25519PublicKey"].is_string());
+        assert_eq!(profile["torConnected"], serde_json::json!(false));
+        assert_eq!(profile["outboxPending"], serde_json::json!(0));
         // seed-фраза больше не выводится в /profile
         assert!(profile.get("seedPhrase").is_none());
         assert!(!app.get_seed_phrase().is_empty());
@@ -3247,11 +3046,11 @@ mod tests {
         let (app, temp_dir, _receiver) = setup_test_app();
 
         let mut config = app.get_config();
-        config.server_url = "https://new-text.example".to_string();
-        config.file_server_url = "https://new-files.example".to_string();
-        config.mask_header_name = "X-Custom-Guard".to_string();
-        config.mask_header_value = "new-secret".to_string();
-        config.proxy_url = Some("socks5://127.0.0.1:9050".to_string());
+        config.tor_control_addr = "127.0.0.1:9151".to_string();
+        config.tor_socks_addr = "127.0.0.1:9150".to_string();
+        config.tor_cookie_path = Some("/var/lib/tor/secret_control_cookie".to_string());
+        config.p2p_local_port = 19878;
+        config.p2p_onion_port = 9999;
         config.notify_level = 1;
         config.stealth_title = "Перерыв".to_string();
         config.stealth_body = "Отдых {sec}, писем: {count}".to_string();
@@ -3260,14 +3059,14 @@ mod tests {
         app.update_config(config.clone()).unwrap();
 
         let applied = app.get_config();
-        assert_eq!(applied.server_url, config.server_url);
-        assert_eq!(applied.file_server_url, config.file_server_url);
-        assert_eq!(applied.mask_header_name, config.mask_header_name);
-        assert_eq!(applied.mask_header_value, config.mask_header_value);
+        assert_eq!(applied.tor_control_addr, "127.0.0.1:9151");
+        assert_eq!(applied.tor_socks_addr, "127.0.0.1:9150");
         assert_eq!(
-            applied.proxy_url.as_deref(),
-            Some("socks5h://127.0.0.1:9050")
+            applied.tor_cookie_path.as_deref(),
+            Some("/var/lib/tor/secret_control_cookie")
         );
+        assert_eq!(applied.p2p_local_port, 19878);
+        assert_eq!(applied.p2p_onion_port, 9999);
         assert_eq!(applied.notify_level, 1);
         assert_eq!(applied.stealth_title, "Перерыв");
         assert_eq!(applied.stealth_body, "Отдых {sec}, писем: {count}");
@@ -3276,16 +3075,19 @@ mod tests {
         let config_path = temp_dir.path().join("global.conf");
         let raw = std::fs::read(&config_path).unwrap();
         assert!(vault::is_sealed(&raw));
-        assert!(!String::from_utf8_lossy(&raw).contains("new-secret"));
+        assert!(!String::from_utf8_lossy(&raw).contains("secret_control_cookie"));
 
         let base_dir = temp_dir.path().to_str().unwrap();
         let reopened_vault = Vault::unlock(base_dir, "test-password").unwrap();
         let saved = Config::load(base_dir, &reopened_vault).unwrap();
-        assert_eq!(saved.mask_header_value, "new-secret");
+        assert_eq!(saved.tor_control_addr, "127.0.0.1:9151");
+        assert_eq!(saved.tor_socks_addr, "127.0.0.1:9150");
         assert_eq!(
-            saved.proxy_url.as_deref(),
-            Some("socks5h://127.0.0.1:9050")
+            saved.tor_cookie_path.as_deref(),
+            Some("/var/lib/tor/secret_control_cookie")
         );
+        assert_eq!(saved.p2p_local_port, 19878);
+        assert_eq!(saved.p2p_onion_port, 9999);
         assert_eq!(saved.notify_level, 1);
         assert_eq!(saved.stealth_title, "Перерыв");
         assert_eq!(saved.stealth_body, "Отдых {sec}, писем: {count}");
@@ -3296,6 +3098,12 @@ mod tests {
     fn test_contact_link() {
         let (app, _temp_dir, _receiver) = setup_test_app();
 
+        // Пока .onion не получен от Tor и не сохранён в vault, генерация ссылки fail-closed.
+        assert!(app.get_my_contact_link().is_err());
+
+        let own_onion = OnionAddress::test_v3_from_seed(77);
+        app.set_own_onion_for_test(own_onion.clone());
+
         let link = app.get_my_contact_link().unwrap();
         assert!(link.starts_with("lastchance://contact?"));
         assert!(link.contains("hash="));
@@ -3303,11 +3111,13 @@ mod tests {
         assert!(link.contains("sig="));
         assert!(link.contains("x25519="));
         assert!(link.contains("ed25519="));
+        assert!(link.contains("onion="));
         assert!(link.contains("nickname="));
 
         let parsed = IdentityInvite::from_link(&link).unwrap();
         assert_eq!(parsed.hash_hex(), app.identity.hash);
         assert_eq!(parsed.doc.x25519_pub.to_vec(), app.identity.public_key);
+        assert_eq!(parsed.onion_addr(), own_onion.as_str());
     }
 
     #[test]
@@ -3476,16 +3286,13 @@ mod tests {
     async fn synced_ttl_send_failure_keeps_ttl_and_no_ratchet_on_disk() {
         // H-3: неудачная отправка не должна оставлять ratchet в vault.dat
         // и не должна молча откатывать уже включённый TTL.
-        let server = spawn_http_stub("400 Bad Request").await;
-        let config = Config {
-            server_url: server,
-            ..Config::default()
-        };
-        let (app, _temp_dir, _receiver) = setup_test_app_with_config(config);
+        let reject_addr = spawn_p2p_reject_stub().await;
+        let (app, _temp_dir, _receiver) = setup_test_app();
 
         let invite = test_invite(5, "SyncPeer");
         let hash = invite.hash_hex();
         app.add_contact_with_ed25519(&invite).unwrap();
+        app.set_peer_override_for_test(&hash, reject_addr);
 
         // Обычная комната: ratchet уже записан на диск.
         app.encrypt_with_ratchet(&hash, b"prime").unwrap();
@@ -3520,16 +3327,13 @@ mod tests {
     async fn synced_ttl_retry_confirms_pending_sync() {
         // L-8: после ошибки отправки TTL остаётся локальным и явно
         // помеченным, а повторная синхронизация подтверждает его.
-        let failing = spawn_http_stub("400 Bad Request").await;
-        let config = Config {
-            server_url: failing,
-            ..Config::default()
-        };
-        let (app, _temp_dir, _receiver) = setup_test_app_with_config(config);
+        let failing_addr = spawn_p2p_reject_stub().await;
+        let (app, _temp_dir, _receiver) = setup_test_app();
 
         let invite = test_invite(7, "RetryPeer");
         let hash = invite.hash_hex();
         app.add_contact_with_ed25519(&invite).unwrap();
+        app.set_peer_override_for_test(&hash, failing_addr);
 
         let outcome = app.set_synced_ttl(&hash, Some(45)).await.unwrap();
         match outcome {
@@ -3542,11 +3346,9 @@ mod tests {
         assert!(!ttl.synced);
         assert!(ttl.pending_sync);
 
-        // Повторный ретрай при всё ещё недоступном сервере сохраняет статус.
-        let still_failing = spawn_http_stub("500 Internal Server Error").await;
-        let mut config = app.get_config();
-        config.server_url = still_failing;
-        app.update_config(config).unwrap();
+        // Повторный ретрай при всё ещё недоступном пире сохраняет статус.
+        let still_failing_addr = spawn_p2p_reject_stub().await;
+        app.set_peer_override_for_test(&hash, still_failing_addr);
         assert!(matches!(
             app.resync_ttl(&hash).await.unwrap(),
             TtlSyncOutcome::LocalOnly { .. }
@@ -3554,10 +3356,8 @@ mod tests {
         assert!(app.get_room_ttl(&hash).unwrap().pending_sync);
 
         // Успешный ретрай снимает pending и подтверждает доставку.
-        let ok_server = spawn_http_stub("200 OK").await;
-        let mut config = app.get_config();
-        config.server_url = ok_server;
-        app.update_config(config).unwrap();
+        let ok_addr = spawn_p2p_ack_stub().await;
+        app.set_peer_override_for_test(&hash, ok_addr);
 
         assert_eq!(
             app.resync_ttl(&hash).await.unwrap(),
@@ -3571,16 +3371,13 @@ mod tests {
 
     #[tokio::test]
     async fn synced_ttl_removes_previously_persisted_ratchet() {
-        let server = spawn_http_stub("200 OK").await;
-        let config = Config {
-            server_url: server,
-            ..Config::default()
-        };
-        let (app, _temp_dir, _receiver) = setup_test_app_with_config(config);
+        let ok_addr = spawn_p2p_ack_stub().await;
+        let (app, _temp_dir, _receiver) = setup_test_app();
 
         let invite = test_invite(6, "SyncPeer");
         let hash = invite.hash_hex();
         app.add_contact_with_ed25519(&invite).unwrap();
+        app.set_peer_override_for_test(&hash, ok_addr);
 
         app.encrypt_with_ratchet(&hash, b"prime").unwrap();
         assert!(app
@@ -4133,42 +3930,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn invalid_file_hash_message_is_rejected_before_db_write() {
-        let (app, _temp_dir, mut receiver) = setup_test_app();
-        let hash = app.identity.hash.clone();
-
-        // Инициализируем ratchet-сессию, чтобы пакет прошёл расшифровку.
-        app.encrypt_with_ratchet(&hash, b"prime").unwrap();
-        let text = "📎 File: evil.bin\nHash: not-a-valid-hex-hash";
-        let packet = app
-            .encrypt_with_ratchet(&hash, &crypto::encode_text_payload(text, None))
-            .unwrap();
-
-        App::handle_incoming_packet(
-            packet,
-            &app.shared_secrets,
-            &app.storage,
-            &app.room_ttls,
-            &app.ratchets,
-            &app.retired_ratchet_sessions,
-            &app.ttl_tombstones,
-            &app.inbound_router,
-            &app.identity.hash,
-            &app.event_sender,
-        )
-        .await;
-
-        assert!(
-            app.get_messages(&hash, 10).unwrap().is_empty(),
-            "invalid file hash must not reach the message table"
-        );
-        assert!(
-            receiver.try_recv().is_err(),
-            "rejected packet must not be announced to the UI"
-        );
-    }
-
     // -----------------------------------------------------------------
     // M-8: адресация входящих по alias, без перебора контактов.
     // -----------------------------------------------------------------
@@ -4471,28 +4232,6 @@ mod tests {
         assert_eq!(stats.decrypt_attempts, 0);
     }
 
-    #[test]
-    fn atomic_file_write_leaves_no_partial_file() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("download.bin");
-        write_file_atomically(&path, b"payload").unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"payload");
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600);
-        }
-
-        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.file_name().to_string_lossy().contains(".part-"))
-            .collect();
-        assert!(leftovers.is_empty(), "temporary file must be renamed/removed");
-    }
-
     /// Отравитель мьютекса: паника в отдельном потоке оставляет lock
     /// poisoned, не роняя тестовый поток.
     fn poison_mutex<T: Send + 'static>(mutex: &Arc<Mutex<T>>) {
@@ -4732,29 +4471,114 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn atomic_file_write_failure_removes_temporary_file() {
-        use std::os::unix::fs::PermissionsExt;
+    #[tokio::test]
+    async fn p2p_offline_send_enqueues_outbox_with_backoff() {
+        let (app, _temp_dir, _receiver) = setup_test_app();
+        let invite = test_invite(31, "OfflinePeer");
+        let hash = invite.hash_hex();
+        app.add_contact_with_ed25519(&invite).unwrap();
 
-        let dir = tempdir().unwrap();
-        // rename(2) не заменит файлом существующий непустой каталог.
-        let target = dir.path().join("target");
-        std::fs::create_dir(&target).unwrap();
-        std::fs::write(target.join("keep"), b"keep").unwrap();
+        let reject_addr = spawn_p2p_reject_stub().await;
+        app.set_peer_override_for_test(&hash, reject_addr);
 
-        assert!(write_file_atomically(&target, b"payload").is_err());
+        app.send_message(&hash, "queued while offline").await.unwrap();
+        assert_eq!(app.outbox_pending_count(), 1);
+        assert_eq!(app.get_messages(&hash, 10).unwrap().len(), 1);
 
-        assert!(target.is_dir());
-        assert_eq!(std::fs::read(target.join("keep")).unwrap(), b"keep");
+        let delivered = app.flush_outbox_for_test().await.unwrap();
+        assert_eq!(delivered, 0);
+        assert_eq!(app.outbox_pending_count(), 1);
 
-        for entry in std::fs::read_dir(dir.path()).unwrap().flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            assert!(!name.contains(".part-"), "temporary file left: {}", name);
-            if entry.path().is_file() {
-                let mode = entry.metadata().unwrap().permissions().mode() & 0o777;
-                assert_eq!(mode, 0o600, "unexpected mode for {}", name);
+        let future_due = app
+            .get_storage()
+            .due_outbox_items(i64::MAX)
+            .unwrap();
+        assert_eq!(future_due.len(), 1);
+        assert_eq!(future_due[0].attempts, 1);
+        assert!(future_due[0].last_error.is_some());
+    }
+
+    #[tokio::test]
+    async fn p2p_loopback_end_to_end_delivery_and_ratchet() {
+        let (alice, _dir_a, _rx_a) = setup_test_app();
+        let (bob, _dir_b, mut rx_b) = setup_test_app();
+
+        alice.set_own_onion_for_test(OnionAddress::test_v3_from_seed(11));
+        bob.set_own_onion_for_test(OnionAddress::test_v3_from_seed(22));
+
+        let bob_invite = IdentityInvite::from_link(&bob.get_my_contact_link().unwrap()).unwrap();
+        let alice_invite =
+            IdentityInvite::from_link(&alice.get_my_contact_link().unwrap()).unwrap();
+
+        alice.add_contact_with_ed25519(&bob_invite).unwrap();
+        bob.add_contact_with_ed25519(&alice_invite).unwrap();
+
+        let (listener, bob_port) = bind_inbound_listener(0).await.unwrap();
+        let bob_addr = std::net::SocketAddr::from(([127, 0, 0, 1], bob_port));
+
+        let bob_shared = bob.shared_secrets.clone();
+        let bob_storage = bob.storage.clone();
+        let bob_ttls = bob.room_ttls.clone();
+        let bob_ratchets = bob.ratchets.clone();
+        let bob_retired = bob.retired_ratchet_sessions.clone();
+        let bob_tombstones = bob.ttl_tombstones.clone();
+        let bob_router = bob.inbound_router.clone();
+        let bob_hash = bob.identity.hash.clone();
+        let bob_events = bob.event_sender.clone();
+        let server_task = tokio::spawn(serve_inbound(listener, move |packet| {
+            let bob_shared = bob_shared.clone();
+            let bob_storage = bob_storage.clone();
+            let bob_ttls = bob_ttls.clone();
+            let bob_ratchets = bob_ratchets.clone();
+            let bob_retired = bob_retired.clone();
+            let bob_tombstones = bob_tombstones.clone();
+            let bob_router = bob_router.clone();
+            let bob_hash = bob_hash.clone();
+            let bob_events = bob_events.clone();
+            async move {
+                App::handle_incoming_packet(
+                    packet,
+                    &bob_shared,
+                    &bob_storage,
+                    &bob_ttls,
+                    &bob_ratchets,
+                    &bob_retired,
+                    &bob_tombstones,
+                    &bob_router,
+                    &bob_hash,
+                    &bob_events,
+                )
+                .await;
             }
+        }));
+
+        alice.set_peer_override_for_test(&bob.identity.hash, bob_addr);
+        alice
+            .send_message(&bob.identity.hash, "hello over pure p2p")
+            .await
+            .unwrap();
+        assert_eq!(alice.outbox_pending_count(), 1);
+
+        let delivered = alice.flush_outbox_for_test().await.unwrap();
+        assert_eq!(delivered, 1);
+        assert_eq!(alice.outbox_pending_count(), 0);
+
+        let evt = tokio::time::timeout(Duration::from_secs(2), rx_b.recv())
+            .await
+            .expect("timed out waiting for inbound packet")
+            .expect("event channel closed");
+        match evt {
+            AppEvent::NewMessage { text, room_hash, .. } => {
+                assert_eq!(room_hash, alice.identity.hash);
+                assert_eq!(text, "hello over pure p2p");
+            }
+            other => panic!("unexpected event: {other:?}"),
         }
+
+        let bob_msgs = bob.get_messages(&alice.identity.hash, 10).unwrap();
+        assert_eq!(bob_msgs.len(), 1);
+        assert_eq!(bob_msgs[0].text, "hello over pure p2p");
+
+        server_task.abort();
     }
 }

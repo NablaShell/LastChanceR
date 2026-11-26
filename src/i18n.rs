@@ -164,14 +164,6 @@ texts! {
     create_folder_failed: "failed to create folder {}: {}", "не удалось создать папку {}: {}";
     write_file_failed: "failed to write {}: {}", "не удалось записать {}: {}";
     cwd_failed: "failed to determine the current directory: {}", "не удалось определить текущую директорию: {}";
-    file_not_found: "file not found: {}", "файл не найден: {}";
-    permission_denied: "permission denied: {}", "нет прав на чтение: {}";
-    stat_failed: "failed to get info about {}: {}", "не удалось получить информацию о {}: {}";
-    not_regular_file: "not a regular file (maybe a directory): {}", "это не обычный файл (возможно, директория): {}";
-    resolve_path_failed: "failed to resolve path {}: {}", "не удалось разрешить путь {}: {}";
-    system_path_forbidden: "sending from a system directory is forbidden: {} (use /sf --force {})", "отправка из системной директории запрещена: {} (используйте /sf --force {})";
-    open_file_failed: "failed to open {}: {}", "не удалось открыть {}: {}";
-    invalid_file_path: "invalid file path", "некорректный путь к файлу";
     password_min_app: "new password must be at least {} characters", "новый пароль должен быть не короче {} символов";
     config_lock_failed: "configuration unavailable: lock is poisoned", "конфигурация недоступна: блокировка повреждена";
 
@@ -182,8 +174,6 @@ texts! {
     status_no_chats: "no chats", "чатов нет";
     status_chat: "chat: {}", "чат: {}";
     history_load_failed: "Failed to load history: {}", "Не удалось загрузить историю: {}";
-    file_sent_out: "[{}] 📎 you sent file [#{}] {} (type /dl or /dl {})", "[{}] 📎 вы отправили файл [#{}] {} (введите /dl или /dl {})";
-    file_sent_in: "[{}] 📎 {} sent file [#{}] {} (type /dl or /dl {})", "[{}] 📎 {} отправил файл [#{}] {} (введите /dl или /dl {})";
     no_active_room: "No active room. Add a contact via /join <link> or /room <hash>.", "Нет активной комнаты. Добавьте контакт через /join <link> или /room <hash>.";
     no_active_room_short: "No active room. /join <link>", "Нет активной комнаты. /join <link>";
     send_error: "Send error: {}", "Ошибка отправки: {}";
@@ -226,19 +216,6 @@ texts! {
     comp_no_commands: "no commands for «{}»", "нет команд по запросу «{}»";
     comp_matching_commands: "Matching commands:\n{}", "Подходящие команды:\n{}";
     comp_variants: "{} options — see chat", "{} вариантов — см. чат";
-    dl_status_many: "file {}/{}: {} (Tab — next)", "файл {}/{}: {} (Tab — далее)";
-    dl_status_one: "file: {}", "файл: {}";
-    dl_no_files_room: "no files in this room", "в этой комнате нет файлов";
-    dl_no_match: "no files for «{}»", "нет файлов по запросу «{}»";
-    path_status_many: "path {}/{}: {} (Tab — next)", "путь {}/{}: {} (Tab — далее)";
-    path_status_one: "file: {}", "файл: {}";
-    sf_folder_many: "folder: {} (Tab — enter, {} options)", "папка: {} (Tab — войти, {} вариантов)";
-    sf_folder: "folder: {} (Tab — enter)", "папка: {} (Tab — войти)";
-    sf_home: "home directory", "домашняя директория";
-    sf_permission: "permission denied: {}", "нет прав на чтение: {}";
-    sf_read_failed: "failed to read {}: {}", "не удалось прочитать {}: {}";
-    sf_no_files_dir: "no files in {}", "в {} нет файлов";
-    sf_no_match: "no files for «{}»", "нет файлов по запросу «{}»";
     contacts_fetch_error: "failed to get contacts: {}", "ошибка получения контактов: {}";
     no_contacts_query: "No contacts for «{}»", "Нет контактов по запросу «{}»";
     matching_contacts: "Matching contacts:\n{}", "Подходящие контакты:\n{}";
@@ -247,17 +224,18 @@ texts! {
     // ---------- Настройки ----------
     settings_title: " Settings · /set ", " Настройки · /set ";
     settings_input_title: " Settings ", " Настройки ";
-    label_text_api: "Text API", "Text API";
-    label_file_api: "File API", "File API";
-    label_guard_name: "Guard Header Name", "Guard Header Name";
-    label_guard_value: "Guard Header Value", "Guard Header Value";
-    label_proxy: "Proxy URL", "Proxy URL";
+    label_tor_control: "Tor ControlPort", "Tor ControlPort";
+    label_tor_socks: "Tor SOCKS5h", "Tor SOCKS5h";
+    label_tor_cookie: "Tor Cookie Path", "Tor Cookie";
+    label_p2p_local_port: "P2P Local Port", "Локальный порт P2P";
+    label_p2p_onion_port: "Onion Service Port", "Порт .onion-сервиса";
     label_notify: "Notify Level", "Notify Level";
     label_stealth_title: "Stealth Title", "Stealth Title";
     label_stealth_body: "Stealth Body", "Stealth Body";
     label_stealth_seconds: "Stealth Seconds", "Stealth Seconds";
     label_language: "Language", "Язык";
-    direct_connection: "— (direct connection)", "— (прямое подключение)";
+    cookie_auto: "— (auto via PROTOCOLINFO)", "— (авто через PROTOCOLINFO)";
+    port_auto: "0 (auto)", "0 (авто)";
     settings_status_bar: " Settings: {} · {} ", " Настройки: {} · {} ";
     settings_mode_edit: "editing", "ввод";
     settings_mode_select: "select", "выбор";
@@ -269,8 +247,7 @@ texts! {
     settings_edit_cancelled: "editing cancelled", "редактирование отменено";
     settings_open: "settings opened", "настройки открыты";
     settings_saved: "settings saved to the encrypted config and applied.", "настройки сохранены в зашифрованный конфиг и применены.";
-    settings_saved_proxy: "settings saved to the encrypted config and applied. Proxy: {}.", "настройки сохранены в зашифрованный конфиг и применены. Прокси: {}.";
-    settings_proxy_direct: "direct connection", "прямое подключение";
+    settings_saved_p2p: "settings saved to the encrypted config and applied. ControlPort: {}, SOCKS5h: {}.", "настройки сохранены в зашифрованный конфиг и применены. ControlPort: {}, SOCKS5h: {}.";
     settings_applied: "settings applied", "настройки применены";
     settings_save_error: "Failed to save settings: {}", "Не удалось сохранить настройки: {}";
     settings_error: "settings error", "ошибка настроек";
@@ -373,18 +350,6 @@ texts! {
     room_none: "No active room. Add a contact via /join <link>", "Активной комнаты нет. Добавьте контакт через /join <link>";
     messages_empty: "No messages in this room", "Сообщений в этой комнате нет";
     messages_error: "Failed to load messages: {}", "Ошибка загрузки сообщений: {}";
-    sendfile_usage: "Usage: /sendfile [--force] <path>", "Использование: /sendfile [--force] <path>";
-    sendfile_force: "⚠ --force: sending from a system directory manually allowed", "⚠ --force: отправка из системной директории разрешена вручную";
-    sendfile_sending: "sending file: {}...", "отправка файла: {}...";
-    sendfile_sending_force: "sending file (--force): {}...", "отправка файла (--force): {}...";
-    sendfile_sent: "file sent", "файл отправлен";
-    sendfile_error: "Failed to send file: {}", "Ошибка отправки файла: {}";
-    download_no_files: "This room has no files yet", "В этой комнате пока нет файлов";
-    download_not_found: "File «{}» not found. Tab after /dl lists room files", "Файл «{}» не найден. Tab после /dl — список файлов комнаты";
-    download_path_error: "Failed to choose a path: {}", "Не удалось выбрать путь: {}";
-    download_saving: "downloading {}...", "скачивание {}...";
-    download_saved: "file {} saved to {}", "файл {} сохранён в {}";
-    download_error: "Failed to download {}: {}", "Ошибка скачивания {}: {}";
     nick_usage: "Usage: /nick <name>", "Использование: /nick <name>";
     nick_changed: "Nickname changed: {}", "Ник изменён: {}";
     nick_changed_status: "nickname changed", "ник изменён";
@@ -426,6 +391,8 @@ texts! {
     contacts_info_title: " Contact info ", " Информация о контакте ";
     contacts_info_name: "Name: {}", "Имя: {}";
     contacts_info_hash: "Identity hash: {}", "Identity hash: {}";
+    contacts_info_onion: "Tor .onion: {}", "Tor .onion: {}";
+    contacts_info_onion_missing: "not stored (re-import the v2 invite)", "не сохранён (импортируйте v2-инвайт заново)";
     contacts_info_fingerprint: "Fingerprint: {}", "Отпечаток: {}";
     contacts_info_tofu: "Trust (TOFU): {}", "Доверие (TOFU): {}";
     contacts_info_x25519: "X25519 public key: {}", "Публичный ключ X25519: {}";
@@ -454,6 +421,7 @@ texts! {
     import_intro: "Verify the fingerprint out-of-band before adding this contact.", "Сверьте отпечаток по независимому каналу перед добавлением контакта.";
     import_nickname: "Nickname: {}", "Имя: {}";
     import_hash: "Identity hash: {}", "Identity hash: {}";
+    import_onion: "Tor .onion: {}", "Tor .onion: {}";
     import_fingerprint: "Fingerprint: {}", "Отпечаток: {}";
     import_x25519: "X25519 key: {}", "Ключ X25519: {}";
     import_ed25519: "Ed25519 key: {}", "Ключ Ed25519: {}";
@@ -463,34 +431,21 @@ texts! {
     import_changed_warning: "Warning: X25519 key changed for {} · verify fingerprint {}", "Внимание: X25519-ключ для {} изменился · сверьте отпечаток {}";
     import_error: "Failed to add contact: {}", "Не удалось добавить контакт: {}";
     import_cancelled: "invite import cancelled", "импорт инвайта отменён";
-    upload_started: "Uploading file: {}", "Загрузка файла: {}";
-    upload_started_status: "uploading file...", "загрузка файла...";
-    upload_progress: "upload {}% — {}", "загрузка {}% — {}";
-    upload_done: "File [#{}] {} sent, hash={}{}{}", "Файл [#{}] {} отправлен, hash={}{}{}";
-    upload_size: ", {} B", ", {} B";
-    upload_download_hint: "; download: /dl {}", "; скачать: /dl {}";
-    upload_done_status: "file #{} sent", "файл #{} отправлен";
-    upload_error: "File upload error: {}", "Ошибка загрузки файла: {}";
-    download_started_status: "downloading file...", "скачивание файла...";
-    download_completed: "File saved: {}", "Файл сохранён: {}";
-    download_completed_status: "file saved", "файл сохранён";
-    download_failed: "File download error: {}", "Ошибка скачивания файла: {}";
+    tor_status_online: "Tor: {}", "Tor: {}";
+    tor_status_offline: "Tor: offline", "Tor: оффлайн";
+    outbox_status_badge: "outbox: {}", "очередь: {}";
+    tor_connected_msg: "Tor hidden service active: {}", "Скрытый сервис Tor активен: {}";
+    tor_disconnected_msg: "Tor ControlPort offline: {}", "Tor ControlPort недоступен: {}";
+    tor_disconnected_status: "Tor offline", "Tor оффлайн";
     new_message_status: "new message from {}", "новое сообщение от {}";
-    new_file_status: "file #{}: {} — /dl {}", "файл #{}: {} — /dl {}";
-    unread_message: "new message from {} in «{}» (+{}){}, switch: Alt+Up/Alt+Down", "новое сообщение от {} в «{}» (+{}){}, переключение: Alt+Up/Alt+Down";
-    unread_file_note: " (file #{}: {})", " (файл #{}: {})";
+    unread_message: "new message from {} in «{}» (+{}), switch: Alt+Up/Alt+Down", "новое сообщение от {} в «{}» (+{}), переключение: Alt+Up/Alt+Down";
     contact_added_room: "Contact added, active room: {}", "Контакт добавлен, активная комната: {}";
 
     // ---------- Системные уведомления ----------
     notify_new_message: "New message from {}", "Новое сообщение от {}";
     notify_new_message_default: "New message", "Новое сообщение";
-    notify_file: "File: {}", "Файл: {}";
     notify_test_body: "Test message: notifications are configured.", "Тестовое сообщение: уведомления настроены.";
     notify_disabled: "notifications are disabled (Notify Level: 0)", "уведомления отключены (Notify Level: 0)";
-    upload_encrypting: "Encrypting...", "Шифрование...";
-    upload_sending: "Sending to server...", "Отправка на сервер...";
-    upload_finished: "Completed", "Завершено";
-    file_notification: "📎 File: {}\nSize: {}\nHash: {}\nFile ID: {}", "📎 Файл: {}\nРазмер: {}\nХеш: {}\nFile ID: {}";
 
     // ---------- Welcome ----------
     welcome_status: "choose interface language · ←/→ or 1/2 · Enter — confirm", "выберите язык интерфейса · ←/→ или 1/2 · Enter — подтвердить";
@@ -501,8 +456,8 @@ texts! {
 
 static WELCOME_EN: WelcomeText = WelcomeText {
     title: "Welcome to LastChance",
-    subtitle: "Private messenger with a terminal interface.",
-    settings: "• Servers and proxy: /set or Ctrl+S",
+    subtitle: "Private P2P messenger over Tor v3 hidden services.",
+    settings: "• Tor & settings: /set or Ctrl+S",
     help: "• Commands: /help or F1",
     language: "• Language: /lang",
     footer: "←/→ or 1/2 — choose · Enter — confirm",
@@ -510,8 +465,8 @@ static WELCOME_EN: WelcomeText = WelcomeText {
 
 static WELCOME_RU: WelcomeText = WelcomeText {
     title: "Добро пожаловать в LastChance",
-    subtitle: "Приватный мессенджер с терминальным интерфейсом.",
-    settings: "• Серверы и прокси: /set или Ctrl+S",
+    subtitle: "Приватный P2P-мессенджер поверх скрытых сервисов Tor v3.",
+    settings: "• Tor и настройки: /set или Ctrl+S",
     help: "• Команды: /help или F1",
     language: "• Язык: /lang",
     footer: "←/→ или 1/2 — выбор · Enter — подтвердить",
@@ -534,30 +489,26 @@ const EN_HELP_SECTIONS: &[HelpSection] = &[
         ],
     },
     HelpSection {
-        title: "Messages and files",
+        title: "Messages",
         rows: &[
             HelpRow { keys: "/messages [limit]", desc: "Recent messages in the active room" },
             HelpRow { keys: "/ttl [duration|off]", desc: "One-way RAM-only TTL for new messages (30s, 5m, 2h); without an argument — status" },
             HelpRow { keys: "/ttl-syn [duration|off]", desc: "Two-way RAM TTL: the peer receives the same timer via an encrypted SetTtl" },
             HelpRow { keys: "/ttl-syn-retry", desc: "Resend an unconfirmed two-way TTL after a delivery error" },
             HelpRow { keys: "/ratchet-reset", desc: "Reset the Double Ratchet session with the active contact and reinitialize it" },
-            HelpRow { keys: "/sendfile, /sf [--force] <path>", desc: "Send a file; path is from the current directory, ~/ or absolute; system folders require --force" },
-            HelpRow { keys: "/download, /dl [id | name | hash] [path]", desc: "Download a room file (the latest by default) to ./downloads" },
-            HelpRow { keys: "Tab after /dl", desc: "Cycle through files in the active room" },
-            HelpRow { keys: "Tab after /sf", desc: "Complete paths from the current directory" },
-            HelpRow { keys: "Text without a leading /", desc: "Send a message to the active room" },
+            HelpRow { keys: "Text without a leading /", desc: "Send an encrypted P2P message to the active room" },
         ],
     },
     HelpSection {
         title: "Profile and settings",
         rows: &[
-            HelpRow { keys: "/profile, /p", desc: "Profile: nickname, hash and keys" },
+            HelpRow { keys: "/profile, /p", desc: "Profile: nickname, hash, keys and .onion" },
             HelpRow { keys: "/recovery", desc: "Restore identity from a BIP-39 phrase (with overwrite confirmation)" },
-            HelpRow { keys: "/invite, /in [-f [dir | file]]", desc: "Copy an invite link to the clipboard; with -f save it to a file" },
+            HelpRow { keys: "/invite, /in [-f [dir | file]]", desc: "Copy signed v2 P2P invite link to the clipboard; with -f save to a file" },
             HelpRow { keys: "/export", desc: "Contact as JSON" },
             HelpRow { keys: "/nick <name>", desc: "Change your nickname" },
             HelpRow { keys: "/rename <hash> <name>", desc: "Rename a contact" },
-            HelpRow { keys: "/set, /settings", desc: "Interactive settings: API, Guard Header, Proxy, Notify Level, Stealth, Language" },
+            HelpRow { keys: "/set, /settings", desc: "Interactive settings: Tor ControlPort, SOCKS5h, Cookie, Ports, Notify Level, Stealth, Language" },
             HelpRow { keys: "/set notify <0|1|2|3>", desc: "Notification mode: off / stealth / sender / full" },
             HelpRow { keys: "/set test", desc: "Show a test system notification" },
             HelpRow { keys: COMMAND_LANG, desc: "Switch interface language (en/ru) or toggle it without an argument" },
@@ -606,30 +557,26 @@ const RU_HELP_SECTIONS: &[HelpSection] = &[
         ],
     },
     HelpSection {
-        title: "Сообщения и файлы",
+        title: "Сообщения",
         rows: &[
             HelpRow { keys: "/messages [limit]", desc: "Последние сообщения активной комнаты" },
             HelpRow { keys: "/ttl [duration|off]", desc: "Односторонний RAM-TTL для новых сообщений (30s, 5m, 2h); без аргумента — статус" },
             HelpRow { keys: "/ttl-syn [duration|off]", desc: "Двусторонний RAM-TTL: собеседник получает тот же таймер через зашифрованный SetTtl" },
             HelpRow { keys: "/ttl-syn-retry", desc: "Повторно отправить неподтверждённый двусторонний TTL после ошибки доставки" },
             HelpRow { keys: "/ratchet-reset", desc: "Сбросить сессию Double Ratchet с активным контактом и инициализировать её заново" },
-            HelpRow { keys: "/sendfile, /sf [--force] <path>", desc: "Отправить файл; путь от текущей директории, ~/ и абсолютный; системные папки — только с --force" },
-            HelpRow { keys: "/download, /dl [id | name | hash] [path]", desc: "Скачать файл комнаты (по умолчанию последний) в ./downloads" },
-            HelpRow { keys: "Tab после /dl", desc: "Перебор файлов активной комнаты" },
-            HelpRow { keys: "Tab после /sf", desc: "Автодополнение путей от текущей директории" },
-            HelpRow { keys: "Текст без ведущего /", desc: "Отправить сообщение в активную комнату" },
+            HelpRow { keys: "Текст без ведущего /", desc: "Отправить зашифрованное P2P-сообщение в активную комнату" },
         ],
     },
     HelpSection {
         title: "Профиль и настройки",
         rows: &[
-            HelpRow { keys: "/profile, /p", desc: "Профиль: ник, hash и ключи" },
+            HelpRow { keys: "/profile, /p", desc: "Профиль: ник, hash, ключи и .onion" },
             HelpRow { keys: "/recovery", desc: "Восстановить идентичность из BIP-39 фразы (с подтверждением перезаписи)" },
-            HelpRow { keys: "/invite, /in [-f [dir | file]]", desc: "Скопировать ссылку-приглашение в буфер; с -f сохранить в файл" },
+            HelpRow { keys: "/invite, /in [-f [dir | file]]", desc: "Скопировать подписанный v2 P2P-инвайт в буфер; с -f сохранить в файл" },
             HelpRow { keys: "/export", desc: "Контакт в формате JSON" },
             HelpRow { keys: "/nick <name>", desc: "Сменить свой ник" },
             HelpRow { keys: "/rename <hash> <name>", desc: "Переименовать контакт" },
-            HelpRow { keys: "/set, /settings", desc: "Интерактивное меню настроек: API, Guard Header, Proxy, Notify Level, Stealth, язык" },
+            HelpRow { keys: "/set, /settings", desc: "Интерактивное меню настроек: Tor ControlPort, SOCKS5h, Cookie, порты, Notify Level, Stealth, язык" },
             HelpRow { keys: "/set notify <0|1|2|3>", desc: "Режим уведомлений: выкл. / stealth / отправитель / полный" },
             HelpRow { keys: "/set test", desc: "Показать тестовое системное уведомление" },
             HelpRow { keys: COMMAND_LANG, desc: "Переключить язык интерфейса (en/ru) или без аргумента — сменить текущий" },
@@ -688,10 +635,8 @@ mod tests {
     #[test]
     fn old_config_without_lang_defaults_to_english() {
         let json = r#"{
-            "server_url": "https://msg.example.com",
-            "file_server_url": "https://files.example.com",
-            "mask_header_name": "X-DNS-Connect",
-            "mask_header_value": "We_Are_Not_Legion"
+            "tor_control_addr": "127.0.0.1:9051",
+            "tor_socks_addr": "127.0.0.1:9050"
         }"#;
 
         let config: Config = serde_json::from_str(json).expect("old config must deserialize");

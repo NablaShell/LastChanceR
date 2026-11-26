@@ -30,9 +30,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 use zeroize::Zeroizing;
 
-use crate::crypto::secret::SecretBytes;
+use crate::crypto::secret::{SecretBytes, SecretString};
 use crate::storage::SafeFSOps;
-use crate::types::{truncate_display, FileHash, IdentityHash};
+use crate::types::{truncate_display, IdentityHash, OnionAddress};
 use crate::vault::{MasterKey, Vault};
 
 /// Новый зашифрованный контейнер локальной базы.
@@ -95,8 +95,9 @@ pub struct Contact {
     pub hash: String,
     pub public_key: Vec<u8>,
     /// Ed25519 public key в hex, если он был в ссылке-приглашении.
-    /// Старые контакты могут не иметь его: колонка появилась позже.
     pub ed25519: Option<String>,
+    /// Подписанный Tor v3 `.onion`-адрес собеседника.
+    pub onion_addr: Option<String>,
     /// Отпечаток связки Ed25519 + X25519, hex.
     pub fingerprint: Option<String>,
     /// Состояние TOFU: `pending`, `verified` или `changed`.
@@ -121,13 +122,32 @@ pub struct Message {
     pub expires_at: Option<u64>,
 }
 
+/// Учётные данные Tor v3 hidden service, хранящиеся внутри зашифрованного `vault.dat`.
+pub struct TorServiceCredentials {
+    pub service_id: String,
+    pub private_key: SecretString,
+}
+
+impl std::fmt::Debug for TorServiceCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TorServiceCredentials")
+            .field("service_id", &self.service_id)
+            .field("private_key", &self.private_key)
+            .finish()
+    }
+}
+
+/// Запись зашифрованной исходящей очереди (`outbox`) в `vault.dat`.
 #[derive(Debug, Clone)]
-pub struct FileRecord {
-    pub file_hash: String,
+pub struct OutboxItem {
+    pub id: i64,
     pub room_hash: String,
-    pub file_name: String,
-    pub file_size: i64,
-    pub uploaded_at: DateTime<Utc>,
+    pub recipient_onion: String,
+    pub packet: Vec<u8>,
+    pub created_at: i64,
+    pub attempts: u32,
+    pub next_retry_at: i64,
+    pub last_error: Option<String>,
 }
 
 /// M-C: tombstone уничтоженной сессии TTL-комнаты.
@@ -163,21 +183,21 @@ struct Snapshot {
     rooms: Vec<RoomRow>,
     #[serde(default)]
     messages: Vec<MessageRow>,
-    #[serde(default)]
-    files: Vec<FileRow>,
-    /// Сериализованные состояния Double Ratchet. Поле появилось позже,
-    /// поэтому старые снимки читаются с пустым значением.
+    /// Сериализованные состояния Double Ratchet.
     #[serde(default)]
     ratchet_states: Vec<RatchetRow>,
     /// `session_id`, которые нельзя принимать после reset/вытеснения.
-    /// Хранятся отдельно от `ratchet_states`, потому что состояние комнаты
-    /// при reset удаляется, а tombstone должны пережить перезапуск.
     #[serde(default)]
     retired_ratchet_sessions: Vec<RetiredSessionRow>,
-    /// M-C: tombstone-хеши retired-сессий TTL-комнат. Поле появилось позже,
-    /// старые снимки читаются с пустым значением.
+    /// M-C: tombstone-хеши retired-сессий TTL-комнат.
     #[serde(default)]
     ttl_tombstones: Vec<TtlTombstoneRow>,
+    /// Постоянный Tor v3 hidden service ключ (`ED25519-V3:...`).
+    #[serde(default)]
+    tor_service: Option<TorServiceRow>,
+    /// Зашифрованная очередь исходящих пакетов на случай оффлайна пира.
+    #[serde(default)]
+    outbox: Vec<OutboxRow>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -186,6 +206,8 @@ struct ContactRow {
     /// hex-кодированный публичный ключ.
     public_key: String,
     ed25519: Option<String>,
+    #[serde(default)]
+    onion_addr: Option<String>,
     #[serde(default)]
     fingerprint: Option<String>,
     #[serde(default = "default_tofu_state")]
@@ -198,6 +220,7 @@ struct ContactRow {
 type ContactDbRow = (
     String,
     Vec<u8>,
+    Option<String>,
     Option<String>,
     Option<String>,
     Option<String>,
@@ -230,12 +253,23 @@ struct MessageRow {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct FileRow {
-    file_hash: String,
+struct TorServiceRow {
+    service_id: String,
+    private_key: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct OutboxRow {
+    id: i64,
     room_hash: String,
-    file_name: String,
-    file_size: i64,
-    uploaded_at: String,
+    recipient_onion: String,
+    /// hex-кодированный Double Ratchet v3 пакет.
+    packet: String,
+    created_at: i64,
+    attempts: u32,
+    next_retry_at: i64,
+    #[serde(default)]
+    last_error: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -361,6 +395,7 @@ impl Storage {
                 hash TEXT PRIMARY KEY,
                 public_key BLOB NOT NULL,
                 ed25519 TEXT,
+                onion_addr TEXT,
                 fingerprint TEXT,
                 tofu_state TEXT NOT NULL DEFAULT 'pending',
                 nickname TEXT NOT NULL,
@@ -389,13 +424,21 @@ impl Storage {
                 FOREIGN KEY(room_hash) REFERENCES contacts(hash)
             );
 
-            CREATE TABLE IF NOT EXISTS files (
-                file_hash TEXT PRIMARY KEY,
+            CREATE TABLE IF NOT EXISTS tor_service (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                service_id TEXT NOT NULL,
+                private_key TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS outbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 room_hash TEXT NOT NULL,
-                file_name TEXT NOT NULL,
-                file_size INTEGER NOT NULL,
-                uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY(room_hash) REFERENCES contacts(hash)
+                recipient_onion TEXT NOT NULL,
+                packet BLOB NOT NULL,
+                created_at INTEGER NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_retry_at INTEGER NOT NULL,
+                last_error TEXT
             );
 
             CREATE TABLE IF NOT EXISTS ratchet_states (
@@ -422,8 +465,8 @@ impl Storage {
             CREATE INDEX IF NOT EXISTS idx_messages_contact ON messages(contact_hash);
             CREATE INDEX IF NOT EXISTS idx_messages_room ON messages(room_hash);
             CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);
-            CREATE INDEX IF NOT EXISTS idx_files_room ON files(room_hash);
-            CREATE INDEX IF NOT EXISTS idx_files_uploaded ON files(uploaded_at);
+            CREATE INDEX IF NOT EXISTS idx_outbox_due ON outbox(next_retry_at, id);
+            CREATE INDEX IF NOT EXISTS idx_outbox_room ON outbox(room_hash);
             CREATE INDEX IF NOT EXISTS idx_ttl_tombstones_retired ON ttl_tombstones(retired_at);
         ",
         )
@@ -606,7 +649,7 @@ impl Storage {
         let contacts = {
             let mut stmt = conn
                 .prepare(
-                    "SELECT hash, public_key, ed25519, fingerprint, tofu_state, nickname, created_at
+                    "SELECT hash, public_key, ed25519, onion_addr, fingerprint, tofu_state, nickname, created_at
                      FROM contacts ORDER BY created_at ASC",
                 )
                 .map_err(|e| anyhow!("failed to prepare contacts dump: {}", e))?;
@@ -616,12 +659,13 @@ impl Storage {
                         hash: row.get(0)?,
                         public_key: hex::encode(row.get::<_, Vec<u8>>(1)?),
                         ed25519: row.get(2)?,
-                        fingerprint: row.get(3)?,
+                        onion_addr: row.get(3)?,
+                        fingerprint: row.get(4)?,
                         tofu_state: row
-                            .get::<_, Option<String>>(4)?
+                            .get::<_, Option<String>>(5)?
                             .unwrap_or_else(default_tofu_state),
-                        nickname: row.get(5)?,
-                        created_at: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                        nickname: row.get(6)?,
+                        created_at: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
                     })
                 })
                 .map_err(|e| anyhow!("failed to dump contacts: {}", e))?
@@ -684,26 +728,44 @@ impl Storage {
             rows
         };
 
-        let files = {
+        let tor_service = conn
+            .query_row(
+                "SELECT service_id, private_key FROM tor_service WHERE id = 1",
+                [],
+                |row| {
+                    Ok(TorServiceRow {
+                        service_id: row.get(0)?,
+                        private_key: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| anyhow!("failed to dump tor service: {}", e))?;
+
+        let outbox = {
             let mut stmt = conn
                 .prepare(
-                    "SELECT file_hash, room_hash, file_name, file_size, uploaded_at
-                     FROM files ORDER BY uploaded_at ASC",
+                    "SELECT id, room_hash, recipient_onion, packet, created_at,
+                            attempts, next_retry_at, last_error
+                     FROM outbox ORDER BY id ASC",
                 )
-                .map_err(|e| anyhow!("failed to prepare files dump: {}", e))?;
+                .map_err(|e| anyhow!("failed to prepare outbox dump: {}", e))?;
             let rows = stmt
                 .query_map([], |row| {
-                    Ok(FileRow {
-                        file_hash: row.get(0)?,
+                    Ok(OutboxRow {
+                        id: row.get(0)?,
                         room_hash: row.get(1)?,
-                        file_name: row.get(2)?,
-                        file_size: row.get(3)?,
-                        uploaded_at: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                        recipient_onion: row.get(2)?,
+                        packet: hex::encode(row.get::<_, Vec<u8>>(3)?),
+                        created_at: row.get(4)?,
+                        attempts: row.get::<_, i64>(5)?.max(0) as u32,
+                        next_retry_at: row.get(6)?,
+                        last_error: row.get(7)?,
                     })
                 })
-                .map_err(|e| anyhow!("failed to dump files: {}", e))?
+                .map_err(|e| anyhow!("failed to dump outbox: {}", e))?
                 .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|e| anyhow!("failed to read files: {}", e))?;
+                .map_err(|e| anyhow!("failed to read outbox: {}", e))?;
             rows
         };
 
@@ -769,10 +831,11 @@ impl Storage {
             contacts,
             rooms,
             messages,
-            files,
             ratchet_states,
             retired_ratchet_sessions,
             ttl_tombstones,
+            tor_service,
+            outbox,
         })
     }
 
@@ -794,12 +857,13 @@ impl Storage {
                     .map_err(|e| anyhow!("corrupted public key for contact in storage: {}", e))?;
                 tx.execute(
                     "INSERT OR REPLACE INTO contacts
-                        (hash, public_key, ed25519, fingerprint, tofu_state, nickname, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        (hash, public_key, ed25519, onion_addr, fingerprint, tofu_state, nickname, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     params![
                         contact.hash,
                         public_key,
                         contact.ed25519,
+                        contact.onion_addr,
                         contact.fingerprint,
                         contact.tofu_state,
                         contact.nickname,
@@ -839,20 +903,34 @@ impl Storage {
                 .map_err(|e| anyhow!("failed to restore message: {}", e))?;
             }
 
-            for file in &snapshot.files {
+            if let Some(service) = &snapshot.tor_service {
                 tx.execute(
-                    "INSERT OR REPLACE INTO files
-                        (file_hash, room_hash, file_name, file_size, uploaded_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    "INSERT OR REPLACE INTO tor_service (id, service_id, private_key)
+                     VALUES (1, ?1, ?2)",
+                    params![service.service_id, service.private_key],
+                )
+                .map_err(|e| anyhow!("failed to restore tor service: {}", e))?;
+            }
+
+            for item in &snapshot.outbox {
+                let packet = hex::decode(&item.packet)
+                    .map_err(|e| anyhow!("corrupted outbox packet in storage: {}", e))?;
+                tx.execute(
+                    "INSERT OR REPLACE INTO outbox
+                        (id, room_hash, recipient_onion, packet, created_at, attempts, next_retry_at, last_error)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     params![
-                        file.file_hash,
-                        file.room_hash,
-                        file.file_name,
-                        file.file_size,
-                        file.uploaded_at
+                        item.id,
+                        item.room_hash,
+                        item.recipient_onion,
+                        packet,
+                        item.created_at,
+                        item.attempts as i64,
+                        item.next_retry_at,
+                        item.last_error
                     ],
                 )
-                .map_err(|e| anyhow!("failed to restore file record: {}", e))?;
+                .map_err(|e| anyhow!("failed to restore outbox item: {}", e))?;
             }
 
             for ratchet in &snapshot.ratchet_states {
@@ -964,6 +1042,7 @@ impl Storage {
                     hash,
                     public_key: hex::encode(public_key),
                     ed25519,
+                    onion_addr: None,
                     fingerprint,
                     tofu_state: tofu_state
                         .filter(|state| !state.is_empty())
@@ -1039,42 +1118,6 @@ impl Storage {
             }
         }
 
-        if table_exists(&conn, "files")? {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT file_hash, room_hash, file_name, file_size, uploaded_at FROM files",
-                )
-                .map_err(|e| anyhow!("failed to read legacy files: {}", e))?;
-            let rows = stmt
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        legacy_value_as_string(row, 3)?,
-                        row.get::<_, Option<String>>(4)?.unwrap_or_default(),
-                    ))
-                })
-                .map_err(|e| anyhow!("failed to query legacy files: {}", e))?
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|e| anyhow!("failed to read legacy files: {}", e))?;
-
-            for (file_hash, room_hash, file_name, raw_size, uploaded_at) in rows {
-                let decrypted_size = self.vault.decrypt_str(&raw_size)?;
-                let file_size = decrypted_size
-                    .trim()
-                    .parse::<i64>()
-                    .map_err(|e| anyhow!("corrupted file size in legacy database: {}", e))?;
-                snapshot.files.push(FileRow {
-                    file_hash,
-                    room_hash,
-                    file_name: self.vault.decrypt_str(&file_name)?,
-                    file_size,
-                    uploaded_at,
-                });
-            }
-        }
-
         Ok(snapshot)
     }
 
@@ -1098,10 +1141,7 @@ impl Storage {
         self.add_contact_with_ed25519(hash, public_key, None, nickname)
     }
 
-    /// Сохраняет контакт вместе с Ed25519-ключом (legacy/тестовый путь).
-    ///
-    /// Повторный импорт без Ed25519 не должен затирать уже известный ключ,
-    /// поэтому используется `COALESCE` в UPSERT-ветке.
+    /// Сохраняет контакт вместе с Ed25519-ключом (тестовый/упрощённый путь).
     pub fn add_contact_with_ed25519(
         &self,
         hash: &str,
@@ -1113,13 +1153,14 @@ impl Storage {
             hash,
             public_key,
             ed25519,
+            None,
             nickname,
             None,
             None,
         )
     }
 
-    /// Сохраняет криптографически проверенный контакт с отпечатком и TOFU.
+    /// Сохраняет криптографически проверенный контакт с отпечатком и TOFU (без `.onion`).
     pub fn upsert_verified_contact(
         &self,
         hash: &str,
@@ -1133,23 +1174,49 @@ impl Storage {
             hash,
             public_key,
             Some(ed25519),
+            None,
             nickname,
             Some(fingerprint),
             Some(tofu_state),
         )
     }
 
+    /// Сохраняет проверенный P2P-контакт вместе с подписанным Tor v3 `.onion`-адресом.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_p2p_contact(
+        &self,
+        hash: &str,
+        public_key: &[u8],
+        ed25519: &str,
+        onion_addr: &str,
+        fingerprint: &str,
+        tofu_state: &str,
+        nickname: &str,
+    ) -> Result<()> {
+        let normalized_onion = OnionAddress::parse(onion_addr)
+            .map_err(|e| anyhow!("invalid peer .onion address: {}", e))?;
+        self.upsert_contact(
+            hash,
+            public_key,
+            Some(ed25519),
+            Some(normalized_onion.as_str()),
+            nickname,
+            Some(fingerprint),
+            Some(tofu_state),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn upsert_contact(
         &self,
         hash: &str,
         public_key: &[u8],
         ed25519: Option<&str>,
+        onion_addr: Option<&str>,
         nickname: &str,
         fingerprint: Option<&str>,
         tofu_state: Option<&str>,
     ) -> Result<()> {
-        // Недоверенный identity hash (из invite/сервера) проверяется здесь,
-        // до записи в БД и до любых дальнейших срезов.
         IdentityHash::from_hex(hash).map_err(|e| {
             anyhow!(
                 "invalid contact hash ({}…, {} chars): {}",
@@ -1158,23 +1225,36 @@ impl Storage {
                 e
             )
         })?;
+        if let Some(addr) = onion_addr {
+            OnionAddress::parse(addr)
+                .map_err(|e| anyhow!("invalid peer .onion address: {}", e))?;
+        }
 
         let tofu_state = tofu_state.unwrap_or(TOFU_PENDING);
         let conn = self.conn()?;
         conn.execute(
             "INSERT INTO contacts
-                (hash, public_key, ed25519, fingerprint, tofu_state, nickname)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                (hash, public_key, ed25519, onion_addr, fingerprint, tofu_state, nickname)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(hash) DO UPDATE SET
                  public_key = excluded.public_key,
                  nickname = excluded.nickname,
                  ed25519 = COALESCE(excluded.ed25519, contacts.ed25519),
+                 onion_addr = COALESCE(excluded.onion_addr, contacts.onion_addr),
                  fingerprint = COALESCE(excluded.fingerprint, contacts.fingerprint),
                  tofu_state = CASE
-                     WHEN ?4 IS NULL THEN contacts.tofu_state
+                     WHEN ?5 IS NULL THEN contacts.tofu_state
                      ELSE excluded.tofu_state
                  END",
-            params![hash, public_key, ed25519, fingerprint, tofu_state, nickname],
+            params![
+                hash,
+                public_key,
+                ed25519,
+                onion_addr,
+                fingerprint,
+                tofu_state,
+                nickname
+            ],
         )
         .map_err(|e| anyhow!("failed to add contact: {}", e))?;
 
@@ -1205,12 +1285,12 @@ impl Storage {
         let conn = self.conn()?;
         let mut stmt = conn
             .prepare(
-                "SELECT hash, public_key, ed25519, fingerprint, tofu_state, nickname, created_at
+                "SELECT hash, public_key, ed25519, onion_addr, fingerprint, tofu_state, nickname, created_at
                  FROM contacts WHERE hash = ?1",
             )
             .map_err(|e| anyhow!("failed to prepare query: {}", e))?;
 
-        let (hash_value, public_key, ed25519, fingerprint, tofu_state, nickname, created_at): ContactDbRow =
+        let (hash_value, public_key, ed25519, onion_addr, fingerprint, tofu_state, nickname, created_at): ContactDbRow =
             stmt
             .query_row(params![hash], |row| {
                 Ok((
@@ -1221,6 +1301,7 @@ impl Storage {
                     row.get(4)?,
                     row.get(5)?,
                     row.get(6)?,
+                    row.get(7)?,
                 ))
             })
             .map_err(|_e| anyhow!("contact not found: {}", truncate_display(hash, 16)))?;
@@ -1229,6 +1310,7 @@ impl Storage {
             hash: hash_value,
             public_key,
             ed25519,
+            onion_addr,
             fingerprint,
             tofu_state: tofu_state
                 .filter(|state| !state.is_empty())
@@ -1242,7 +1324,7 @@ impl Storage {
         let conn = self.conn()?;
         let mut stmt = conn
             .prepare(
-                "SELECT hash, public_key, ed25519, fingerprint, tofu_state, nickname, created_at
+                "SELECT hash, public_key, ed25519, onion_addr, fingerprint, tofu_state, nickname, created_at
                  FROM contacts ORDER BY created_at DESC",
             )
             .map_err(|e| anyhow!("failed to prepare query: {}", e))?;
@@ -1255,8 +1337,9 @@ impl Storage {
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, Option<String>>(4)?,
-                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(5)?,
                     row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
                 ))
             })
             .map_err(|e| anyhow!("failed to query contacts: {}", e))?
@@ -1264,11 +1347,12 @@ impl Storage {
             .map_err(|e| anyhow!("failed to read contacts: {}", e))?;
 
         let mut contacts = Vec::with_capacity(rows.len());
-        for (hash, public_key, ed25519, fingerprint, tofu_state, nickname, created_at) in rows {
+        for (hash, public_key, ed25519, onion_addr, fingerprint, tofu_state, nickname, created_at) in rows {
             contacts.push(Contact {
                 hash,
                 public_key,
                 ed25519,
+                onion_addr,
                 fingerprint,
                 tofu_state: tofu_state
                     .filter(|state| !state.is_empty())
@@ -1417,10 +1501,10 @@ impl Storage {
         )
         .map_err(|e| anyhow!("failed to delete messages: {}", e))?;
         tx.execute(
-            "DELETE FROM files WHERE room_hash = ?1",
+            "DELETE FROM outbox WHERE room_hash = ?1",
             params![contact_hash],
         )
-        .map_err(|e| anyhow!("failed to delete files: {}", e))?;
+        .map_err(|e| anyhow!("failed to delete outbox items: {}", e))?;
         tx.execute(
             "DELETE FROM ratchet_states WHERE room_hash = ?1",
             params![contact_hash],
@@ -1873,28 +1957,64 @@ impl Storage {
     }
 
     // ============================================================
-    // FILES
+    // TOR HIDDEN SERVICE & P2P OUTBOX
     // ============================================================
 
-    pub fn save_file_record(
-        &self,
-        file_hash: &str,
-        room_hash: &str,
-        file_name: &str,
-        file_size: i64,
-        is_ephemeral: bool,
-    ) -> Result<()> {
-        // file_hash приходит от файлового сервера, room_hash — из сети.
-        // Оба должны быть валидным hex до записи в БД.
-        let bare_hash = file_hash.strip_prefix("sha256:").unwrap_or(file_hash);
-        FileHash::from_hex(bare_hash).map_err(|e| {
-            anyhow!(
-                "invalid file hash ({}…, {} chars): {}",
-                truncate_display(file_hash, 16),
-                file_hash.chars().count(),
-                e
+    /// Сохраняет постоянный ключ Tor v3 hidden service (`ED25519-V3:...`)
+    /// и его `ServiceID` внутри зашифрованного `vault.dat`.
+    pub fn save_tor_service(&self, service_id: &str, private_key: &str) -> Result<()> {
+        let addr = OnionAddress::from_service_id(service_id)
+            .map_err(|e| anyhow!("invalid Tor ServiceID: {}", e))?;
+        if private_key.trim().is_empty() {
+            return Err(anyhow!("Tor private key cannot be empty"));
+        }
+
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO tor_service (id, service_id, private_key)
+             VALUES (1, ?1, ?2)",
+            params![addr.service_id(), private_key],
+        )
+        .map_err(|e| anyhow!("failed to save tor service credentials: {}", e))?;
+
+        self.persist_locked(&conn)
+    }
+
+    /// Загружает сохранённый ключ Tor v3 hidden service из `vault.dat`.
+    pub fn load_tor_service(&self) -> Result<Option<TorServiceCredentials>> {
+        let conn = self.conn()?;
+        let row = conn
+            .query_row(
+                "SELECT service_id, private_key FROM tor_service WHERE id = 1",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
-        })?;
+            .optional()
+            .map_err(|e| anyhow!("failed to load tor service credentials: {}", e))?;
+
+        match row {
+            Some((service_id, private_key)) => {
+                let addr = OnionAddress::from_service_id(&service_id)
+                    .map_err(|e| anyhow!("corrupted Tor ServiceID in storage: {}", e))?;
+                Ok(Some(TorServiceCredentials {
+                    service_id: addr.service_id().to_string(),
+                    private_key: SecretString::new(private_key),
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Ставит уже зашифрованный Double Ratchet v3 пакет в исходящую очередь.
+    ///
+    /// Для комнат с активным RAM-TTL этот метод НЕ должен вызываться (H-3).
+    pub fn enqueue_outbox(
+        &self,
+        room_hash: &str,
+        recipient_onion: &str,
+        packet: &[u8],
+        now_unix: i64,
+    ) -> Result<i64> {
         IdentityHash::from_hex(room_hash).map_err(|e| {
             anyhow!(
                 "invalid room hash ({}…, {} chars): {}",
@@ -1903,100 +2023,121 @@ impl Storage {
                 e
             )
         })?;
-
-        // H-3: имена, размеры и hash файлов TTL-комнат не попадают на диск.
-        if is_ephemeral {
-            return Ok(());
+        let normalized_onion = OnionAddress::parse(recipient_onion)
+            .map_err(|e| anyhow!("invalid recipient .onion address: {}", e))?;
+        if packet.is_empty() {
+            return Err(anyhow!("cannot enqueue empty packet"));
         }
 
         let conn = self.conn()?;
         conn.execute(
-            "INSERT OR REPLACE INTO files (file_hash, room_hash, file_name, file_size, uploaded_at)
-             VALUES (?1, ?2, ?3, ?4, CURRENT_TIMESTAMP)",
-            params![file_hash, room_hash, file_name, file_size],
+            "INSERT INTO outbox
+                (room_hash, recipient_onion, packet, created_at, attempts, next_retry_at)
+             VALUES (?1, ?2, ?3, ?4, 0, ?4)",
+            params![room_hash, normalized_onion.as_str(), packet, now_unix],
         )
-        .map_err(|e| anyhow!("failed to save file record: {}", e))?;
+        .map_err(|e| anyhow!("failed to enqueue outbox packet: {}", e))?;
+        let id = conn.last_insert_rowid();
+
+        self.persist_locked(&conn)?;
+        Ok(id)
+    }
+
+    /// Возвращает элементы outbox, готовые к отправке (FIFO по `id`).
+    pub fn due_outbox_items(&self, now_unix: i64) -> Result<Vec<OutboxItem>> {
+        let conn = self.conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, room_hash, recipient_onion, packet, created_at,
+                        attempts, next_retry_at, last_error
+                 FROM outbox
+                 WHERE next_retry_at <= ?1
+                 ORDER BY id ASC",
+            )
+            .map_err(|e| anyhow!("failed to prepare due outbox query: {}", e))?;
+
+        let rows = stmt
+            .query_map(params![now_unix], |row| {
+                Ok(OutboxItem {
+                    id: row.get(0)?,
+                    room_hash: row.get(1)?,
+                    recipient_onion: row.get(2)?,
+                    packet: row.get(3)?,
+                    created_at: row.get(4)?,
+                    attempts: row.get::<_, i64>(5)?.max(0) as u32,
+                    next_retry_at: row.get(6)?,
+                    last_error: row.get(7)?,
+                })
+            })
+            .map_err(|e| anyhow!("failed to query due outbox: {}", e))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| anyhow!("failed to read due outbox: {}", e))?;
+
+        Ok(rows)
+    }
+
+    /// Обновляет счётчик попыток и время следующей попытки после сбоя доставки.
+    pub fn mark_outbox_retry(
+        &self,
+        id: i64,
+        attempts: u32,
+        next_retry_at: i64,
+        last_error: &str,
+    ) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE outbox
+             SET attempts = ?1, next_retry_at = ?2, last_error = ?3
+             WHERE id = ?4",
+            params![attempts as i64, next_retry_at, last_error, id],
+        )
+        .map_err(|e| anyhow!("failed to update outbox retry: {}", e))?;
 
         self.persist_locked(&conn)
     }
 
-    pub fn get_file_record(&self, file_hash: &str) -> Result<FileRecord> {
+    /// Удаляет успешно доставленный пакет из outbox.
+    pub fn delete_outbox_item(&self, id: i64) -> Result<()> {
         let conn = self.conn()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT file_hash, room_hash, file_name, file_size, uploaded_at
-                 FROM files WHERE file_hash = ?1",
-            )
-            .map_err(|e| anyhow!("failed to prepare query: {}", e))?;
+        conn.execute("DELETE FROM outbox WHERE id = ?1", params![id])
+            .map_err(|e| anyhow!("failed to delete outbox item: {}", e))?;
 
-        let (hash_value, room_hash, file_name, file_size, uploaded_at): (
-            String,
-            String,
-            String,
-            i64,
-            String,
-        ) = stmt
-            .query_row(params![file_hash], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            })
-            .map_err(|_e| {
-                anyhow!(
-                    "file record not found: {}",
-                    truncate_display(file_hash, 16)
-                )
-            })?;
-
-        Ok(FileRecord {
-            file_hash: hash_value,
-            room_hash,
-            file_name,
-            file_size,
-            uploaded_at: parse_timestamp(&uploaded_at),
-        })
+        self.persist_locked(&conn)
     }
 
-    pub fn get_room_files(&self, room_hash: &str) -> Result<Vec<FileRecord>> {
+    /// Удаляет все отложенные пакеты комнаты (reset храповика или удаление контакта).
+    pub fn clear_room_outbox(&self, room_hash: &str) -> Result<usize> {
         let conn = self.conn()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT file_hash, room_hash, file_name, file_size, uploaded_at
-                 FROM files WHERE room_hash = ?1
-                 ORDER BY uploaded_at DESC",
-            )
-            .map_err(|e| anyhow!("failed to prepare query: {}", e))?;
-
-        let rows = stmt
-            .query_map(params![room_hash], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, String>(4)?,
-                ))
-            })
-            .map_err(|e| anyhow!("failed to query room files: {}", e))?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| anyhow!("failed to read files: {}", e))?;
-
-        let mut files = Vec::with_capacity(rows.len());
-        for (file_hash, room_hash, file_name, file_size, uploaded_at) in rows {
-            files.push(FileRecord {
-                file_hash,
-                room_hash,
-                file_name,
-                file_size,
-                uploaded_at: parse_timestamp(&uploaded_at),
-            });
+        let removed = conn
+            .execute("DELETE FROM outbox WHERE room_hash = ?1", params![room_hash])
+            .map_err(|e| anyhow!("failed to clear room outbox: {}", e))?;
+        if removed > 0 {
+            self.persist_locked(&conn)?;
         }
+        Ok(removed)
+    }
 
-        Ok(files)
+    /// Количество пакетов, ожидающих отправки в outbox.
+    pub fn count_outbox(&self) -> Result<usize> {
+        let conn = self.conn()?;
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM outbox", [], |row| row.get(0))
+            .map_err(|e| anyhow!("failed to count outbox items: {}", e))?;
+        Ok(count.max(0) as usize)
+    }
+
+    /// Возвращает `true`, если для комнаты уже есть ожидающие пакеты в outbox.
+    pub fn has_pending_outbox_for_room(&self, room_hash: &str) -> Result<bool> {
+        let conn = self.conn()?;
+        let found: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM outbox WHERE room_hash = ?1 LIMIT 1",
+                params![room_hash],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| anyhow!("failed to check room outbox: {}", e))?;
+        Ok(found.is_some())
     }
 
     pub fn close(&self) -> Result<()> {
@@ -2038,27 +2179,6 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| anyhow!("failed to read legacy schema: {}", e))?;
     Ok(columns.iter().any(|name| name == column))
-}
-
-/// Читает значение старой колонки как строку. Нужен для `file_size`:
-/// в древних базах это INTEGER, позже — зашифрованный TEXT.
-fn legacy_value_as_string(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<String> {
-    use rusqlite::types::ValueRef;
-
-    match row.get_ref(index)? {
-        ValueRef::Null => Ok(String::new()),
-        ValueRef::Integer(value) => Ok(value.to_string()),
-        ValueRef::Real(value) => Ok(value.to_string()),
-        ValueRef::Text(bytes) | ValueRef::Blob(bytes) => {
-            String::from_utf8(bytes.to_vec()).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    index,
-                    rusqlite::types::Type::Text,
-                    Box::new(e),
-                )
-            })
-        }
-    }
 }
 
 /// Перезаписывает файл нулями и удаляет его.
@@ -2261,16 +2381,23 @@ mod tests {
         let t = setup();
 
         let hash = "c".repeat(64);
-        let file_hash = "d".repeat(64);
+        let onion = OnionAddress::test_v3_from_seed(5).to_string();
         let nickname = "HiddenContactName";
         let secret_text = "Very secret message body";
 
-        t.storage.add_contact(&hash, &[3u8; 32], nickname).unwrap();
+        t.storage
+            .upsert_p2p_contact(
+                &hash,
+                &[3u8; 32],
+                &"ab".repeat(32),
+                &onion,
+                &"cd".repeat(32),
+                TOFU_PENDING,
+                nickname,
+            )
+            .unwrap();
         t.storage.ensure_room(nickname, &hash).unwrap();
         t.storage.save_message(&hash, "in", secret_text).unwrap();
-        t.storage
-            .save_file_record(&file_hash, &hash, "hidden-file.txt", 42, false)
-            .unwrap();
 
         let bytes = read_vault(t.path());
 
@@ -2279,7 +2406,7 @@ mod tests {
         assert!(!contains(&bytes, b"SQLite format 3"));
         assert!(!contains(&bytes, nickname.as_bytes()));
         assert!(!contains(&bytes, secret_text.as_bytes()));
-        assert!(!contains(&bytes, b"hidden-file.txt"));
+        assert!(!contains(&bytes, onion.as_bytes()));
 
         // Размер лежит в первом bucket’е с джиттером (а не ровно на границе).
         assert_bucket_padded(bytes.len());
@@ -2291,10 +2418,9 @@ mod tests {
         let snapshot = Storage::decode_container(&key, &bytes).unwrap();
         assert_eq!(snapshot.contacts.len(), 1);
         assert_eq!(snapshot.contacts[0].nickname, nickname);
+        assert_eq!(snapshot.contacts[0].onion_addr.as_deref(), Some(onion.as_str()));
         assert_eq!(snapshot.messages.len(), 1);
         assert_eq!(snapshot.messages[0].text, secret_text);
-        assert_eq!(snapshot.files.len(), 1);
-        assert_eq!(snapshot.files[0].file_size, 42);
     }
 
     #[test]
@@ -2440,7 +2566,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().to_str().unwrap();
         let hash = "f".repeat(64);
-        let file_hash = "0".repeat(64);
 
         let vault = Vault::create(base, TEST_PASSWORD).unwrap();
 
@@ -2471,13 +2596,6 @@ mod tests {
                         timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                         status TEXT DEFAULT 'delivered'
                     );
-                    CREATE TABLE files (
-                        file_hash TEXT PRIMARY KEY,
-                        room_hash TEXT NOT NULL,
-                        file_name TEXT NOT NULL,
-                        file_size INTEGER NOT NULL,
-                        uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                    );
                 ",
                 )
                 .unwrap();
@@ -2501,13 +2619,6 @@ mod tests {
                     params![hash],
                 )
                 .unwrap();
-            legacy
-                .execute(
-                    "INSERT INTO files (file_hash, room_hash, file_name, file_size)
-                     VALUES (?1, ?2, 'legacy.txt', 42)",
-                    params![file_hash, hash],
-                )
-                .unwrap();
         }
 
         let storage = Storage::new(base, vault).unwrap();
@@ -2517,7 +2628,6 @@ mod tests {
             storage.get_room_messages(&hash, 10).unwrap()[0].text,
             "Legacy message"
         );
-        assert_eq!(storage.get_file_record(&file_hash).unwrap().file_size, 42);
 
         // Старая открытая база затерта и удалена, остался только vault.dat.
         for suffix in ["", "-wal", "-shm"] {
@@ -2637,12 +2747,12 @@ mod tests {
     }
 
     #[test]
-    fn delete_contact_removes_messages_files_and_room() {
+    fn delete_contact_removes_messages_outbox_and_room() {
         let t = setup();
 
         let hash = "4".repeat(64);
         let other = "5".repeat(64);
-        let file_hash = "6".repeat(64);
+        let onion = OnionAddress::test_v3_from_seed(7).to_string();
 
         t.storage
             .add_contact(&hash, &[7u8; 32], "Delete Me")
@@ -2651,7 +2761,7 @@ mod tests {
         t.storage.save_message(&hash, "in", "secret one").unwrap();
         t.storage.save_message(&hash, "out", "secret two").unwrap();
         t.storage
-            .save_file_record(&file_hash, &hash, "secret.txt", 10, false)
+            .enqueue_outbox(&hash, &onion, b"queued-packet", 100)
             .unwrap();
 
         t.storage
@@ -2661,12 +2771,13 @@ mod tests {
         t.storage.save_message(&other, "in", "keep this").unwrap();
 
         assert_eq!(t.storage.count_messages(&hash).unwrap(), 2);
+        assert_eq!(t.storage.count_outbox().unwrap(), 1);
 
         t.storage.delete_contact(&hash).unwrap();
 
         assert!(t.storage.get_contact(&hash).is_err());
         assert!(t.storage.get_room_messages(&hash, 10).unwrap().is_empty());
-        assert!(t.storage.get_room_files(&hash).unwrap().is_empty());
+        assert_eq!(t.storage.count_outbox().unwrap(), 0);
         assert_eq!(t.storage.count_messages(&hash).unwrap(), 0);
 
         // Второй контакт и его история не затронуты.
@@ -2677,7 +2788,7 @@ mod tests {
         let bytes = read_vault(t.path());
         assert!(!contains(&bytes, b"Delete Me"));
         assert!(!contains(&bytes, b"secret one"));
-        assert!(!contains(&bytes, b"secret.txt"));
+        assert!(!contains(&bytes, b"queued-packet"));
     }
 
     #[cfg(unix)]
@@ -2743,48 +2854,71 @@ mod tests {
     }
 
     #[test]
-    fn ephemeral_file_records_are_not_persisted() {
-        // H-3: метаданные файлов TTL-комнаты не должны попадать на диск.
-        let t = setup();
-        let hash = "9".repeat(64);
-        let file_hash = "a".repeat(64);
+    fn tor_service_credentials_persist_encrypted_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_str().unwrap();
+        let addr = OnionAddress::test_v3_from_seed(11);
+        let secret_blob = "ED25519-V3:super-secret-onion-key-material";
 
-        t.storage.add_contact(&hash, &[9u8; 32], "Ttl").unwrap();
-        t.storage.ensure_room("Ttl", &hash).unwrap();
+        {
+            let vault = Vault::create(base, TEST_PASSWORD).unwrap();
+            let storage = Storage::new(base, vault).unwrap();
+            assert!(storage.load_tor_service().unwrap().is_none());
+            storage
+                .save_tor_service(addr.service_id(), secret_blob)
+                .unwrap();
+        }
 
-        t.storage
-            .save_file_record(&file_hash, &hash, "ephemeral.bin", 7, true)
-            .unwrap();
+        let disk = read_vault(dir.path());
+        assert!(!contains(&disk, secret_blob.as_bytes()));
+        assert!(!contains(&disk, addr.service_id().as_bytes()));
 
-        // Записи нет ни в памяти, ни в расшифрованном снимке.
-        assert!(t.storage.get_file_record(&file_hash).is_err());
-        let key = t.storage.vault.key().unwrap();
-        let snapshot = Storage::decode_container(&key, &read_vault(t.path())).unwrap();
-        assert!(snapshot.files.is_empty());
+        let vault = Vault::unlock(base, TEST_PASSWORD).unwrap();
+        let reopened = Storage::new(base, vault).unwrap();
+        let loaded = reopened.load_tor_service().unwrap().expect("tor service");
+        assert_eq!(loaded.service_id, addr.service_id());
+        assert_eq!(loaded.private_key.expose(), secret_blob);
+        assert_eq!(format!("{:?}", loaded).contains("super-secret"), false);
     }
 
     #[test]
-    fn regular_file_records_are_still_persisted() {
-        // Регрессия: guard не должен срабатывать для обычных комнат.
-        let t = setup();
-        let hash = "b".repeat(64);
-        let file_hash = "c".repeat(64);
+    fn outbox_items_persist_backoff_and_clear() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_str().unwrap();
+        let room = "a".repeat(64);
+        let onion = OnionAddress::test_v3_from_seed(4).to_string();
 
-        t.storage.add_contact(&hash, &[10u8; 32], "Regular").unwrap();
-        t.storage.ensure_room("Regular", &hash).unwrap();
+        let id1 = {
+            let vault = Vault::create(base, TEST_PASSWORD).unwrap();
+            let storage = Storage::new(base, vault).unwrap();
+            let id1 = storage.enqueue_outbox(&room, &onion, b"pkt-1", 100).unwrap();
+            let _id2 = storage.enqueue_outbox(&room, &onion, b"pkt-2", 100).unwrap();
+            assert_eq!(storage.count_outbox().unwrap(), 2);
+            assert!(storage.has_pending_outbox_for_room(&room).unwrap());
+            storage.mark_outbox_retry(id1, 1, 130, "peer offline").unwrap();
+            id1
+        };
 
-        t.storage
-            .save_file_record(&file_hash, &hash, "regular.bin", 11, false)
-            .unwrap();
+        let vault = Vault::unlock(base, TEST_PASSWORD).unwrap();
+        let storage = Storage::new(base, vault).unwrap();
+        assert_eq!(storage.count_outbox().unwrap(), 2);
 
-        let record = t.storage.get_file_record(&file_hash).unwrap();
-        assert_eq!(record.file_name, "regular.bin");
-        assert_eq!(record.file_size, 11);
+        let due_at_110 = storage.due_outbox_items(110).unwrap();
+        assert_eq!(due_at_110.len(), 1);
+        assert_eq!(due_at_110[0].packet, b"pkt-2");
 
-        let key = t.storage.vault.key().unwrap();
-        let snapshot = Storage::decode_container(&key, &read_vault(t.path())).unwrap();
-        assert_eq!(snapshot.files.len(), 1);
-        assert_eq!(snapshot.files[0].file_name, "regular.bin");
+        let due_at_130 = storage.due_outbox_items(130).unwrap();
+        assert_eq!(due_at_130.len(), 2);
+        assert_eq!(due_at_130[0].id, id1);
+        assert_eq!(due_at_130[0].attempts, 1);
+        assert_eq!(due_at_130[0].last_error.as_deref(), Some("peer offline"));
+
+        storage.delete_outbox_item(id1).unwrap();
+        assert_eq!(storage.count_outbox().unwrap(), 1);
+
+        assert_eq!(storage.clear_room_outbox(&room).unwrap(), 1);
+        assert_eq!(storage.count_outbox().unwrap(), 0);
+        assert!(!storage.has_pending_outbox_for_room(&room).unwrap());
     }
 
     #[test]
@@ -2899,24 +3033,26 @@ mod tests {
     fn invalid_identifiers_are_rejected_before_db_write() {
         let t = setup();
         let room = "a".repeat(64);
+        let valid_onion = OnionAddress::test_v3_from_seed(9).to_string();
 
         for bad_hash in ["", "abc", &"я".repeat(64), &"😀".repeat(32)] {
             assert!(
                 t.storage.add_contact(bad_hash, &[1u8; 32], "Bad").is_err(),
                 "invalid contact hash must be rejected"
             );
+            assert!(t
+                .storage
+                .enqueue_outbox(bad_hash, &valid_onion, b"pkt", 100)
+                .is_err());
         }
         assert!(t.storage.get_all_contacts().unwrap().is_empty());
+        assert_eq!(t.storage.count_outbox().unwrap(), 0);
 
         assert!(t
             .storage
-            .save_file_record("not-a-hash", &room, "file.bin", 1, false)
+            .enqueue_outbox(&room, "not-an-onion.com", b"pkt", 100)
             .is_err());
-        assert!(t.storage.get_room_files(&room).unwrap().is_empty());
-
-        assert!(t
-            .storage
-            .save_file_record(&"b".repeat(64), "short-room", "file.bin", 1, false)
-            .is_err());
+        assert!(t.storage.save_tor_service("short", "ED25519-V3:x").is_err());
+        assert_eq!(t.storage.count_outbox().unwrap(), 0);
     }
 }

@@ -1,7 +1,7 @@
 // src/identity/mod.rs
 use crate::crypto::secret::{Ed25519Seed, SecretBytes, SecretString, X25519Priv};
 use crate::storage::SafeFSOps;
-use crate::types::{sanitize_display_text, truncate_display, IdentityHash};
+use crate::types::{sanitize_display_text, truncate_display, IdentityHash, OnionAddress};
 use crate::vault::{self, MasterKey, Vault};
 use anyhow::{anyhow, Result};
 use bip39::Mnemonic;
@@ -21,7 +21,8 @@ pub const IDENTITY_FILE_NAME: &str = "identity.json";
 const IDENTITY_AAD: &[u8] = b"lastchance:identity.json";
 
 /// Версия подписываемого identity-документа.
-pub const IDENTITY_DOC_VERSION: u64 = 1;
+/// v2 включает подписанный Tor v3 `.onion`-адрес (v1 отклоняется fail-closed).
+pub const IDENTITY_DOC_VERSION: u64 = 2;
 /// Максимальная длина ника в identity-документе (UTF-8 байты).
 pub const MAX_NICKNAME_BYTES: usize = 64;
 /// Максимальный размер CBOR-документа в URL (hex-строка).
@@ -32,13 +33,15 @@ const FINGERPRINT_CONTEXT: &[u8] = b"lastchance:identity-fingerprint:v1";
 
 /// Подписываемый документ личности.
 ///
-/// В документ входят оба публичных ключа, поэтому Ed25519-подпись
-/// криптографически связывает X25519-ключ с владельцем Ed25519-ключа.
+/// В документ входят оба публичных ключа и `.onion`-адрес пира, поэтому
+/// Ed25519-подпись криптографически связывает X25519-ключ и Tor-адрес с
+/// владельцем Ed25519-ключа.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdentityDoc {
     pub version: u64,
     pub ed25519_pub: [u8; 32],
     pub x25519_pub: [u8; 32],
+    pub onion: String,
     pub nickname: Option<String>,
     pub created_at: u64,
 }
@@ -48,15 +51,19 @@ impl IdentityDoc {
         version: u64,
         ed25519_pub: [u8; 32],
         x25519_pub: [u8; 32],
+        onion: String,
         nickname: Option<String>,
         created_at: u64,
     ) -> Result<Self> {
         if version != IDENTITY_DOC_VERSION {
             return Err(anyhow!(
-                "unsupported identity document version: {}",
+                "unsupported identity document version {} (P2P requires v2 with signed .onion address)",
                 version
             ));
         }
+        let onion = OnionAddress::parse(&onion)
+            .map_err(|e| anyhow!("invalid .onion address in identity document: {}", e))?
+            .to_string();
         if let Some(name) = nickname.as_deref() {
             if name.len() > MAX_NICKNAME_BYTES {
                 return Err(anyhow!(
@@ -74,15 +81,17 @@ impl IdentityDoc {
             version,
             ed25519_pub,
             x25519_pub,
+            onion,
             nickname,
             created_at,
         })
     }
 
-    /// Создаёт документ из срезов ключей (используется `App`).
+    /// Создаёт документ из срезов ключей и `.onion`-адреса (используется `App`).
     pub fn from_slices(
         ed25519_pub: &[u8],
         x25519_pub: &[u8],
+        onion: &str,
         nickname: Option<String>,
         created_at: u64,
     ) -> Result<Self> {
@@ -96,6 +105,7 @@ impl IdentityDoc {
             IDENTITY_DOC_VERSION,
             ed25519_pub,
             x25519_pub,
+            onion.to_string(),
             nickname,
             created_at,
         )
@@ -108,6 +118,7 @@ impl IdentityDoc {
             ("version", Value::Integer(self.version.into())),
             ("ed25519_pub", Value::Bytes(self.ed25519_pub.to_vec())),
             ("x25519_pub", Value::Bytes(self.x25519_pub.to_vec())),
+            ("onion", Value::Text(self.onion.clone())),
             ("created_at", Value::Integer(self.created_at.into())),
         ];
         if let Some(nickname) = self.nickname.as_deref() {
@@ -151,6 +162,7 @@ impl IdentityDoc {
         let mut version = None;
         let mut ed25519_pub = None;
         let mut x25519_pub = None;
+        let mut onion = None;
         let mut nickname = None;
         let mut created_at = None;
 
@@ -166,6 +178,12 @@ impl IdentityDoc {
                 "version" => version = Some(cbor_u64(value, key)?),
                 "ed25519_pub" => ed25519_pub = Some(cbor_bytes32(value, key)?),
                 "x25519_pub" => x25519_pub = Some(cbor_bytes32(value, key)?),
+                "onion" => {
+                    let text = value
+                        .as_text()
+                        .ok_or_else(|| anyhow!("onion must be a text string"))?;
+                    onion = Some(text.to_string());
+                }
                 "nickname" => {
                     let text = value
                         .as_text()
@@ -177,10 +195,19 @@ impl IdentityDoc {
             }
         }
 
+        let version = version.ok_or_else(|| anyhow!("identity document is missing version"))?;
+        if version != IDENTITY_DOC_VERSION {
+            return Err(anyhow!(
+                "unsupported identity document version {} (P2P requires v2 with signed .onion address)",
+                version
+            ));
+        }
+
         let doc = Self::new(
-            version.ok_or_else(|| anyhow!("identity document is missing version"))?,
+            version,
             ed25519_pub.ok_or_else(|| anyhow!("identity document is missing ed25519_pub"))?,
             x25519_pub.ok_or_else(|| anyhow!("identity document is missing x25519_pub"))?,
+            onion.ok_or_else(|| anyhow!("identity document is missing .onion address"))?,
             nickname,
             created_at.ok_or_else(|| anyhow!("identity document is missing created_at"))?,
         )?;
@@ -242,6 +269,10 @@ impl IdentityInvite {
         self.doc.fingerprint_hex()
     }
 
+    pub fn onion_addr(&self) -> &str {
+        &self.doc.onion
+    }
+
     pub fn display_nickname(&self) -> String {
         self.doc
             .nickname
@@ -259,6 +290,7 @@ impl IdentityInvite {
         let hash = self.hash_hex();
         let x25519 = hex::encode(self.doc.x25519_pub);
         let ed25519 = hex::encode(self.doc.ed25519_pub);
+        let onion = self.doc.onion.as_str();
 
         let mut params = vec![
             ("hash", hash.as_str()),
@@ -266,6 +298,7 @@ impl IdentityInvite {
             ("sig", sig_hex.as_str()),
             ("x25519", x25519.as_str()),
             ("ed25519", ed25519.as_str()),
+            ("onion", onion),
         ];
         if let Some(nickname) = self.doc.nickname.as_deref() {
             params.push(("nickname", nickname));
@@ -280,8 +313,8 @@ impl IdentityInvite {
 
     /// Разбирает и полностью проверяет invite-ссылку.
     ///
-    /// Ссылка без `doc`/`sig` (старый формат) отклоняется: иначе подмена
-    /// X25519-ключа в URL оставалась бы незамеченной.
+    /// Ссылка без `doc`/`sig`, версии v1 или без валидного подписанного
+    /// `.onion`-адреса отклоняется (fail-closed).
     pub fn from_link(raw: &str) -> Result<Self> {
         let params_str = raw
             .strip_prefix(INVITE_PREFIX)
@@ -299,8 +332,6 @@ impl IdentityInvite {
             .get("hash")
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow!("invite is missing identity hash"))?;
-        // Валидация до сравнения и любых срезов: не-ASCII/короткая строка
-        // не должна доходить до бизнес-логики.
         let hash_id = IdentityHash::from_hex(hash).map_err(|e| {
             anyhow!(
                 "invalid identity hash in invite ({}…, {} chars): {}",
@@ -341,6 +372,18 @@ impl IdentityInvite {
                 "identity hash mismatch: link has {}, but sha256(ed25519_pub) is {}",
                 hash_id,
                 computed_hash
+            ));
+        }
+
+        let onion_param = params
+            .get("onion")
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("invite is missing peer .onion address"))?;
+        let parsed_onion = OnionAddress::parse(onion_param)
+            .map_err(|e| anyhow!("invalid .onion address in invite: {}", e))?;
+        if parsed_onion.as_str() != invite.doc.onion {
+            return Err(anyhow!(
+                "onion address in link does not match the signed identity document"
             ));
         }
 
@@ -875,11 +918,16 @@ mod tests {
         assert!(Identity::from_mnemonic(invalid, "").is_err());
     }
 
+    fn test_onion(seed: u8) -> String {
+        OnionAddress::test_v3_from_seed(seed).to_string()
+    }
+
     fn test_doc(x25519_byte: u8) -> IdentityDoc {
         IdentityDoc::new(
-            1,
+            IDENTITY_DOC_VERSION,
             [7u8; 32],
             [x25519_byte; 32],
+            test_onion(x25519_byte),
             Some("alice".to_string()),
             1_700_000_000,
         )
@@ -891,10 +939,10 @@ mod tests {
         let doc = test_doc(9);
         let cbor = doc.canonical_cbor().unwrap();
 
-        // 5 entries; the first key is "version" (shortest encoded key).
-        assert_eq!(cbor[0], 0xa5);
-        assert_eq!(&cbor[1..2], &[0x67]);
-        assert_eq!(&cbor[2..9], b"version");
+        // 6 entries; the first key is "onion" (5 bytes, shortest encoded key).
+        assert_eq!(cbor[0], 0xa6);
+        assert_eq!(&cbor[1..2], &[0x65]);
+        assert_eq!(&cbor[2..7], b"onion");
 
         assert_eq!(IdentityDoc::from_canonical_cbor(&cbor).unwrap(), doc);
     }
@@ -914,6 +962,10 @@ mod tests {
             (
                 Value::Text("version".to_string()),
                 Value::Integer(doc.version.into()),
+            ),
+            (
+                Value::Text("onion".to_string()),
+                Value::Text(doc.onion.clone()),
             ),
             (
                 Value::Text("created_at".to_string()),
@@ -940,19 +992,22 @@ mod tests {
         invite.verify().unwrap();
 
         let link = invite.to_link().unwrap();
+        assert!(link.contains(&format!("onion={}", doc.onion)));
         let parsed = IdentityInvite::from_link(&link).unwrap();
         assert_eq!(parsed, invite);
         assert_eq!(parsed.hash_hex(), doc.hash_hex());
         assert_eq!(parsed.fingerprint_hex(), doc.fingerprint_hex());
+        assert_eq!(parsed.onion_addr(), doc.onion);
     }
 
     #[test]
     fn signed_invite_without_nickname_round_trips() {
         let signing_key = SigningKey::from_bytes(&[8u8; 32]);
         let doc = IdentityDoc::new(
-            1,
+            IDENTITY_DOC_VERSION,
             *signing_key.verifying_key().as_bytes(),
             [9u8; 32],
+            test_onion(9),
             None,
             7,
         )
@@ -964,6 +1019,60 @@ mod tests {
         let parsed = IdentityInvite::from_link(&link).unwrap();
         assert_eq!(parsed.doc.nickname, None);
         assert!(parsed.display_nickname().starts_with("user_"));
+    }
+
+    #[test]
+    fn invite_rejects_v1_server_document_and_tampered_onion() {
+        let signing_key = SigningKey::from_bytes(&[12u8; 32]);
+        // Собираем канонический v1-документ (без onion).
+        let v1_map = Value::Map(vec![
+            (Value::Text("version".to_string()), Value::Integer(1.into())),
+            (
+                Value::Text("created_at".to_string()),
+                Value::Integer(10.into()),
+            ),
+            (
+                Value::Text("ed25519_pub".to_string()),
+                Value::Bytes(signing_key.verifying_key().as_bytes().to_vec()),
+            ),
+            (
+                Value::Text("x25519_pub".to_string()),
+                Value::Bytes(vec![5u8; 32]),
+            ),
+        ]);
+        let mut v1_cbor = Vec::new();
+        ciborium::ser::into_writer(&v1_map, &mut v1_cbor).unwrap();
+        let sig = signing_key.sign(&v1_cbor);
+        let hash = hash_ed25519_public(signing_key.verifying_key().as_bytes());
+        let v1_link = format!(
+            "lastchance://contact?hash={}&doc={}&sig={}",
+            hash,
+            hex::encode(&v1_cbor),
+            hex::encode(sig.to_bytes())
+        );
+        let err = IdentityInvite::from_link(&v1_link).unwrap_err();
+        assert!(
+            err.to_string().contains("version 1"),
+            "unexpected error for v1 invite: {err}"
+        );
+
+        // Валидный v2 инвайт с подменённым query-параметром onion= отклоняется.
+        let doc = IdentityDoc::from_slices(
+            signing_key.verifying_key().as_bytes(),
+            &[5u8; 32],
+            &test_onion(15),
+            Some("bob".to_string()),
+            10,
+        )
+        .unwrap();
+        let invite = IdentityInvite::sign(doc, &signing_key).unwrap();
+        let link = invite.to_link().unwrap();
+        let tampered_onion = link.replacen(&test_onion(15), &test_onion(16), 1);
+        assert!(IdentityInvite::from_link(&tampered_onion).is_err());
+
+        // Инвайт с удалённым query-параметром onion= отклоняется.
+        let without_onion = link.replace(&format!("&onion={}", test_onion(15)), "");
+        assert!(IdentityInvite::from_link(&without_onion).is_err());
     }
 
     #[test]

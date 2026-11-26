@@ -40,7 +40,7 @@ use lastchance::network::config::notify_level_label;
 use lastchance::storage::{
     Storage, LEGACY_DB_FILE_NAME, TOFU_CHANGED, TOFU_PENDING, TOFU_VERIFIED, VAULT_FILE_NAME,
 };
-use lastchance::types::{parse_file_notification, sanitize_display_text, short_hash};
+use lastchance::types::{sanitize_display_text, short_hash, truncate_display};
 use lastchance::{get_base_dir_with_override, vault, App, AppEvent, Config, TtlSyncOutcome, Vault};
 
 // ============================================================
@@ -68,34 +68,6 @@ struct ChatEntry {
     label: String,
 }
 
-/// Метаданные файла, полученного (или отправленного) в текущей сессии.
-#[derive(Clone, Debug)]
-struct FileEntry {
-    /// Короткий порядковый номер для `/dl <id>`.
-    id: usize,
-    room_hash: String,
-    file_hash: String,
-    /// Идентификатор конверта из E2E-уведомления (если оно нового формата).
-    file_id: Option<String>,
-    file_name: String,
-    /// Время сообщения о файле (unix timestamp) — чтобы выбрать последний.
-    timestamp: i64,
-}
-
-/// Состояние циклического автодополнения аргумента по Tab (`/dl`, `/sf`).
-struct CompletionCycle {
-    /// Начало дополняемого слова во вводе.
-    start: usize,
-    /// Индекс текущего кандидата.
-    index: usize,
-    /// Токены для подстановки (`#1`, `#2`, ... или пути).
-    candidates: Vec<String>,
-    /// Человекочитаемые подписи для статус-бара.
-    labels: Vec<String>,
-    /// Токен, который сейчас вставлен в поле ввода.
-    last_insert: String,
-}
-
 /// Команды, доступные для автодополнения по Tab (канонические имена).
 const COMMANDS: &[&str] = &[
     "/help",
@@ -112,8 +84,6 @@ const COMMANDS: &[&str] = &[
     "/ttl-syn",
     "/ttl-syn-retry",
     "/ratchet-reset",
-    "/sendfile",
-    "/download",
     "/nick",
     "/rename",
     "/set",
@@ -147,14 +117,12 @@ struct UiState {
     history_index: Option<usize>,
     /// Черновик, сохранённый при входе в историю.
     history_draft: String,
-    /// Файлы, встреченные в этой сессии (для умного `/dl`).
-    files: Vec<FileEntry>,
-    /// Следующий порядковый номер файла.
-    next_file_id: usize,
-    /// Циклическое дополнение `/dl` по Tab.
-    dl_cycle: Option<CompletionCycle>,
-    /// Циклическое дополнение путей `/sf` по Tab.
-    sf_cycle: Option<CompletionCycle>,
+    /// Признак активного подключения к Tor ControlPort.
+    tor_connected: bool,
+    /// Наш `.onion` v3-адрес (когда сервис опубликован или загружен из vault).
+    own_onion: Option<String>,
+    /// Число зашифрованных пакетов, ожидающих отправки в Outbox.
+    outbox_pending: usize,
     /// Долгоживущий объект буфера обмена: на X11 он остаётся владельцем
     /// selection, пока жив процесс, поэтому вставка в других окнах работает.
     clipboard: Option<arboard::Clipboard>,
@@ -252,11 +220,11 @@ impl RecoveryFlow {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SettingField {
-    ServerUrl,
-    FileServerUrl,
-    HeaderName,
-    HeaderValue,
-    ProxyUrl,
+    TorControlAddr,
+    TorSocksAddr,
+    TorCookiePath,
+    P2pLocalPort,
+    P2pOnionPort,
     NotifyLevel,
     StealthTitle,
     StealthBody,
@@ -265,11 +233,11 @@ enum SettingField {
 }
 
 const SETTINGS_FIELDS: [SettingField; 10] = [
-    SettingField::ServerUrl,
-    SettingField::FileServerUrl,
-    SettingField::HeaderName,
-    SettingField::HeaderValue,
-    SettingField::ProxyUrl,
+    SettingField::TorControlAddr,
+    SettingField::TorSocksAddr,
+    SettingField::TorCookiePath,
+    SettingField::P2pLocalPort,
+    SettingField::P2pOnionPort,
     SettingField::NotifyLevel,
     SettingField::StealthTitle,
     SettingField::StealthBody,
@@ -281,11 +249,11 @@ impl SettingField {
     fn label(self, lang: Lang) -> &'static str {
         let texts = lang.texts();
         match self {
-            SettingField::ServerUrl => texts.label_text_api,
-            SettingField::FileServerUrl => texts.label_file_api,
-            SettingField::HeaderName => texts.label_guard_name,
-            SettingField::HeaderValue => texts.label_guard_value,
-            SettingField::ProxyUrl => texts.label_proxy,
+            SettingField::TorControlAddr => texts.label_tor_control,
+            SettingField::TorSocksAddr => texts.label_tor_socks,
+            SettingField::TorCookiePath => texts.label_tor_cookie,
+            SettingField::P2pLocalPort => texts.label_p2p_local_port,
+            SettingField::P2pOnionPort => texts.label_p2p_onion_port,
             SettingField::NotifyLevel => texts.label_notify,
             SettingField::StealthTitle => texts.label_stealth_title,
             SettingField::StealthBody => texts.label_stealth_body,
@@ -300,7 +268,7 @@ impl SettingField {
     }
 
     fn is_masked(self) -> bool {
-        matches!(self, SettingField::HeaderValue)
+        false
     }
 }
 
@@ -340,6 +308,7 @@ struct ContactRow {
     nickname: String,
     x25519: String,
     ed25519: Option<String>,
+    onion_addr: Option<String>,
     fingerprint: Option<String>,
     tofu_state: String,
     messages: usize,
@@ -444,16 +413,15 @@ struct WelcomeFlow {
 }
 
 /// Модальное окно настроек `/set`.
-/// Значение защитного заголовка не показывается на экране.
 struct SettingsFlow {
     selected: usize,
     editing: bool,
-    server_url: String,
-    file_server_url: String,
-    header_name: String,
-    header_value: Zeroizing<String>,
-    /// Пустая строка означает «прокси не используется».
-    proxy_url: String,
+    tor_control_addr: String,
+    tor_socks_addr: String,
+    /// Пустая строка означает автоматический поиск cookie через `PROTOCOLINFO`.
+    tor_cookie_path: String,
+    p2p_local_port: String,
+    p2p_onion_port: String,
     notify_level: u8,
     stealth_title: String,
     stealth_body: String,
@@ -466,11 +434,11 @@ impl SettingsFlow {
         Self {
             selected: 0,
             editing: false,
-            server_url: config.server_url.clone(),
-            file_server_url: config.file_server_url.clone(),
-            header_name: config.mask_header_name.clone(),
-            header_value: Zeroizing::new(config.mask_header_value.clone()),
-            proxy_url: config.proxy_url.clone().unwrap_or_default(),
+            tor_control_addr: config.tor_control_addr.clone(),
+            tor_socks_addr: config.tor_socks_addr.clone(),
+            tor_cookie_path: config.tor_cookie_path.clone().unwrap_or_default(),
+            p2p_local_port: config.p2p_local_port.to_string(),
+            p2p_onion_port: config.p2p_onion_port.to_string(),
             notify_level: config.notify_level,
             stealth_title: config.stealth_title.clone(),
             stealth_body: config.stealth_body.clone(),
@@ -509,11 +477,11 @@ impl SettingsFlow {
 
     fn edit_value(&self, field: SettingField) -> String {
         match field {
-            SettingField::ServerUrl => self.server_url.clone(),
-            SettingField::FileServerUrl => self.file_server_url.clone(),
-            SettingField::HeaderName => self.header_name.clone(),
-            SettingField::HeaderValue => self.header_value.to_string(),
-            SettingField::ProxyUrl => self.proxy_url.clone(),
+            SettingField::TorControlAddr => self.tor_control_addr.clone(),
+            SettingField::TorSocksAddr => self.tor_socks_addr.clone(),
+            SettingField::TorCookiePath => self.tor_cookie_path.clone(),
+            SettingField::P2pLocalPort => self.p2p_local_port.clone(),
+            SettingField::P2pOnionPort => self.p2p_onion_port.clone(),
             SettingField::NotifyLevel => self.notify_level.to_string(),
             SettingField::StealthTitle => self.stealth_title.clone(),
             SettingField::StealthBody => self.stealth_body.clone(),
@@ -525,24 +493,24 @@ impl SettingsFlow {
     fn apply_edit(&mut self, field: SettingField, raw: &str) {
         let value = raw.trim();
         match field {
-            SettingField::ServerUrl if !value.is_empty() => {
-                self.server_url = value.to_string();
+            SettingField::TorControlAddr if !value.is_empty() => {
+                self.tor_control_addr = value.to_string();
             }
-            SettingField::FileServerUrl if !value.is_empty() => {
-                self.file_server_url = value.to_string();
+            SettingField::TorSocksAddr if !value.is_empty() => {
+                self.tor_socks_addr = value.to_string();
             }
-            SettingField::HeaderName if !value.is_empty() => {
-                self.header_name = value.to_string();
-            }
-            SettingField::HeaderValue if !value.is_empty() => {
-                self.header_value = Zeroizing::new(value.to_string());
-            }
-            SettingField::ProxyUrl => {
-                self.proxy_url = if value == "-" || value.eq_ignore_ascii_case("none") {
+            SettingField::TorCookiePath => {
+                self.tor_cookie_path = if value == "-" || value.eq_ignore_ascii_case("none") {
                     String::new()
                 } else {
                     value.to_string()
                 };
+            }
+            SettingField::P2pLocalPort if value.parse::<u16>().is_ok() => {
+                self.p2p_local_port = value.to_string();
+            }
+            SettingField::P2pOnionPort if value.parse::<u16>().is_ok_and(|p| p > 0) => {
+                self.p2p_onion_port = value.to_string();
             }
             SettingField::StealthTitle if !value.is_empty() => {
                 self.stealth_title = value.to_string();
@@ -560,17 +528,23 @@ impl SettingsFlow {
 
     fn display_value(&self, field: SettingField) -> String {
         match field {
-            SettingField::ServerUrl => self.server_url.clone(),
-            SettingField::FileServerUrl => self.file_server_url.clone(),
-            SettingField::HeaderName => self.header_name.clone(),
-            SettingField::HeaderValue => "********".to_string(),
-            SettingField::ProxyUrl => {
-                if self.proxy_url.trim().is_empty() {
-                    self.lang.texts().direct_connection.to_string()
+            SettingField::TorControlAddr => self.tor_control_addr.clone(),
+            SettingField::TorSocksAddr => self.tor_socks_addr.clone(),
+            SettingField::TorCookiePath => {
+                if self.tor_cookie_path.trim().is_empty() {
+                    self.lang.texts().cookie_auto.to_string()
                 } else {
-                    self.proxy_url.clone()
+                    self.tor_cookie_path.clone()
                 }
             }
+            SettingField::P2pLocalPort => {
+                if self.p2p_local_port.trim() == "0" {
+                    self.lang.texts().port_auto.to_string()
+                } else {
+                    self.p2p_local_port.clone()
+                }
+            }
+            SettingField::P2pOnionPort => self.p2p_onion_port.clone(),
             SettingField::NotifyLevel => self.lang.notify_level_label(self.notify_level).to_string(),
             SettingField::StealthTitle => self.stealth_title.clone(),
             SettingField::StealthBody => self.stealth_body.clone(),
@@ -581,15 +555,19 @@ impl SettingsFlow {
 
     fn to_config(&self) -> Config {
         let mut config = Config {
-            server_url: self.server_url.clone(),
-            file_server_url: self.file_server_url.clone(),
-            mask_header_name: self.header_name.clone(),
-            mask_header_value: self.header_value.to_string(),
-            proxy_url: if self.proxy_url.trim().is_empty() {
+            tor_control_addr: self.tor_control_addr.clone(),
+            tor_socks_addr: self.tor_socks_addr.clone(),
+            tor_cookie_path: if self.tor_cookie_path.trim().is_empty() {
                 None
             } else {
-                Some(self.proxy_url.clone())
+                Some(self.tor_cookie_path.clone())
             },
+            p2p_local_port: self.p2p_local_port.trim().parse::<u16>().unwrap_or(0),
+            p2p_onion_port: self
+                .p2p_onion_port
+                .trim()
+                .parse::<u16>()
+                .unwrap_or(lastchance::network::config::DEFAULT_P2P_ONION_PORT),
             notify_level: self.notify_level,
             stealth_title: self.stealth_title.clone(),
             stealth_body: self.stealth_body.clone(),
@@ -641,10 +619,9 @@ impl UiState {
             history: VecDeque::new(),
             history_index: None,
             history_draft: String::new(),
-            files: Vec::new(),
-            next_file_id: 0,
-            dl_cycle: None,
-            sf_cycle: None,
+            tor_connected: app.is_tor_connected(),
+            own_onion: app.own_onion_addr(),
+            outbox_pending: app.outbox_pending_count(),
             clipboard,
             needs_clear: false,
             is_terminal_focused: true,
@@ -884,9 +861,6 @@ fn load_room_feed(app: &App, state: &mut UiState) -> Vec<FeedEntry> {
         return Vec::new();
     }
 
-    let room_title = state.room_label.clone();
-    let nickname = state.nickname.clone();
-
     match app.get_messages(&room, 300) {
         Ok(messages) => messages
             .into_iter()
@@ -898,33 +872,7 @@ fn load_room_feed(app: &App, state: &mut UiState) -> Vec<FeedEntry> {
                     FeedKind::Incoming
                 };
                 let time = m.timestamp.format("%H:%M:%S").to_string();
-
-                let text = match parse_file_notification(&m.text) {
-                    Some(notification) => {
-                        let id = register_file(
-                            state,
-                            &room,
-                            &notification.file_name,
-                            &notification.file_hash,
-                            notification.file_id.as_deref(),
-                            m.timestamp.timestamp(),
-                        );
-                        let sender = if outgoing {
-                            nickname.as_str()
-                        } else {
-                            room_title.as_str()
-                        };
-                        file_feed_line(
-                            &time,
-                            sender,
-                            id,
-                            &notification.file_name,
-                            outgoing,
-                            state.lang,
-                        )
-                    }
-                    None => format!("[{}] {}", time, m.text),
-                };
+                let text = format!("[{}] {}", time, m.text);
 
                 FeedEntry {
                     kind,
@@ -941,195 +889,6 @@ fn load_room_feed(app: &App, state: &mut UiState) -> Vec<FeedEntry> {
             ),
             expires_at: None,
         }],
-    }
-}
-
-/// Регистрирует файл в состоянии сессии и возвращает его короткий номер.
-fn register_file(
-    state: &mut UiState,
-    room_hash: &str,
-    file_name: &str,
-    file_hash: &str,
-    file_id: Option<&str>,
-    timestamp: i64,
-) -> usize {
-    if let Some(existing) = state
-        .files
-        .iter_mut()
-        .find(|f| f.room_hash == room_hash && f.file_hash == file_hash)
-    {
-        existing.timestamp = timestamp;
-        if let Some(file_id) = file_id {
-            existing.file_id = Some(file_id.to_string());
-        }
-        return existing.id;
-    }
-
-    state.next_file_id += 1;
-    let id = state.next_file_id;
-    state.files.push(FileEntry {
-        id,
-        room_hash: room_hash.to_string(),
-        file_hash: file_hash.to_string(),
-        file_id: file_id.map(str::to_string),
-        file_name: sanitize_display_text(file_name),
-        timestamp,
-    });
-    id
-}
-
-fn file_feed_line(
-    time: &str,
-    sender: &str,
-    id: usize,
-    file_name: &str,
-    outgoing: bool,
-    lang: Lang,
-) -> String {
-    let texts = lang.texts();
-    let id = id.to_string();
-    if outgoing {
-        tr(
-            texts.file_sent_out,
-            &[time, &id, file_name, &id],
-        )
-    } else {
-        tr(
-            texts.file_sent_in,
-            &[time, sender, &id, file_name, &id],
-        )
-    }
-}
-
-fn file_matches(file: &FileEntry, token: &str) -> bool {
-    let token = token.trim();
-    if token.is_empty() {
-        return true;
-    }
-    let bare = token.strip_prefix('#').unwrap_or(token);
-
-    if let Ok(id) = bare.parse::<usize>() {
-        if file.id == id {
-            return true;
-        }
-    }
-
-    if file.file_name.eq_ignore_ascii_case(bare) || file.file_hash.eq_ignore_ascii_case(bare) {
-        return true;
-    }
-
-    let lower = bare.to_lowercase();
-    file.file_name.to_lowercase().starts_with(&lower)
-        || file.file_hash.to_lowercase().starts_with(&lower)
-}
-
-/// Ищет файл сначала в текущей комнате, затем среди всех файлов сессии.
-fn find_file<'a>(files: &'a [FileEntry], room: &str, token: &str) -> Option<&'a FileEntry> {
-    files
-        .iter()
-        .filter(|f| f.room_hash == room)
-        .find(|f| file_matches(f, token))
-        .or_else(|| files.iter().find(|f| file_matches(f, token)))
-}
-
-/// Не даёт имени файла выйти за пределы папки сохранения.
-fn safe_file_name(file_name: &str) -> String {
-    let base = file_name
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(file_name)
-        .replace('\0', "");
-    let base = sanitize_display_text(&base);
-    let base = base.trim();
-
-    if base.is_empty() || base == "." || base == ".." {
-        "download".to_string()
-    } else {
-        base.to_string()
-    }
-}
-
-/// Выбирает путь сохранения: аргумент-папка, аргумент-файл или ./downloads/<name>.
-fn resolve_save_path(target: Option<&str>, file_name: &str, lang: Lang) -> Result<PathBuf> {
-    let file_name = safe_file_name(file_name);
-    let create_failed = lang.texts().create_dir_failed;
-
-    let path = match target.map(str::trim).filter(|s| !s.is_empty()) {
-        None => {
-            let dir = PathBuf::from("./downloads");
-            std::fs::create_dir_all(&dir).map_err(|e| {
-                anyhow!(
-                    "{}",
-                    tr(create_failed, &[&dir.display().to_string(), &e.to_string()])
-                )
-            })?;
-            dir.join(file_name)
-        }
-        Some(raw) => {
-            let candidate = PathBuf::from(raw);
-            let looks_like_dir =
-                candidate.is_dir() || raw.ends_with('/') || raw.ends_with('\\');
-
-            if looks_like_dir {
-                std::fs::create_dir_all(&candidate).map_err(|e| {
-                    anyhow!(
-                        "{}",
-                        tr(
-                            create_failed,
-                            &[&candidate.display().to_string(), &e.to_string()]
-                        )
-                    )
-                })?;
-                candidate.join(file_name)
-            } else {
-                if let Some(parent) = candidate.parent() {
-                    if !parent.as_os_str().is_empty() {
-                        std::fs::create_dir_all(parent).map_err(|e| {
-                            anyhow!(
-                                "{}",
-                                tr(
-                                    create_failed,
-                                    &[&parent.display().to_string(), &e.to_string()]
-                                )
-                            )
-                        })?;
-                    }
-                }
-                candidate
-            }
-        }
-    };
-
-    Ok(path)
-}
-
-/// Разворачивает `~` и `~/...` в домашнюю директорию.
-fn expand_tilde(raw: &str) -> PathBuf {
-    if raw == "~" {
-        if let Some(home) = dirs::home_dir() {
-            return home;
-        }
-    } else if let Some(rest) = raw.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
-    }
-    PathBuf::from(raw)
-}
-
-/// Превращает путь пользователя в абсолютный от текущей рабочей директории.
-fn absolute_user_path(raw: &str, lang: Lang) -> Result<PathBuf> {
-    let expanded = expand_tilde(raw);
-    if expanded.is_absolute() {
-        Ok(expanded)
-    } else {
-        let cwd = std::env::current_dir().map_err(|e| {
-            anyhow!(
-                "{}",
-                tr(lang.texts().cwd_failed, &[&e.to_string()])
-            )
-        })?;
-        Ok(cwd.join(expanded))
     }
 }
 
@@ -1259,8 +1018,6 @@ fn normalize_command(cmd: &str) -> &str {
         "/ls" | "/c" => "/contacts",
         "/cnt" => "/contacts",
         "/r" => "/room",
-        "/sf" => "/sendfile",
-        "/dl" => "/download",
         "/p" => "/profile",
         "/h" | "/?" => "/help",
         "/sb" => "/sidebar",
@@ -1277,8 +1034,6 @@ fn alias_to_command(cmd: &str) -> Option<&'static str> {
         "/ls" | "/c" => Some("/contacts"),
         "/cnt" => Some("/contacts"),
         "/r" => Some("/room"),
-        "/sf" => Some("/sendfile"),
-        "/dl" => Some("/download"),
         "/p" => Some("/profile"),
         "/h" | "/?" => Some("/help"),
         "/sb" => Some("/sidebar"),
@@ -1689,35 +1444,6 @@ fn complete_input(app: &App, state: &mut UiState) {
         .unwrap_or(0);
     let first = before.split_whitespace().next().unwrap_or("");
     let command = normalize_command(first);
-    let words_before = before[..word_start].split_whitespace().count();
-    let prefix_parts: Vec<&str> = before[..word_start].split_whitespace().collect();
-
-    // /dl <Tab> или /download <Tab> — перебираем файлы текущей комнаты.
-    // Второй и последующие аргументы (путь сохранения) не дополняем.
-    if command == "/download" && word_start > 0 && words_before == 1 {
-        complete_download(state, word_start);
-        return;
-    }
-
-    // /sf <Tab> или /sendfile <Tab> — пути от текущей директории.
-    if command == "/sendfile" && word_start > 0 {
-        let current = &before[word_start..];
-
-        // Первый аргумент может быть флагом --force.
-        if words_before == 1 && !current.is_empty() && "--force".starts_with(current) {
-            replace_input_before_cursor(state, word_start, "--force ");
-            state.sf_cycle = None;
-            state.status = state.lang.texts().comp_force.to_string();
-            return;
-        }
-
-        let path_arg = words_before == 1
-            || (words_before == 2 && prefix_parts.get(1) == Some(&"--force"));
-        if path_arg {
-            complete_sendfile(state, word_start);
-            return;
-        }
-    }
 
     // /room <Tab> или /r <Tab> — дополняем контакт.
     if command == "/room" && word_start > 0 {
@@ -1734,7 +1460,7 @@ fn complete_input(app: &App, state: &mut UiState) {
 fn complete_command(state: &mut UiState) {
     let before = state.input[..state.cursor].to_string();
 
-    // Точный алиас (/r, /q, /sf...) сразу раскрывается в каноническую команду.
+    // Точный алиас (/r, /q, /in...) сразу раскрывается в каноническую команду.
     if let Some(target) = alias_to_command(&before) {
         replace_input_before_cursor(state, 0, target);
         state.status = tr(state.lang.texts().comp_command, &[target]);
@@ -1762,228 +1488,6 @@ fn complete_command(state: &mut UiState) {
             );
             state.status = tr(texts.comp_variants, &[&matches.len().to_string()]);
         }
-    }
-}
-
-fn dl_status(lang: Lang, index: usize, total: usize, label: &str) -> String {
-    let texts = lang.texts();
-    if total > 1 {
-        let current = (index + 1).to_string();
-        let total = total.to_string();
-        tr(texts.dl_status_many, &[&current, &total, label])
-    } else {
-        tr(texts.dl_status_one, &[label])
-    }
-}
-
-fn complete_download(state: &mut UiState, word_start: usize) {
-    let before = state.input[..state.cursor].to_string();
-    let current = before[word_start..].to_string();
-
-    // Повторный Tab по уже подставленному токену листает кандидатов.
-    if let Some(cycle) = state.dl_cycle.take() {
-        if cycle.start == word_start
-            && cycle.last_insert == current
-            && !cycle.candidates.is_empty()
-        {
-            let index = (cycle.index + 1) % cycle.candidates.len();
-            let token = cycle.candidates[index].clone();
-            let label = cycle
-                .labels
-                .get(index)
-                .cloned()
-                .unwrap_or_else(|| token.clone());
-            let total = cycle.candidates.len();
-
-            replace_input_before_cursor(state, word_start, &token);
-            state.status = dl_status(state.lang, index, total, &label);
-            state.dl_cycle = Some(CompletionCycle {
-                start: word_start,
-                index,
-                candidates: cycle.candidates,
-                labels: cycle.labels,
-                last_insert: token,
-            });
-            return;
-        }
-    }
-
-    let files: Vec<FileEntry> = state
-        .files
-        .iter()
-        .filter(|f| f.room_hash == state.room)
-        .cloned()
-        .collect();
-
-    if files.is_empty() {
-        state.status = state.lang.texts().dl_no_files_room.to_string();
-        return;
-    }
-
-    let matching: Vec<&FileEntry> = if current.trim().is_empty() {
-        files.iter().collect()
-    } else {
-        files.iter().filter(|f| file_matches(f, &current)).collect()
-    };
-
-    if matching.is_empty() {
-        state.status = tr(state.lang.texts().dl_no_match, &[&current]);
-        return;
-    }
-
-    let candidates: Vec<String> = matching.iter().map(|f| format!("#{}", f.id)).collect();
-    let labels: Vec<String> = matching
-        .iter()
-        .map(|f| format!("#{} {}", f.id, f.file_name))
-        .collect();
-
-    let token = candidates[0].clone();
-    let label = labels[0].clone();
-    let total = candidates.len();
-
-    replace_input_before_cursor(state, word_start, &token);
-    state.status = dl_status(state.lang, 0, total, &label);
-    state.dl_cycle = Some(CompletionCycle {
-        start: word_start,
-        index: 0,
-        candidates,
-        labels,
-        last_insert: token,
-    });
-}
-
-fn path_status(lang: Lang, index: usize, total: usize, label: &str) -> String {
-    let texts = lang.texts();
-    if total > 1 {
-        let current = (index + 1).to_string();
-        let total = total.to_string();
-        tr(texts.path_status_many, &[&current, &total, label])
-    } else {
-        tr(texts.path_status_one, &[label])
-    }
-}
-
-fn complete_sendfile(state: &mut UiState, word_start: usize) {
-    let before = state.input[..state.cursor].to_string();
-    let current = before[word_start..].to_string();
-
-    // Повторный Tab листает файлы. Папки не листаем: Tab по папке входит внутрь.
-    if let Some(cycle) = state.sf_cycle.take() {
-        if cycle.start == word_start
-            && cycle.last_insert == current
-            && !cycle.candidates.is_empty()
-        {
-            let index = (cycle.index + 1) % cycle.candidates.len();
-            let token = cycle.candidates[index].clone();
-            let label = cycle
-                .labels
-                .get(index)
-                .cloned()
-                .unwrap_or_else(|| token.clone());
-            let total = cycle.candidates.len();
-
-            replace_input_before_cursor(state, word_start, &token);
-            if token.ends_with('/') {
-                state.status = tr(state.lang.texts().sf_folder, &[&label]);
-            } else {
-                state.status = path_status(state.lang, index, total, &label);
-                state.sf_cycle = Some(CompletionCycle {
-                    start: word_start,
-                    index,
-                    candidates: cycle.candidates,
-                    labels: cycle.labels,
-                    last_insert: token,
-                });
-            }
-            return;
-        }
-    }
-
-    // Отдельно обрабатываем `~`, чтобы не читать текущую директорию.
-    if current == "~" {
-        replace_input_before_cursor(state, word_start, "~/");
-        state.sf_cycle = None;
-        state.status = state.lang.texts().sf_home.to_string();
-        return;
-    }
-
-    // Разделяем введённое на уже набранную папку и префикс имени.
-    let (dir_part, name_part) = match current.rfind('/') {
-        Some(pos) => (&current[..=pos], &current[pos + 1..]),
-        None => ("", current.as_str()),
-    };
-
-    let dir_for_read = if dir_part.is_empty() { "." } else { dir_part };
-    let dir_path = match absolute_user_path(dir_for_read, state.lang) {
-        Ok(path) => path,
-        Err(e) => {
-            state.status = format!("{:#}", e);
-            return;
-        }
-    };
-
-    let entries = match std::fs::read_dir(&dir_path) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-            state.status = tr(state.lang.texts().sf_permission, &[&dir_path.display().to_string()]);
-            return;
-        }
-        Err(e) => {
-            state.status = tr(state.lang.texts().sf_read_failed, &[&dir_path.display().to_string(), &e.to_string()]);
-            return;
-        }
-    };
-
-    let show_hidden = name_part.starts_with('.');
-    let mut candidates: Vec<String> = Vec::new();
-
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if !name.starts_with(name_part) {
-            continue;
-        }
-        if !show_hidden && name.starts_with('.') {
-            continue;
-        }
-
-        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        let suffix = if is_dir { "/" } else { "" };
-        candidates.push(format!("{}{}{}", dir_part, name, suffix));
-    }
-
-    candidates.sort();
-
-    if candidates.is_empty() {
-        state.status = if current.is_empty() {
-            tr(state.lang.texts().sf_no_files_dir, &[&dir_path.display().to_string()])
-        } else {
-            tr(state.lang.texts().sf_no_match, &[&current])
-        };
-        return;
-    }
-
-    let total = candidates.len();
-    let token = candidates[0].clone();
-    let is_dir = token.ends_with('/');
-    let label = token.clone();
-
-    replace_input_before_cursor(state, word_start, &token);
-    if is_dir {
-        if total > 1 {
-            let total_text = total.to_string();
-            state.status = tr(state.lang.texts().sf_folder_many, &[&label, &total_text]);
-        } else {
-            state.status = tr(state.lang.texts().sf_folder, &[&label]);
-        }
-    } else {
-        state.status = path_status(state.lang, 0, total, &label);
-        state.sf_cycle = Some(CompletionCycle {
-            start: word_start,
-            index: 0,
-            labels: candidates.clone(),
-            candidates,
-            last_insert: token,
-        });
     }
 }
 
@@ -2176,9 +1680,27 @@ fn draw_ui(frame: &mut Frame, state: &mut UiState) {
         };
         tr(texts.recovery_status_bar, &[stage])
     } else {
+        let tor_badge = if state.tor_connected {
+            let short = state
+                .own_onion
+                .as_deref()
+                .map(|s| truncate_display(s, 14))
+                .unwrap_or_else(|| "online".to_string());
+            tr(texts.tor_status_online, &[&short])
+        } else {
+            texts.tor_status_offline.to_string()
+        };
+        let outbox_badge = if state.outbox_pending > 0 {
+            format!(
+                " · {}",
+                tr(texts.outbox_status_badge, &[&state.outbox_pending.to_string()])
+            )
+        } else {
+            String::new()
+        };
         format!(
-            " {}   {}: {}   {} ",
-            state.nickname, texts.room_label, room, state.status
+            " {}   {}: {}   [{}{}]   {} ",
+            state.nickname, texts.room_label, room, tor_badge, outbox_badge, state.status
         )
     };
     frame.render_widget(
@@ -2797,14 +2319,19 @@ fn draw_contact_info(frame: &mut Frame, flow: &ContactsFlow, inner: Rect, lang: 
     let width = inner.width.max(1) as usize;
 
     let missing = texts.contacts_info_ed25519_missing.to_string();
+    let missing_onion = texts.contacts_info_onion_missing.to_string();
     let fingerprint = row
         .fingerprint
         .as_deref()
         .map(group_fingerprint)
         .unwrap_or_else(|| texts.contacts_info_none.to_string());
-    let fields: [(&str, String); 7] = [
+    let fields: [(&str, String); 8] = [
         (texts.contacts_info_name, row.nickname.clone()),
         (texts.contacts_info_hash, row.hash.clone()),
+        (
+            texts.contacts_info_onion,
+            row.onion_addr.clone().unwrap_or(missing_onion),
+        ),
         (texts.contacts_info_fingerprint, fingerprint),
         (texts.contacts_info_tofu, tofu_label(lang, &row.tofu_state)),
         (texts.contacts_info_x25519, row.x25519.clone()),
@@ -2894,6 +2421,7 @@ fn draw_import_modal(frame: &mut Frame, state: &UiState) {
     let fields = [
         (texts.import_nickname, invite.display_nickname()),
         (texts.import_hash, invite.hash_hex()),
+        (texts.import_onion, invite.onion_addr().to_string()),
         (
             texts.import_fingerprint,
             group_fingerprint(&invite.fingerprint_hex()),
@@ -3202,7 +2730,6 @@ fn handle_app_event(app: &Arc<App>, state: &mut UiState, event: AppEvent) {
             expires_at,
         } => {
             let outgoing = sender.ends_with("(self)");
-            let incoming_file = parse_file_notification(&text);
             let should_notify =
                 !outgoing && (!state.is_terminal_focused || room_hash != state.room);
             let notify_unread = if room_hash == state.room {
@@ -3212,43 +2739,12 @@ fn handle_app_event(app: &Arc<App>, state: &mut UiState, event: AppEvent) {
             };
 
             if room_hash == state.room {
-                if let Some(notification) = incoming_file {
-                    let file_name = notification.file_name;
-                    let file_hash = notification.file_hash;
-                    let file_id = notification.file_id;
-                    let id = register_file(
-                        state,
-                        &room_hash,
-                        &file_name,
-                        &file_hash,
-                        file_id.as_deref(),
-                        timestamp,
-                    );
-                    state.feed.push(FeedEntry {
-                        kind: if outgoing {
-                            FeedKind::Outgoing
-                        } else {
-                            FeedKind::Incoming
-                        },
-                        text: file_feed_line(
-                            &event_time(timestamp),
-                            &sender,
-                            id,
-                            &file_name,
-                            outgoing,
-                            state.lang,
-                        ),
-                        expires_at,
-                    });
-                    state.status = tr(state.lang.texts().new_file_status, &[&id.to_string(), &file_name, &id.to_string()]);
-                } else {
-                    state.feed.push(FeedEntry {
-                        kind: FeedKind::Incoming,
-                        text: format!("[{}] {}: {}", event_time(timestamp), sender, text),
-                        expires_at,
-                    });
-                    state.status = tr(state.lang.texts().new_message_status, &[&sender]);
-                }
+                state.feed.push(FeedEntry {
+                    kind: FeedKind::Incoming,
+                    text: format!("[{}] {}: {}", event_time(timestamp), sender, text),
+                    expires_at,
+                });
+                state.status = tr(state.lang.texts().new_message_status, &[&sender]);
                 state.follow = true;
             } else {
                 ensure_chat_entry(state, &room_hash, &sender);
@@ -3256,31 +2752,12 @@ fn handle_app_event(app: &Arc<App>, state: &mut UiState, event: AppEvent) {
                 *count += 1;
                 let count = *count;
 
-                let file_note = match incoming_file {
-                    Some(notification) => {
-                        let id = register_file(
-                            state,
-                            &room_hash,
-                            &notification.file_name,
-                            &notification.file_hash,
-                            notification.file_id.as_deref(),
-                            timestamp,
-                        );
-                        tr(
-                            state.lang.texts().unread_file_note,
-                            &[&id.to_string(), &notification.file_name],
-                        )
-                    }
-                    None => String::new(),
-                };
-
                 state.status = tr(
                     state.lang.texts().unread_message,
                     &[
                         &sender,
                         &room_label(app, &room_hash),
                         &count.to_string(),
-                        &file_note,
                     ],
                 );
             }
@@ -3318,63 +2795,28 @@ fn handle_app_event(app: &Arc<App>, state: &mut UiState, event: AppEvent) {
         AppEvent::ContactImportError { error } => {
             push_error(state, &tr(state.lang.texts().contact_import_error, &[&error]));
         }
-        AppEvent::UploadStarted { file_name } => {
-            push_system(state, &tr(state.lang.texts().upload_started, &[&file_name]));
-            state.status = state.lang.texts().upload_started_status.to_string();
-        }
-        AppEvent::UploadProgress { status, progress } => {
-            state.status = tr(state.lang.texts().upload_progress, &[&progress.to_string(), &status]);
-        }
-        AppEvent::UploadCompleted {
-            file_name,
-            file_hash,
-            file_id,
-            file_size,
+        AppEvent::TorStatusChanged {
+            connected,
+            onion_addr,
+            error,
         } => {
-            let room = state.room.clone();
-            let id = register_file(
-                state,
-                &room,
-                &file_name,
-                &file_hash,
-                Some(&file_id),
-                chrono::Utc::now().timestamp(),
-            );
-            let size = file_size
-                .map(|s| tr(state.lang.texts().upload_size, &[&s.to_string()]))
-                .unwrap_or_default();
-            let hint = if room.is_empty() {
-                String::new()
-            } else {
-                tr(state.lang.texts().upload_download_hint, &[&id.to_string()])
-            };
-            push_system(
-                state,
-                &tr(
-                    state.lang.texts().upload_done,
-                    &[
-                        &id.to_string(),
-                        &file_name,
-                        &short_hash(&file_hash),
-                        &size,
-                        &hint,
-                    ],
-                ),
-            );
-            state.status = tr(state.lang.texts().upload_done_status, &[&id.to_string()]);
+            let prev = state.tor_connected;
+            state.tor_connected = connected;
+            if let Some(addr) = onion_addr {
+                state.own_onion = Some(addr);
+            }
+            if connected && !prev {
+                let onion_display = state.own_onion.as_deref().unwrap_or("?");
+                push_system(
+                    state,
+                    &tr(state.lang.texts().tor_connected_msg, &[onion_display]),
+                );
+            } else if !connected && error.is_some() && (prev || state.own_onion.is_none()) {
+                state.status = state.lang.texts().tor_disconnected_status.to_string();
+            }
         }
-        AppEvent::UploadError { error } => {
-            push_error(state, &tr(state.lang.texts().upload_error, &[&error]));
-        }
-        AppEvent::DownloadStarted => {
-            state.status = state.lang.texts().download_started_status.to_string();
-        }
-        AppEvent::DownloadCompleted { file_path } => {
-            push_system(state, &tr(state.lang.texts().download_completed, &[&file_path]));
-            state.status = state.lang.texts().download_completed_status.to_string();
-        }
-        AppEvent::DownloadError { error } => {
-            push_error(state, &tr(state.lang.texts().download_failed, &[&error]));
+        AppEvent::OutboxUpdated { pending } => {
+            state.outbox_pending = pending;
         }
     }
 }
@@ -3650,6 +3092,7 @@ fn load_contact_rows(app: &App) -> Result<Vec<ContactRow>> {
         rows.push(ContactRow {
             x25519: hex::encode(&contact.public_key),
             ed25519: contact.ed25519,
+            onion_addr: contact.onion_addr,
             fingerprint: contact.fingerprint.or(computed_fingerprint),
             tofu_state: contact.tofu_state,
             hash: contact.hash,
@@ -4149,12 +3592,6 @@ async fn handle_terminal_event(
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             let alt = key.modifiers.contains(KeyModifiers::ALT);
 
-            // Любое действие, кроме повторного Tab, сбрасывает цикл подсказок.
-            if !matches!(key.code, KeyCode::Tab) {
-                state.dl_cycle = None;
-                state.sf_cycle = None;
-            }
-
             // Ctrl+C защищён от случайного выхода: пока в поле ввода есть
             // текст, копируем его в буфер и очищаем строку. Выход — только
             // по повторному Ctrl+C на пустой строке или по команде /q.
@@ -4377,8 +3814,6 @@ async fn handle_terminal_event(
         }
         Event::Paste(text) => {
             if can_paste(state) {
-                state.dl_cycle = None;
-                state.sf_cycle = None;
                 insert_text(state, &text);
             }
         }
@@ -4482,8 +3917,6 @@ fn start_settings(app: &App, state: &mut UiState) {
     state.cursor = 0;
     state.history_index = None;
     state.history_draft.clear();
-    state.dl_cycle = None;
-    state.sf_cycle = None;
     state.status = state.lang.texts().settings_open.to_string();
 }
 
@@ -4616,10 +4049,13 @@ fn close_settings(app: &App, state: &mut UiState) {
     let new_lang = flow.lang;
     let config = flow.to_config();
     let texts = new_lang.texts();
-    let saved_message = match config.proxy_url.as_deref() {
-        Some(url) => tr(texts.settings_saved_proxy, &[url]),
-        None => texts.settings_saved.to_string(),
-    };
+    let saved_message = tr(
+        texts.settings_saved_p2p,
+        &[
+            &config.effective_tor_control_addr(),
+            &config.effective_tor_socks_addr(),
+        ],
+    );
 
     match app.update_config(config) {
         Ok(()) => {
@@ -5053,8 +4489,6 @@ async fn handle_command(
                 .max(1);
 
             let room = state.room.clone();
-            let room_title = state.room_label.clone();
-            let nickname = state.nickname.clone();
 
             match app.get_messages(&room, limit) {
                 Ok(messages) => {
@@ -5065,33 +4499,7 @@ async fn handle_command(
                             let outgoing = m.direction != "in";
                             let dir = if outgoing { "→" } else { "←" };
                             let time = m.timestamp.format("%H:%M:%S").to_string();
-
-                            let line = match parse_file_notification(&m.text) {
-                                Some(notification) => {
-                                    let id = register_file(
-                                        state,
-                                        &room,
-                                        &notification.file_name,
-                                        &notification.file_hash,
-                                        notification.file_id.as_deref(),
-                                        m.timestamp.timestamp(),
-                                    );
-                                    let sender = if outgoing {
-                                        nickname.as_str()
-                                    } else {
-                                        room_title.as_str()
-                                    };
-                                    file_feed_line(
-                                        &time,
-                                        sender,
-                                        id,
-                                        &notification.file_name,
-                                        outgoing,
-                                        state.lang,
-                                    )
-                                }
-                                None => format!("[{}] {} {}", time, dir, m.text),
-                            };
+                            let line = format!("[{}] {} {}", time, dir, m.text);
                             push_system(state, &line);
                         }
                     }
@@ -5300,127 +4708,6 @@ async fn handle_command(
             }
         }
 
-        "/sendfile" => {
-            let mut force = false;
-            let mut path: Option<&str> = None;
-
-            for arg in parts.iter().skip(1) {
-                if *arg == "--force" {
-                    force = true;
-                } else if path.is_none() {
-                    path = Some(*arg);
-                } else {
-                    push_error(state, state.lang.texts().sendfile_usage);
-                    return Ok(false);
-                }
-            }
-
-            let Some(path) = path else {
-                push_error(state, state.lang.texts().sendfile_usage);
-                return Ok(false);
-            };
-            if state.room.is_empty() {
-                push_error(state, state.lang.texts().no_active_room_short);
-                return Ok(false);
-            }
-
-            let app_ref = app.clone();
-            let room = state.room.clone();
-            let path = path.to_string();
-            let tx = ui_tx.clone();
-            if force {
-                push_system(state, state.lang.texts().sendfile_force);
-                state.status = tr(state.lang.texts().sendfile_sending_force, &[&path]);
-            } else {
-                state.status = tr(state.lang.texts().sendfile_sending, &[&path]);
-            }
-            let lang = state.lang;
-
-            tokio::spawn(async move {
-                match app_ref.send_file_native(&room, &path, force).await {
-                    Ok(()) => {
-                        let _ = tx.send(UiNotice::Status(
-                            lang.texts().sendfile_sent.to_string(),
-                        ));
-                    }
-                    Err(e) => {
-                        let _ = tx.send(UiNotice::Error(tr(
-                            lang.texts().sendfile_error,
-                            &[&format!("{:#}", e)],
-                        )));
-                    }
-                }
-            });
-        }
-
-        "/download" => {
-            if state.room.is_empty() {
-                push_error(state, state.lang.texts().no_active_room_short);
-                return Ok(false);
-            }
-
-            let target = parts.get(1).copied();
-            let explicit_path = parts.get(2).copied();
-
-            // Без аргумента — последний полученный файл текущей комнаты.
-            let file = match target {
-                None => state
-                    .files
-                    .iter()
-                    .filter(|f| f.room_hash == state.room)
-                    .max_by_key(|f| f.timestamp)
-                    .cloned(),
-                Some(token) => find_file(&state.files, &state.room, token).cloned(),
-            };
-
-            let Some(file) = file else {
-                let message = match target {
-                    Some(token) => tr(state.lang.texts().download_not_found, &[token]),
-                    None => state.lang.texts().download_no_files.to_string(),
-                };
-                push_error(state, &message);
-                return Ok(false);
-            };
-
-            let path = match resolve_save_path(explicit_path, &file.file_name, state.lang) {
-                Ok(path) => path,
-                Err(e) => {
-                    push_error(state, &tr(state.lang.texts().download_path_error, &[&format!("{:#}", e)]));
-                    return Ok(false);
-                }
-            };
-            let path_display = path.to_string_lossy().to_string();
-
-            let app_ref = app.clone();
-            let room = file.room_hash.clone();
-            let file_hash = file.file_hash.clone();
-            let file_id = file.file_id.clone();
-            let target_display = format!("#{} {}", file.id, file.file_name);
-            let tx = ui_tx.clone();
-            state.status = tr(state.lang.texts().download_saving, &[&target_display]);
-            let lang = state.lang;
-
-            tokio::spawn(async move {
-                match app_ref
-                    .download_and_save_file(&room, &file_hash, file_id.as_deref(), &path_display)
-                    .await
-                {
-                    Ok(()) => {
-                        let _ = tx.send(UiNotice::Status(tr(
-                            lang.texts().download_saved,
-                            &[&target_display, &path_display],
-                        )));
-                    }
-                    Err(e) => {
-                        let _ = tx.send(UiNotice::Error(tr(
-                            lang.texts().download_error,
-                            &[&target_display, &format!("{:#}", e)],
-                        )));
-                    }
-                }
-            });
-        }
-
         "/nick" => {
             let Some(name) = parts.get(1) else {
                 push_error(state, state.lang.texts().nick_usage);
@@ -5607,12 +4894,12 @@ async fn handle_command(
 
 /// Печатает справку по аргументам командной строки.
 fn print_cli_help(program: &str) {
-    println!("LastChance — защищённый мессенджер.");
+    println!("LastChance — защищённый P2P-мессенджер поверх скрытых сервисов Tor v3.");
     println!();
     println!("Использование:");
     println!("  {} [--profile-dir <path>] [--recovery]", program);
     println!(
-        "  {} --to <contact> --send <text|-> [--file <path>] [--profile-dir <path>]",
+        "  {} --to <contact> --send <text|-> [--profile-dir <path>]",
         program
     );
     println!();
@@ -5626,10 +4913,8 @@ fn print_cli_help(program: &str) {
     println!();
     println!("Headless-отправка (без TUI):");
     println!("  --to <contact>        Имя контакта из локальной базы, identity_hash");
-    println!("                        или ссылка lastchance://contact?...");
+    println!("                        или v2 ссылка lastchance://contact?...");
     println!("  --send <text|->       Текст сообщения; \"-\" читает текст из stdin");
-    println!("  --file <path>         Отправить зашифрованный файл");
-    println!("                        (можно вместе с --send)");
     println!();
     println!("Переменные окружения:");
     println!("  LASTCHANCE_DIR        Каталог профиля, если не задан --profile-dir");
@@ -5640,6 +4925,11 @@ fn print_cli_help(program: &str) {
     println!("                        используйте только в отдельном UID/контейнере;");
     println!("                        без этих переменных пароль запрашивается");
     println!("                        скрыто в TTY");
+    println!("  TOR_CONTROL_ADDR      Адрес Tor ControlPort (по умолчанию 127.0.0.1:9051)");
+    println!("  TOR_SOCKS_ADDR        Адрес Tor SOCKS5h (по умолчанию 127.0.0.1:9050)");
+    println!("  TOR_COOKIE_PATH       Явный путь к cookie-файлу Tor ControlPort");
+    println!("  P2P_LOCAL_PORT        Локальный порт входящего TCP listener (0 = авто)");
+    println!("  P2P_ONION_PORT        Виртуальный порт скрытого сервиса .onion (9878)");
     println!();
     println!("  -h, --help            Показать эту справку");
     println!();
@@ -6036,11 +5326,7 @@ async fn run_headless(args: &HeadlessArgs, base_dir: &str) -> Result<()> {
     };
 
     if let Some(text) = text.as_deref() {
-        app.send_message(&recipient, text).await?;
-    }
-
-    if let Some(path) = args.file.as_deref() {
-        app.send_file_native(&recipient, path, false).await?;
+        app.send_message_direct(&recipient, text).await?;
     }
 
     Ok(())
@@ -6559,12 +5845,6 @@ mod tests {
 
     #[test]
     fn file_names_drop_escape_sequences_and_bidi_overrides() {
-        assert_eq!(
-            safe_file_name("../evil\x1b[31m\u{202E}.txt"),
-            "evil[31m.txt"
-        );
-        assert_eq!(safe_file_name("\x1b\u{202E}"), "download");
-        assert_eq!(safe_file_name("🙂 שלום.txt"), "🙂 שלום.txt");
         assert_eq!(
             invite_file_name("Alice\x1b[31m\u{202E}"),
             "Alice[31m_lastchance.invite"

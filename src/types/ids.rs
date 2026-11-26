@@ -1,10 +1,9 @@
-//! Строго типизированные hex-идентификаторы.
+//! Строго типизированные идентификаторы и Tor v3 `.onion`-адреса.
 //!
 //! Идентификаторы приходят из недоверенных источников (invite-ссылки,
-//! ответы сервера, тексты сообщений). Все они имеют одинаковый wire-формат:
-//! 64 ASCII hex-символа, кодирующие 32 байта. Разбор выполняется до любых
-//! срезов и до попадания значения в БД, поэтому не-ASCII или короткая
-//! строка не может вызвать панику на байтовом индексе.
+//! ответы Tor ControlPort, входящие данные). Все hex-идентификаторы имеют
+//! формат 64 ASCII hex-символа (32 байта), а `.onion`-адреса проверяются
+//! на строгий формат Tor v3 (56 base32-символов + `.onion`, версия `0x03`).
 
 use std::fmt;
 use std::str::FromStr;
@@ -13,9 +12,15 @@ use std::str::FromStr;
 pub const HEX_ID_BYTES: usize = 32;
 /// Длина hex-представления идентификатора.
 pub const HEX_ID_LEN: usize = HEX_ID_BYTES * 2;
+/// Длина Tor v3 ServiceID в символах base32 (без `.onion`).
+pub const ONION_V3_SERVICE_ID_LEN: usize = 56;
+/// Полная длина Tor v3 `.onion`-хоста (56 + `.onion`).
+pub const ONION_V3_HOST_LEN: usize = ONION_V3_SERVICE_ID_LEN + 6;
+/// Версия адреса Tor v3 hidden service (`0x03`).
+pub const ONION_V3_VERSION: u8 = 0x03;
 
-/// Длина `file_id` v3-конверта в hex-символах (16 случайных байт).
-pub const FILE_ID_HEX_LEN: usize = 32;
+#[cfg(test)]
+const BASE32_ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 
 /// Ошибка разбора идентификатора.
 ///
@@ -44,6 +49,173 @@ impl fmt::Display for IdError {
 
 impl std::error::Error for IdError {}
 
+/// Ошибка валидации Tor v3 `.onion`-адреса.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OnionError {
+    MissingSuffix,
+    InvalidLength(usize),
+    InvalidBase32(usize),
+    UnsupportedVersion(u8),
+    ZeroPublicKey,
+}
+
+impl fmt::Display for OnionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingSuffix => write!(f, "onion address must end with .onion"),
+            Self::InvalidLength(len) => write!(
+                f,
+                "invalid v3 onion service id length: expected {}, got {}",
+                ONION_V3_SERVICE_ID_LEN, len
+            ),
+            Self::InvalidBase32(idx) => write!(f, "invalid base32 character at index {}", idx),
+            Self::UnsupportedVersion(ver) => {
+                write!(f, "unsupported onion address version: {} (expected v3)", ver)
+            }
+            Self::ZeroPublicKey => write!(f, "onion address has all-zero public key"),
+        }
+    }
+}
+
+impl std::error::Error for OnionError {}
+
+/// Валидированный Tor v3 адрес вида `<56-char-base32>.onion`.
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct OnionAddress(String);
+
+impl OnionAddress {
+    /// Разбирает и нормализует Tor v3 `.onion`-адрес в нижний регистр.
+    ///
+    /// Не допускает схему, порт, путь или пробельные символы: ожидается
+    /// исключительно `<service_id>.onion`.
+    pub fn parse(raw: &str) -> Result<Self, OnionError> {
+        if !raw.is_ascii() {
+            return Err(OnionError::MissingSuffix);
+        }
+        let lower = raw.to_ascii_lowercase();
+        let service_id = lower
+            .strip_suffix(".onion")
+            .ok_or(OnionError::MissingSuffix)?;
+        if service_id.len() != ONION_V3_SERVICE_ID_LEN {
+            return Err(OnionError::InvalidLength(service_id.len()));
+        }
+
+        let decoded = decode_base32_v3(service_id.as_bytes())?;
+        if decoded[34] != ONION_V3_VERSION {
+            return Err(OnionError::UnsupportedVersion(decoded[34]));
+        }
+        if decoded[..32].iter().all(|b| *b == 0) {
+            return Err(OnionError::ZeroPublicKey);
+        }
+
+        Ok(Self(lower))
+    }
+
+    /// Строит `.onion` из 56-символьного Tor `ServiceID` (без `.onion`).
+    pub fn from_service_id(service_id: &str) -> Result<Self, OnionError> {
+        Self::parse(&format!("{}.onion", service_id))
+    }
+
+    /// Полный адрес `<service_id>.onion`.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// 56-символьный `ServiceID` без `.onion`.
+    pub fn service_id(&self) -> &str {
+        &self.0[..ONION_V3_SERVICE_ID_LEN]
+    }
+
+    /// Собирает синтетический валидный по структуре Tor v3 адрес (для тестов).
+    #[cfg(test)]
+    pub fn test_v3_from_seed(seed: u8) -> Self {
+        let mut raw = [0u8; 35];
+        raw[..32].fill(seed.max(1));
+        raw[32] = seed;
+        raw[33] = seed.wrapping_add(1);
+        raw[34] = ONION_V3_VERSION;
+        let service_id = encode_base32(&raw);
+        Self(format!("{}.onion", service_id))
+    }
+}
+
+impl fmt::Display for OnionAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl fmt::Debug for OnionAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for OnionAddress {
+    type Err = OnionError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s)
+    }
+}
+
+fn decode_base32_v3(input: &[u8]) -> Result<[u8; 35], OnionError> {
+    if input.len() != ONION_V3_SERVICE_ID_LEN {
+        return Err(OnionError::InvalidLength(input.len()));
+    }
+
+    let mut out = [0u8; 35];
+    let mut buffer: u32 = 0;
+    let mut bits: u32 = 0;
+    let mut out_idx = 0usize;
+
+    for (index, byte) in input.iter().enumerate() {
+        let val = match byte {
+            b'a'..=b'z' => byte - b'a',
+            b'2'..=b'7' => byte - b'2' + 26,
+            _ => return Err(OnionError::InvalidBase32(index)),
+        } as u32;
+
+        buffer = (buffer << 5) | val;
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            if out_idx >= out.len() {
+                return Err(OnionError::InvalidLength(input.len()));
+            }
+            out[out_idx] = (buffer >> bits) as u8;
+            out_idx += 1;
+            buffer &= (1 << bits) - 1;
+        }
+    }
+
+    if out_idx != 35 || bits != 0 {
+        return Err(OnionError::InvalidLength(input.len()));
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+fn encode_base32(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity((bytes.len() * 8).div_ceil(5));
+    let mut buffer: u32 = 0;
+    let mut bits: u32 = 0;
+    for &byte in bytes {
+        buffer = (buffer << 8) | u32::from(byte);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            let idx = ((buffer >> bits) & 0x1f) as usize;
+            out.push(BASE32_ALPHABET[idx] as char);
+        }
+    }
+    if bits > 0 {
+        let idx = ((buffer << (5 - bits)) & 0x1f) as usize;
+        out.push(BASE32_ALPHABET[idx] as char);
+    }
+    out
+}
+
 fn hex_value(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
@@ -69,29 +241,6 @@ fn decode_hex_id(bytes: &[u8]) -> Result<[u8; HEX_ID_BYTES], IdError> {
         out[index] = (high << 4) | low;
     }
     Ok(out)
-}
-
-/// Проверяет ровно 32 hex-символа и возвращает канонический lower-case hex.
-///
-/// `file_id` лежит в открытом заголовке v3-конверта и дублируется в
-/// E2E-уведомлении о файле. До сверки с расшифрованным конвертом значение
-/// нормализуется: верхний регистр и любые не-hex байты отклоняются.
-pub fn normalize_file_id(value: &str) -> Result<String, IdError> {
-    let bytes = value.as_bytes();
-    if bytes.len() != FILE_ID_HEX_LEN {
-        return Err(IdError::InvalidLength {
-            expected: FILE_ID_HEX_LEN,
-            actual: bytes.len(),
-        });
-    }
-
-    for (index, byte) in bytes.iter().enumerate() {
-        if hex_value(*byte).is_none() {
-            return Err(IdError::InvalidHex { index });
-        }
-    }
-
-    Ok(value.to_ascii_lowercase())
 }
 
 macro_rules! hex_id {
@@ -155,11 +304,6 @@ hex_id! {
 }
 
 hex_id! {
-    /// SHA-256 зашифрованного файла, который возвращает файловый сервер.
-    FileHash
-}
-
-hex_id! {
     /// Идентификатор комнаты. Сейчас совпадает по формату с identity hash.
     RoomId
 }
@@ -190,7 +334,7 @@ mod tests {
 
         // Невалидный UTF-8 на байтовой границе тоже не должен паниковать.
         let raw = [0xff_u8; HEX_ID_LEN];
-        assert!(FileHash::from_hex_bytes(&raw).is_err());
+        assert!(RoomId::from_hex_bytes(&raw).is_err());
     }
 
     #[test]
@@ -211,62 +355,47 @@ mod tests {
             format!("0x{}", "a".repeat(62)),
         ] {
             assert!(matches!(
-                FileHash::from_hex(&value),
+                IdentityHash::from_hex(&value),
                 Err(IdError::InvalidHex { .. })
             ));
         }
     }
 
     #[test]
-    fn file_id_is_normalized_and_validated() {
-        let lower = "0123456789abcdef0123456789abcdef";
-        assert_eq!(normalize_file_id(lower).unwrap(), lower);
-        assert_eq!(
-            normalize_file_id("0123456789ABCDEF0123456789ABCDEF").unwrap(),
-            lower
-        );
+    fn onion_v3_validates_and_normalizes() {
+        let generated = OnionAddress::test_v3_from_seed(7);
+        let upper = generated.as_str().to_ascii_uppercase();
+        let parsed = OnionAddress::parse(&upper).unwrap();
+        assert_eq!(parsed, generated);
+        assert_eq!(parsed.service_id().len(), ONION_V3_SERVICE_ID_LEN);
 
-        for value in ["", "a", &"a".repeat(31), &"a".repeat(33)] {
-            assert!(matches!(
-                normalize_file_id(value),
-                Err(IdError::InvalidLength { .. })
-            ));
-        }
+        // Реальный публичный пример Tor v3 адреса.
+        let real = "facebookwkhpilnemxj7asaniu7vnjjbiltxjqhye3mhbshg7kx5tfyd.onion";
+        assert!(OnionAddress::parse(real).is_ok());
+    }
+
+    #[test]
+    fn onion_v3_rejects_v2_invalid_chars_and_ports() {
+        // v2 (16 символов)
+        assert!(OnionAddress::parse("expyuzz4wqqyqhjn.onion").is_err());
+        // неверный суффикс или порт
+        let valid = OnionAddress::test_v3_from_seed(3);
+        assert!(OnionAddress::parse(valid.service_id()).is_err());
+        assert!(OnionAddress::parse(&format!("{}:9878", valid)).is_err());
+        assert!(OnionAddress::parse(&format!(" {}", valid)).is_err());
+        // неверная версия (не 0x03)
+        let mut wrong_ver = [1u8; 35];
+        wrong_ver[34] = 0x02;
         assert!(matches!(
-            normalize_file_id("g123456789abcdef0123456789abcdef"),
-            Err(IdError::InvalidHex { .. })
+            OnionAddress::from_service_id(&encode_base32(&wrong_ver)),
+            Err(OnionError::UnsupportedVersion(2))
         ));
-        // Многобайтовый UTF-8 не должен паниковать на байтовом индексе.
-        assert!(normalize_file_id(&"я".repeat(32)).is_err());
-    }
-
-    #[test]
-    fn short_hash_is_char_safe() {
-        assert_eq!(super::super::short_hash("abcdef"), "abcdef");
-        assert_eq!(super::super::short_hash("abcdefg"), "abcdef…");
-        // Каждый символ — многобайтовый UTF-8; байтовый срез здесь паниковал бы.
-        assert_eq!(super::super::short_hash("кириллица"), "кирилл…");
-        assert_eq!(super::super::short_hash("😀😀😀😀😀😀😀"), "😀😀😀😀😀😀…");
-    }
-
-    #[test]
-    fn truncate_display_is_char_safe() {
-        assert_eq!(super::super::truncate_display("abcdef", 6), "abcdef");
-        assert_eq!(super::super::truncate_display("abcdefg", 6), "abcde…");
-        assert_eq!(super::super::truncate_display("кириллица", 4), "кир…");
-        assert_eq!(super::super::truncate_display("😀😀😀", 2), "😀…");
-        assert_eq!(super::super::truncate_display("abc", 0), "");
-        assert_eq!(
-            super::super::truncate_display("кириллица", 100)
-                .chars()
-                .count(),
-            9
-        );
-        assert_eq!(
-            super::super::truncate_display("abcdefg", 6)
-                .chars()
-                .count(),
-            6
-        );
+        // нулевой ключ
+        let mut zero_pk = [0u8; 35];
+        zero_pk[34] = ONION_V3_VERSION;
+        assert!(matches!(
+            OnionAddress::from_service_id(&encode_base32(&zero_pk)),
+            Err(OnionError::ZeroPublicKey)
+        ));
     }
 }

@@ -1,6 +1,7 @@
 // src/network/config.rs
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use crate::i18n::Lang;
 use crate::storage::SafeFSOps;
 use crate::vault::{self, MasterKey, Vault};
@@ -8,11 +9,32 @@ use crate::vault::{self, MasterKey, Vault};
 const CONFIG_FILE_NAME: &str = "global.conf";
 const CONFIG_AAD: &[u8] = b"lastchance:global.conf";
 
+pub const DEFAULT_TOR_CONTROL_ADDR: &str = "127.0.0.1:9051";
+pub const DEFAULT_TOR_SOCKS_ADDR: &str = "127.0.0.1:9050";
+pub const DEFAULT_P2P_LOCAL_PORT: u16 = 0;
+pub const DEFAULT_P2P_ONION_PORT: u16 = 9878;
+
 pub const DEFAULT_NOTIFY_LEVEL: u8 = 2;
 pub const DEFAULT_STEALTH_TITLE: &str = "Eye break";
 pub const DEFAULT_STEALTH_BODY: &str =
     "Time to rest. Take an eye break for {sec} seconds";
 pub const DEFAULT_STEALTH_SECONDS: &str = "10";
+
+fn default_tor_control_addr() -> String {
+    DEFAULT_TOR_CONTROL_ADDR.to_string()
+}
+
+fn default_tor_socks_addr() -> String {
+    DEFAULT_TOR_SOCKS_ADDR.to_string()
+}
+
+fn default_p2p_local_port() -> u16 {
+    DEFAULT_P2P_LOCAL_PORT
+}
+
+fn default_p2p_onion_port() -> u16 {
+    DEFAULT_P2P_ONION_PORT
+}
 
 fn default_notify_level() -> u8 {
     DEFAULT_NOTIFY_LEVEL
@@ -32,13 +54,23 @@ fn default_stealth_seconds() -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    pub server_url: String,
-    pub file_server_url: String,
-    pub mask_header_name: String,
-    pub mask_header_value: String,
-    /// Внешний прокси (Tor/I2P), например `socks5h://127.0.0.1:9050`.
+    /// Адрес Tor ControlPort, например `127.0.0.1:9051`.
+    #[serde(default = "default_tor_control_addr")]
+    pub tor_control_addr: String,
+    /// Адрес Tor SOCKS5h-прокси, например `127.0.0.1:9050`.
+    #[serde(default = "default_tor_socks_addr")]
+    pub tor_socks_addr: String,
+    /// Необязательный путь к Tor control cookie-файлу.
+    /// `None` означает автопоиск через `PROTOCOLINFO` (`COOKIEFILE`).
     #[serde(default)]
-    pub proxy_url: Option<String>,
+    pub tor_cookie_path: Option<String>,
+    /// Локальный TCP-порт на `127.0.0.1`, который принимает трафик скрытого сервиса.
+    /// `0` — автоматический выбор свободного порта при запуске.
+    #[serde(default = "default_p2p_local_port")]
+    pub p2p_local_port: u16,
+    /// Виртуальный порт `.onion`-сервиса для входящих и исходящих P2P-соединений.
+    #[serde(default = "default_p2p_onion_port")]
+    pub p2p_onion_port: u16,
     /// Режим системных уведомлений:
     /// 0 — выключены, 1 — stealth, 2 — только отправитель, 3 — полный предпросмотр.
     #[serde(default = "default_notify_level")]
@@ -60,11 +92,11 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            server_url: "https://msg.example.com".to_string(),
-            file_server_url: "https://files.example.com".to_string(),
-            mask_header_name: "X-DNS-Connect".to_string(),
-            mask_header_value: "We_Are_Not_Legion".to_string(),
-            proxy_url: None,
+            tor_control_addr: default_tor_control_addr(),
+            tor_socks_addr: default_tor_socks_addr(),
+            tor_cookie_path: None,
+            p2p_local_port: DEFAULT_P2P_LOCAL_PORT,
+            p2p_onion_port: DEFAULT_P2P_ONION_PORT,
             notify_level: DEFAULT_NOTIFY_LEVEL,
             stealth_title: default_stealth_title(),
             stealth_body: default_stealth_body(),
@@ -79,40 +111,110 @@ pub fn notify_level_label(lang: Lang, level: u8) -> &'static str {
     lang.notify_level_label(level)
 }
 
-/// Приводит пользовательский адрес прокси к каноническому виду.
-///
-/// Пустая строка, `-` и `none` означают «без прокси». `socks5://` заменяется
-/// на `socks5h://`: в этом режиме DNS-резолвинг выполняет прокси, и домен
-/// сервера не уходит провайдеру.
-pub fn normalize_proxy_url(raw: &str) -> Option<String> {
+/// Нормализует опциональный путь к cookie-файлу Tor.
+/// Пустая строка, `-` и `auto` сбрасывают значение в `None`.
+pub fn normalize_optional_path(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
-    if trimmed.is_empty() || trimmed == "-" || trimmed.eq_ignore_ascii_case("none") {
+    if trimmed.is_empty() || trimmed == "-" || trimmed.eq_ignore_ascii_case("auto") {
         return None;
     }
-
-    const SOCKS5_SCHEME: &str = "socks5://";
-    if trimmed
-        .get(..SOCKS5_SCHEME.len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(SOCKS5_SCHEME))
-    {
-        return Some(format!("socks5h://{}", &trimmed[SOCKS5_SCHEME.len()..]));
-    }
-
     Some(trimmed.to_string())
+}
+
+fn validate_endpoint_addr(label: &str, addr: &str) -> Result<()> {
+    let trimmed = addr.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("{} must not be empty", label));
+    }
+    if trimmed.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(anyhow!("{} contains invalid whitespace or control characters", label));
+    }
+    if let Ok(socket_addr) = trimmed.parse::<SocketAddr>() {
+        if socket_addr.port() == 0 {
+            return Err(anyhow!("{} port must be non-zero", label));
+        }
+        return Ok(());
+    }
+    let Some((host, port)) = trimmed.rsplit_once(':') else {
+        return Err(anyhow!("{} must be in host:port format", label));
+    };
+    if host.is_empty() {
+        return Err(anyhow!("{} is missing host", label));
+    }
+    let port: u16 = port
+        .parse()
+        .map_err(|_| anyhow!("{} has invalid port", label))?;
+    if port == 0 {
+        return Err(anyhow!("{} port must be non-zero", label));
+    }
+    Ok(())
+}
+
+fn env_nonempty(keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| std::env::var(key).ok())
+        .map(|val| val.trim().to_string())
+        .filter(|val| !val.is_empty())
 }
 
 impl Config {
     /// Нормализует значения, которые допускают несколько форм записи.
     pub fn normalize(&mut self) {
-        self.proxy_url = normalize_proxy_url(self.proxy_url.as_deref().unwrap_or_default());
+        self.tor_control_addr = self.tor_control_addr.trim().to_string();
+        if self.tor_control_addr.is_empty() {
+            self.tor_control_addr = default_tor_control_addr();
+        }
+        self.tor_socks_addr = self.tor_socks_addr.trim().to_string();
+        if self.tor_socks_addr.is_empty() {
+            self.tor_socks_addr = default_tor_socks_addr();
+        }
+        self.tor_cookie_path = normalize_optional_path(
+            self.tor_cookie_path.as_deref().unwrap_or_default(),
+        );
+        if self.p2p_onion_port == 0 {
+            self.p2p_onion_port = DEFAULT_P2P_ONION_PORT;
+        }
         self.notify_level = self.notify_level.min(3);
+    }
+
+    /// Адрес Tor ControlPort с учётом env (`LASTCHANCE_TOR_CONTROL`, `TOR_CONTROL_ADDR`).
+    pub fn effective_tor_control_addr(&self) -> String {
+        env_nonempty(&["LASTCHANCE_TOR_CONTROL", "TOR_CONTROL_ADDR"])
+            .unwrap_or_else(|| self.tor_control_addr.clone())
+    }
+
+    /// Адрес Tor SOCKS5h-прокси с учётом env (`LASTCHANCE_TOR_SOCKS`, `TOR_SOCKS_ADDR`).
+    pub fn effective_tor_socks_addr(&self) -> String {
+        env_nonempty(&["LASTCHANCE_TOR_SOCKS", "TOR_SOCKS_ADDR"])
+            .unwrap_or_else(|| self.tor_socks_addr.clone())
+    }
+
+    /// Путь к Tor control cookie с учётом env (`LASTCHANCE_TOR_COOKIE`, `TOR_COOKIE_PATH`).
+    pub fn effective_tor_cookie_path(&self) -> Option<String> {
+        if let Some(raw) = env_nonempty(&["LASTCHANCE_TOR_COOKIE", "TOR_COOKIE_PATH"]) {
+            return normalize_optional_path(&raw);
+        }
+        self.tor_cookie_path.clone()
+    }
+
+    /// Локальный порт привязки с учётом env (`LASTCHANCE_P2P_LOCAL_PORT`, `P2P_LOCAL_PORT`).
+    pub fn effective_p2p_local_port(&self) -> u16 {
+        env_nonempty(&["LASTCHANCE_P2P_LOCAL_PORT", "P2P_LOCAL_PORT"])
+            .and_then(|val| val.parse::<u16>().ok())
+            .unwrap_or(self.p2p_local_port)
+    }
+
+    /// Виртуальный порт `.onion` с учётом env (`LASTCHANCE_P2P_ONION_PORT`, `P2P_ONION_PORT`).
+    pub fn effective_p2p_onion_port(&self) -> u16 {
+        env_nonempty(&["LASTCHANCE_P2P_ONION_PORT", "P2P_ONION_PORT"])
+            .and_then(|val| val.parse::<u16>().ok())
+            .filter(|port| *port > 0)
+            .unwrap_or(self.p2p_onion_port)
     }
 
     /// Переключает язык и, если stealth-шаблоны не менялись вручную,
     /// заменяет их стандартными строками новой локали.
     pub fn apply_lang(&mut self, lang: Lang) {
-        // Стандартный шаблон любой локали считаем «нетронутым»: так старые
-        // конфиги с русскими значениями корректно переводятся на English.
         let untouched_title = [Lang::En, Lang::Ru]
             .iter()
             .any(|l| self.stealth_title == l.default_stealth_title());
@@ -130,8 +232,7 @@ impl Config {
 
     /// Формирует заголовок и тело системного уведомления по текущему режиму.
     ///
-    /// Возвращает `None`, если уведомления отключены. Текст намеренно не
-    /// содержит эмодзи: для файлов используется строка `Файл: <имя>`.
+    /// Возвращает `None`, если уведомления отключены.
     pub fn notification_content(
         &self,
         sender: &str,
@@ -172,18 +273,24 @@ impl Config {
             )),
             3 => Some((
                 sender.to_string(),
-                preview_body(text, self.lang)
+                preview_body(text)
                     .unwrap_or_else(|| texts.notify_new_message_default.to_string()),
             )),
             _ => None,
         }
     }
 
-    /// Проверяет, что прокси-URL корректен, до сохранения конфига.
+    /// Проверяет корректность сетевых адресов Tor до сохранения конфига.
     pub fn validate(&self) -> Result<()> {
-        if let Some(url) = self.proxy_url.as_deref() {
-            reqwest::Proxy::all(url)
-                .map_err(|e| anyhow!("invalid proxy URL {:?}: {}", url, e))?;
+        validate_endpoint_addr("Tor ControlPort", &self.tor_control_addr)?;
+        validate_endpoint_addr("Tor SOCKS5h", &self.tor_socks_addr)?;
+        if self.p2p_onion_port == 0 {
+            return Err(anyhow!("P2P onion port must be non-zero"));
+        }
+        if let Some(path) = self.tor_cookie_path.as_deref() {
+            if path.chars().any(|c| c.is_control()) {
+                return Err(anyhow!("Tor cookie path contains control characters"));
+            }
         }
         Ok(())
     }
@@ -219,19 +326,15 @@ impl Config {
                 let mut cfg: Config = serde_json::from_value(value)
                     .map_err(|e| anyhow!("invalid config file: {}", e))?;
 
-                // Fill empty fields with defaults
                 let defaults = Config::default();
-                if cfg.server_url.is_empty() {
-                    cfg.server_url = defaults.server_url;
+                if cfg.tor_control_addr.trim().is_empty() {
+                    cfg.tor_control_addr = defaults.tor_control_addr;
                 }
-                if cfg.file_server_url.is_empty() {
-                    cfg.file_server_url = defaults.file_server_url;
+                if cfg.tor_socks_addr.trim().is_empty() {
+                    cfg.tor_socks_addr = defaults.tor_socks_addr;
                 }
-                if cfg.mask_header_name.is_empty() {
-                    cfg.mask_header_name = defaults.mask_header_name;
-                }
-                if cfg.mask_header_value.is_empty() {
-                    cfg.mask_header_value = defaults.mask_header_value;
+                if cfg.p2p_onion_port == 0 {
+                    cfg.p2p_onion_port = defaults.p2p_onion_port;
                 }
                 if cfg.stealth_title.trim().is_empty() {
                     cfg.stealth_title = cfg.lang.default_stealth_title().to_string();
@@ -242,8 +345,6 @@ impl Config {
                 if cfg.stealth_seconds.trim().is_empty() {
                     cfg.stealth_seconds = defaults.stealth_seconds;
                 }
-                // Старые конфиги получали английские шаблоны из serde-default;
-                // для русской локали заменяем их на русские стандартные.
                 if cfg.lang != Lang::En {
                     if cfg.stealth_title == DEFAULT_STEALTH_TITLE {
                         cfg.stealth_title = cfg.lang.default_stealth_title().to_string();
@@ -261,7 +362,6 @@ impl Config {
                 Ok((cfg, language_missing))
             }
             Err(_) => {
-                // File doesn't exist, create with defaults
                 let default_cfg = Config::default();
                 save_encrypted(&safe_fs, vault, &default_cfg)?;
 
@@ -280,7 +380,6 @@ impl Config {
     pub fn reencrypt(base_dir: &str, old_key: &MasterKey, new_key: &MasterKey) -> Result<()> {
         let safe_fs = SafeFSOps::new(base_dir)?;
 
-        // Конфиг мог быть ещё не создан — тогда перешифровывать нечего.
         if safe_fs.safe_stat(CONFIG_FILE_NAME).is_err() {
             return Ok(());
         }
@@ -310,11 +409,7 @@ fn substitute_stealth(template: &str, seconds: &str, count: &str) -> String {
 ///
 /// Управляющие символы превращаются в пробелы, пробельные серии
 /// схлопываются, а длина ограничивается 120 символами.
-fn preview_body(text: &str, lang: Lang) -> Option<String> {
-    if let Some(file_name) = file_name_from_notification(text) {
-        return Some(lang.texts().notify_file.replace("{}", &file_name));
-    }
-
+fn preview_body(text: &str) -> Option<String> {
     let cleaned: String = text
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
@@ -333,25 +428,6 @@ fn preview_body(text: &str, lang: Lang) -> Option<String> {
     Some(preview)
 }
 
-/// Достаёт имя файла из служебного сообщения вида `Файл: <имя>`.
-fn file_name_from_notification(text: &str) -> Option<String> {
-    for line in text.lines() {
-        let line = line.trim();
-        let line = line.strip_prefix("📎 ").unwrap_or(line);
-        let Some(name) = line
-            .strip_prefix("Файл: ")
-            .or_else(|| line.strip_prefix("File: "))
-        else {
-            continue;
-        };
-        let name = name.trim();
-        if !name.is_empty() {
-            return Some(name.to_string());
-        }
-    }
-    None
-}
-
 fn save_encrypted(safe_fs: &SafeFSOps, vault: &Vault, cfg: &Config) -> Result<()> {
     let mut cfg = cfg.clone();
     cfg.normalize();
@@ -367,28 +443,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalizes_socks5_to_remote_dns() {
+    fn normalizes_optional_cookie_paths() {
+        assert_eq!(normalize_optional_path(""), None);
+        assert_eq!(normalize_optional_path("   "), None);
+        assert_eq!(normalize_optional_path("-"), None);
+        assert_eq!(normalize_optional_path("auto"), None);
+        assert_eq!(normalize_optional_path("AUTO"), None);
         assert_eq!(
-            normalize_proxy_url("socks5://127.0.0.1:9050").as_deref(),
-            Some("socks5h://127.0.0.1:9050")
-        );
-        assert_eq!(
-            normalize_proxy_url("  socks5h://127.0.0.1:9050  ").as_deref(),
-            Some("socks5h://127.0.0.1:9050")
-        );
-        assert_eq!(
-            normalize_proxy_url("http://127.0.0.1:4444").as_deref(),
-            Some("http://127.0.0.1:4444")
+            normalize_optional_path(" /run/tor/control.authcookie ").as_deref(),
+            Some("/run/tor/control.authcookie")
         );
     }
 
     #[test]
-    fn empty_or_none_disables_proxy() {
-        assert_eq!(normalize_proxy_url(""), None);
-        assert_eq!(normalize_proxy_url("   "), None);
-        assert_eq!(normalize_proxy_url("-"), None);
-        assert_eq!(normalize_proxy_url("none"), None);
-        assert_eq!(normalize_proxy_url("NONE"), None);
+    fn validates_tor_endpoints() {
+        let mut cfg = Config::default();
+        assert!(cfg.validate().is_ok());
+
+        cfg.tor_control_addr = "localhost:9051".to_string();
+        assert!(cfg.validate().is_ok());
+
+        cfg.tor_socks_addr = "not-an-endpoint".to_string();
+        assert!(cfg.validate().is_err());
+
+        cfg.tor_socks_addr = "127.0.0.1:0".to_string();
+        assert!(cfg.validate().is_err());
+
+        cfg.tor_socks_addr = DEFAULT_TOR_SOCKS_ADDR.to_string();
+        cfg.p2p_onion_port = 0;
+        assert!(cfg.validate().is_err());
     }
 
     #[test]
@@ -458,15 +541,10 @@ mod tests {
             .notification_content("Alice", "строка\nс\tуправляющими  символами", 1)
             .unwrap();
         assert_eq!(body, "строка с управляющими символами");
-
-        let (_, body) = config
-            .notification_content("Alice", "📎 Файл: secret.pdf\nРазмер: 10 B", 1)
-            .unwrap();
-        assert_eq!(body, "File: secret.pdf");
     }
 
     #[test]
-    fn old_config_json_gets_notification_defaults() {
+    fn old_server_config_json_upgrades_with_tor_defaults() {
         let json = r#"{
             "server_url": "https://msg.example.com",
             "file_server_url": "https://files.example.com",
@@ -475,6 +553,10 @@ mod tests {
         }"#;
 
         let config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.tor_control_addr, DEFAULT_TOR_CONTROL_ADDR);
+        assert_eq!(config.tor_socks_addr, DEFAULT_TOR_SOCKS_ADDR);
+        assert_eq!(config.p2p_local_port, DEFAULT_P2P_LOCAL_PORT);
+        assert_eq!(config.p2p_onion_port, DEFAULT_P2P_ONION_PORT);
         assert_eq!(config.notify_level, DEFAULT_NOTIFY_LEVEL);
         assert_eq!(config.stealth_title, DEFAULT_STEALTH_TITLE);
         assert_eq!(config.stealth_body, DEFAULT_STEALTH_BODY);
